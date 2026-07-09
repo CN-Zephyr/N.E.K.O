@@ -61,7 +61,7 @@ class RuntimeRecentContextApiMixin:
         for result in reversed(self.recent_results):
             if not isinstance(result, dict):
                 continue
-            if str(result.get("status") or "") not in {"pushed", "dry_run"}:
+            if str(result.get("status") or "") != "pushed":
                 continue
             if self._route_from_result(result) == target:
                 return True
@@ -82,7 +82,7 @@ class RuntimeRecentContextApiMixin:
             event = result.get("event") if isinstance(result.get("event"), dict) else {}
             if str(event.get("source") or "") == "live_danmaku":
                 return streak
-            if str(result.get("status") or "") not in {"pushed", "dry_run"}:
+            if str(result.get("status") or "") != "pushed":
                 continue
             if self._route_from_result(result) == target:
                 streak += 1
