@@ -90,7 +90,7 @@ def recent_live_danmaku_output_age_sec(recent_results: Any, iso_age_fn: IsoAgeFn
     for result in reversed(list(recent_results or [])):
         if not isinstance(result, dict):
             continue
-        if str(result.get("status") or "") not in {"pushed", "dry_run"}:
+        if str(result.get("status") or "") != "pushed":
             continue
         event = result.get("event") if isinstance(result.get("event"), dict) else {}
         if str(event.get("source") or "") != "live_danmaku":
@@ -108,7 +108,7 @@ def recent_hosting_output_age_sec(recent_results: Any, iso_age_fn: IsoAgeFn = is
     for result in reversed(list(recent_results or [])):
         if not isinstance(result, dict):
             continue
-        if str(result.get("status") or "") not in {"pushed", "dry_run"}:
+        if str(result.get("status") or "") != "pushed":
             continue
         route = recent_context.route_from_result(result)
         if route not in {"warmup_hosting", "idle_hosting", "active_engagement"}:
@@ -180,7 +180,7 @@ def last_output_age_sec(
     for result in reversed(list(recent_results or [])):
         if not isinstance(result, dict):
             continue
-        if str(result.get("status") or "") not in {"pushed", "dry_run"}:
+        if str(result.get("status") or "") != "pushed":
             continue
         age = iso_age_fn(result.get("created_at"))
         if age is not None:

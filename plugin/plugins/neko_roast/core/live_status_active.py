@@ -75,8 +75,8 @@ def active_engagement_status(
         cooldown_remaining = host_output_cooldown
         eligible = False
     elif idle_takeover_candidate:
-        reason = "no_viewer_response"
-        eligible = False
+        reason = "idle_hosting_streak"
+        eligible = True
     elif (
         idle_hosting_wait_remaining is not None
         and idle_hosting_wait_remaining <= float(idle_grace_seconds)
