@@ -4,19 +4,30 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import active_topic_rules
-from .live_content import (
-    idle_hosting_beat_candidates as raw_idle_hosting_beat_candidates,
+from .live_material_rules import (
+    is_clean_live_material,
+    is_similar_live_material_title,
 )
 
 
 def idle_hosting_beat_candidates() -> list[dict[str, Any]]:
+    raw_candidates = _raw_idle_hosting_beat_candidates()
     candidates = [
         candidate
-        for candidate in raw_idle_hosting_beat_candidates()
-        if active_topic_rules._is_clean_live_material(candidate)
+        for candidate in raw_candidates
+        if is_clean_live_material(candidate)
     ]
-    return candidates or raw_idle_hosting_beat_candidates()[:1]
+    return candidates or raw_candidates[:1]
+
+
+def _raw_idle_hosting_beat_candidates() -> list[dict[str, Any]]:
+    try:
+        from .live_content import idle_hosting_beat_candidates
+    except ModuleNotFoundError as exc:
+        if exc.name != "plugin.plugins.neko_roast.core.live_content":
+            raise
+        return []
+    return idle_hosting_beat_candidates()
 
 
 def idle_hosting_preferred_stage(recent_idle_hosting_streak: int) -> str:
@@ -67,7 +78,7 @@ def idle_hosting_material_stage(material: dict[str, Any] | None) -> str:
 
 
 def is_similar_idle_hosting_beat_title(title: str, recent_titles: Any) -> bool:
-    return bool(title) and active_topic_rules._is_similar_active_topic_title(
+    return bool(title) and is_similar_live_material_title(
         title,
         recent_titles,
     )
