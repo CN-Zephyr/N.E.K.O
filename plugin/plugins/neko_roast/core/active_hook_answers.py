@@ -72,7 +72,16 @@ def _has_recent_active_hook(recent_results: Any) -> bool:
         event = result.get("event") if isinstance(result.get("event"), dict) else {}
         source = public_text(event.get("source"))
         if source == "active_engagement":
-            return _active_event_has_reply_hook(event) or _active_event_has_reply_hook(result)
+            request = result.get("request") if isinstance(result.get("request"), dict) else {}
+            metadata = (
+                request.get("metadata")
+                if isinstance(request.get("metadata"), dict)
+                else {}
+            )
+            return any(
+                _active_event_has_reply_hook(candidate)
+                for candidate in (event, result, metadata)
+            )
         scanned += 1
         if scanned >= ACTIVE_HOOK_RESULT_SCAN_LIMIT:
             break

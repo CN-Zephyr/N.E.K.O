@@ -17,7 +17,7 @@ def idle_hosting_beat_candidates() -> list[dict[str, Any]]:
         for candidate in raw_candidates
         if is_clean_live_material(candidate)
     ]
-    return candidates or raw_candidates[:1]
+    return candidates
 
 
 def _raw_idle_hosting_beat_candidates() -> list[dict[str, Any]]:

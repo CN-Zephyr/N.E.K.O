@@ -16,6 +16,9 @@ from plugin.plugins.neko_roast.core.live_hosting_beat_rules import (
 from plugin.plugins.neko_roast.core.live_hosting_loop import (
     _maybe_trigger_active_engagement,
 )
+from plugin.plugins.neko_roast.core.live_hosting_beat_state import (
+    record_chosen_idle_hosting_beat,
+)
 from plugin.plugins.neko_roast.core.live_material_rules import (
     is_clean_live_material,
     is_similar_live_material_title,
@@ -59,6 +62,27 @@ def test_empty_active_hook_metadata_does_not_match_short_danmaku():
 
     recent[0]["event"]["topic_shape"] = "tiny_answer"
     assert is_active_hook_answer_event(recent, event)
+
+
+def test_active_hook_reads_stored_request_metadata():
+    recent = [
+        {
+            "status": "pushed",
+            "event": {"source": "active_engagement"},
+            "request": {"metadata": {"topic_reply_affordance": "tiny_answer"}},
+        }
+    ]
+    event = ViewerEvent(uid="1", source="live_danmaku", danmaku_text="1")
+
+    assert is_active_hook_answer_event(recent, event)
+
+
+def test_malformed_idle_hosting_fallback_returns_no_beat():
+    assert record_chosen_idle_hosting_beat(
+        SimpleNamespace(),
+        {"title": "missing key"},
+        {"title": "missing key"},
+    ) == {}
 
 
 @pytest.mark.asyncio

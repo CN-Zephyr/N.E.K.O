@@ -27,7 +27,9 @@ def record_chosen_idle_hosting_beat(
     chosen: dict[str, Any],
     fallback: dict[str, Any],
 ) -> dict[str, Any]:
-    key = str(chosen.get("key") or fallback["key"]).strip()
+    key = str(chosen.get("key") or fallback.get("key") or "").strip()
+    if not key:
+        return {}
     axis = str(chosen.get("fun_axis") or "").strip()
     title = str(chosen.get("title") or "").strip()
     family = runtime._host_material_family(chosen)
