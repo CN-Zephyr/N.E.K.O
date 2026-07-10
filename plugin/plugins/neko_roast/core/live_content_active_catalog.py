@@ -28,6 +28,7 @@ _FALLBACK_TOPIC_CANDIDATES_BY_KEY: dict[str, dict[str, Any]] = {
 
 _FALLBACK_TOPIC_CANDIDATE_KEYS: tuple[str, ...] = (
     "fallback:keyboard-busy",
+    "fallback:snack-choice",
     "fallback:serious-cat",
     "fallback:tiny-confession",
     "fallback:today-mood-vote",
@@ -35,9 +36,11 @@ _FALLBACK_TOPIC_CANDIDATE_KEYS: tuple[str, ...] = (
     "fallback:night-owl-energy",
     "fallback:screen-staring-back",
     "fallback:three-word-task",
+    "fallback:room-temperature-word",
     "fallback:serious-hosting",
     "fallback:danmaku-password",
     "fallback:cat-weather",
+    "fallback:blanket-temperature",
     "fallback:one-word-barrage",
     "fallback:desk-item-choice",
     "fallback:cat-paw-button",

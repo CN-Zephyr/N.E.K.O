@@ -16,6 +16,7 @@ from plugin.plugins.neko_roast.core import (
     active_topic_rules,
     active_topic_trending_source,
     live_content,
+    live_content_active_catalog,
 )
 from plugin.plugins.neko_roast.core.active_topic_selector import ActiveTopicSelector
 
@@ -32,6 +33,18 @@ def test_active_topic_slice_imports_without_later_material_or_content_slices() -
 def test_active_content_slice_imports_without_host_catalog() -> None:
     assert live_content.active_engagement_fallback_topic_candidates()
     assert live_content.idle_hosting_beat_candidates() == []
+
+
+def test_active_content_order_includes_every_defined_candidate_once() -> None:
+    defined_keys = [
+        item["key"]
+        for item in live_content_active_catalog._ALL_FALLBACK_TOPIC_CANDIDATES
+    ]
+    ordered_keys = list(live_content_active_catalog._FALLBACK_TOPIC_CANDIDATE_KEYS)
+
+    assert len(defined_keys) == len(set(defined_keys))
+    assert len(ordered_keys) == len(set(ordered_keys))
+    assert set(ordered_keys) == set(defined_keys)
 
 
 @pytest.mark.parametrize("title", ("about", "table", "cable", "stable"))
