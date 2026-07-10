@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 from collections import deque
+import importlib
 from typing import Any
 
 from . import (
-    active_topic_pack,
+    active_topic_core_fallbacks,
     active_topic_rules,
     active_topic_selection,
-    active_topic_shapes,
     active_topic_sources,
 )
-from .live_content import active_engagement_fallback_topic_candidates
+
+
+def _optional_split_module(name: str) -> Any | None:
+    qualified_name = f"{__package__}.{name}"
+    try:
+        return importlib.import_module(qualified_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != qualified_name:
+            raise
+        return None
 
 
 class ActiveTopicCompatibilityMixin:
@@ -34,7 +43,15 @@ class ActiveTopicCompatibilityMixin:
 
     @staticmethod
     def fallback_topic_candidates() -> list[dict[str, Any]]:
-        return active_engagement_fallback_topic_candidates()
+        live_content = _optional_split_module("live_content")
+        if live_content is None:
+            return active_topic_core_fallbacks.fallback_topic_candidates()
+        candidates = live_content.active_engagement_fallback_topic_candidates()
+        return (
+            candidates
+            if isinstance(candidates, list) and candidates
+            else active_topic_core_fallbacks.fallback_topic_candidates()
+        )
 
     def runtime_fallback_topic_candidates(self) -> list[dict[str, Any]]:
         provider = getattr(
@@ -43,12 +60,17 @@ class ActiveTopicCompatibilityMixin:
             None,
         )
         if callable(provider):
-            return provider()
+            candidates = provider()
+            if isinstance(candidates, list) and candidates:
+                return candidates
         return self.fallback_topic_candidates()
 
     @staticmethod
     def topic_pack(material: dict[str, Any] | None) -> str:
-        return active_topic_pack.active_topic_pack(material)
+        module = _optional_split_module("active_topic_pack")
+        if module is None:
+            return active_topic_core_fallbacks.active_topic_pack(material)
+        return module.active_topic_pack(material)
 
     async def topic_candidates(self) -> list[dict[str, Any]]:
         return await active_topic_sources.topic_candidates(self)
@@ -88,14 +110,24 @@ class ActiveTopicCompatibilityMixin:
         return active_topic_rules._is_live_test_or_runtime_feedback(dense_lowered)
 
     def next_shape(self) -> str:
-        shape, next_index = active_topic_shapes.next_active_topic_shape(
-            self._active_engagement_shape_index
+        module = _optional_split_module("active_topic_shapes")
+        shape_helper = (
+            module.next_active_topic_shape
+            if module is not None
+            else active_topic_core_fallbacks.next_active_topic_shape
         )
+        shape, next_index = shape_helper(self._active_engagement_shape_index)
         self._active_engagement_shape_index = next_index
         return shape
 
     def guarded_shape(self, shape: str) -> str:
-        shape, reason = active_topic_shapes.guarded_active_topic_shape(
+        module = _optional_split_module("active_topic_shapes")
+        guard_helper = (
+            module.guarded_active_topic_shape
+            if module is not None
+            else active_topic_core_fallbacks.guarded_active_topic_shape
+        )
+        shape, reason = guard_helper(
             shape,
             self._active_engagement_recent_shapes,
         )

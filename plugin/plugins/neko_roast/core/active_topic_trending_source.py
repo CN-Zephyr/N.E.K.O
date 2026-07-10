@@ -51,9 +51,10 @@ async def bili_trending_topic_candidates(selector: Any) -> list[dict[str, Any]]:
         compact_title = selector._runtime._compact_context_text(title, limit=40)
         profile = selector.material_profile(compact_title)
         if not profile:
-            selector._active_engagement_recent_topic_skip_reason = (
-                "low_confidence_topic"
-            )
+            if not selector._active_engagement_recent_topic_skip_reason:
+                selector._active_engagement_recent_topic_skip_reason = (
+                    "low_confidence_topic"
+                )
             continue
         candidate = {
             "source": "bili_trending",

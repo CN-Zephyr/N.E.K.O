@@ -30,16 +30,20 @@ class ActiveTopicSelector(ActiveTopicCompatibilityMixin):
     async def select_topic(self) -> dict[str, Any]:
         candidates = await self.topic_candidates()
         fallback_candidates = self.runtime_fallback_topic_candidates()
+        if not fallback_candidates:
+            fallback_candidates = self.fallback_topic_candidates()
         fallback = fallback_candidates[0]
         shape = self.next_shape()
         chosen = fallback
-        exhausted_cached_topics = bool(candidates)
+        exhausted_cached_topics = not bool(candidates)
         candidate = active_topic_candidate_picker.choose_fresh_candidate(
             self, candidates
         )
         if candidate is not None:
             chosen = candidate
             exhausted_cached_topics = False
+        elif candidates:
+            exhausted_cached_topics = True
         if exhausted_cached_topics:
             active_topic_candidate_picker.clear_topic_cache(self)
             refreshed_candidates = await self.topic_candidates()

@@ -64,7 +64,7 @@ def recent_danmaku_topic_candidates(selector: Any) -> list[dict[str, Any]]:
         recent_items.append((uid, compact))
         if len(recent_items) >= 6:
             break
-    speaker_ids = {uid for uid, _ in recent_items if uid}
+    speaker_ids = {uid or "<anonymous>" for uid, _ in recent_items}
     if len(recent_items) >= 3 and len(speaker_ids) == 1:
         selector._active_engagement_recent_topic_skip_reason = "single_viewer_flood"
         return []
