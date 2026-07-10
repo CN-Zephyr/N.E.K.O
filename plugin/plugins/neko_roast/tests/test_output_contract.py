@@ -73,3 +73,23 @@ def test_generic_english_roast_targets_are_rejected():
     assert DanmakuResponseModule._target_roast_nickname("rate @person") == ""
     assert DanmakuResponseModule._target_roast_nickname("\u9510\u8bc4 @\u4ed6") == ""
     assert DanmakuResponseModule._target_roast_nickname("roast that Alice") == "Alice"
+
+
+def test_generic_chinese_roast_targets_are_rejected():
+    placeholders = (
+        "\u67d0\u4eba",
+        "\u67d0\u4f4d",
+        "\u8fd9\u4f4d",
+        "\u90a3\u4f4d",
+        "\u90a3\u8c01",
+        "\u5927\u5bb6",
+        "\u6240\u6709\u4eba",
+    )
+
+    for placeholder in placeholders:
+        assert DanmakuResponseModule._target_roast_nickname(
+            f"\u9510\u8bc4 {placeholder}"
+        ) == ""
+        assert DanmakuResponseModule._target_roast_nickname(
+            f"roast @{placeholder}"
+        ) == ""
