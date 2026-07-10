@@ -114,12 +114,11 @@ def _best_thread(items: list[dict[str, str]]) -> tuple[str, list[str], int] | No
     speakers: dict[str, set[str]] = defaultdict(set)
     examples: dict[str, list[str]] = defaultdict(list)
     for item in items:
-        uid = item.get("uid") or ""
+        uid = item.get("uid") or "<anonymous>"
         text = item.get("text") or ""
         for unit in (item.get("units") or "").splitlines():
             counts[unit] += 1
-            if uid:
-                speakers[unit].add(uid)
+            speakers[unit].add(uid)
             if text and text not in examples[unit]:
                 examples[unit].append(text)
     if not counts:
@@ -136,13 +135,17 @@ def _best_thread(items: list[dict[str, str]]) -> tuple[str, list[str], int] | No
     for unit in ranked:
         if counts[unit] < _MIN_SHARED_MENTIONS:
             continue
+        if speakers[unit] == {"<anonymous>"}:
+            continue
         return unit, examples[unit], len(speakers[unit])
     return None
 
 
 def _topic_units(text: str) -> set[str]:
     compact = " ".join(str(text or "").strip().split())
-    dense = "".join(ch.casefold() for ch in compact if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    dense = "".join(
+        ch.casefold() for ch in compact if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )
     units: set[str] = set()
     latin = []
     for ch in dense:
@@ -174,14 +177,20 @@ def _add_latin_unit(units: set[str], value: str) -> None:
         units.add(value)
 
 
-def _thread_title(term: str, representative: str, mention_count: int, speaker_count: int) -> str:
+def _thread_title(
+    term: str, representative: str, mention_count: int, speaker_count: int
+) -> str:
     if speaker_count >= 2:
         return f"多人在聊「{term}」：{representative}"
     return f"弹幕反复提到「{term}」：{representative}"
 
 
 def _compact_key(value: str) -> str:
-    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")[:24]
+    return "".join(
+        ch
+        for ch in str(value or "").casefold()
+        if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )[:24]
 
 
 __all__ = ["live_thread_topic_candidates"]

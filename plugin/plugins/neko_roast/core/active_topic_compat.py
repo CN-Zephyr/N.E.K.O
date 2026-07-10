@@ -24,6 +24,18 @@ def _optional_split_module(name: str) -> Any | None:
         return None
 
 
+def _valid_fallback_candidates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    required_fields = ("key", "title", "hint")
+    return [
+        dict(item)
+        for item in value
+        if isinstance(item, dict)
+        and all(str(item.get(field) or "").strip() for field in required_fields)
+    ]
+
+
 class ActiveTopicCompatibilityMixin:
     def choose_candidate(
         self,
@@ -46,12 +58,10 @@ class ActiveTopicCompatibilityMixin:
         live_content = _optional_split_module("live_content")
         if live_content is None:
             return active_topic_core_fallbacks.fallback_topic_candidates()
-        candidates = live_content.active_engagement_fallback_topic_candidates()
-        return (
-            candidates
-            if isinstance(candidates, list) and candidates
-            else active_topic_core_fallbacks.fallback_topic_candidates()
+        candidates = _valid_fallback_candidates(
+            live_content.active_engagement_fallback_topic_candidates()
         )
+        return candidates or active_topic_core_fallbacks.fallback_topic_candidates()
 
     def runtime_fallback_topic_candidates(self) -> list[dict[str, Any]]:
         provider = getattr(
@@ -60,8 +70,8 @@ class ActiveTopicCompatibilityMixin:
             None,
         )
         if callable(provider):
-            candidates = provider()
-            if isinstance(candidates, list) and candidates:
+            candidates = _valid_fallback_candidates(provider())
+            if candidates:
                 return candidates
         return self.fallback_topic_candidates()
 

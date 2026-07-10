@@ -8,6 +8,7 @@ import pytest
 
 from plugin.plugins.neko_roast.core import (
     active_topic_candidate_picker,
+    active_topic_live_thread_source,
     active_topic_mentions,
     active_topic_recent_source,
     active_topic_rules,
@@ -25,14 +26,31 @@ def test_active_topic_slice_imports_without_later_material_or_content_slices() -
     assert active_topic_rules._active_topic_material_profile("pick A or B")
 
 
-def test_empty_runtime_fallback_uses_core_default() -> None:
-    runtime = SimpleNamespace(_active_engagement_fallback_topic_candidates=lambda: [])
+@pytest.mark.parametrize(
+    "provider_candidates",
+    ([], [{}], [{"source": "custom"}]),
+)
+def test_invalid_runtime_fallback_uses_core_default(
+    provider_candidates: list[dict[str, str]],
+) -> None:
+    runtime = SimpleNamespace(
+        _active_engagement_fallback_topic_candidates=lambda: provider_candidates
+    )
     selector = ActiveTopicSelector(runtime)
 
     candidates = selector.runtime_fallback_topic_candidates()
 
     assert candidates
     assert candidates[0]["key"] == "fallback:room-mood"
+
+
+def test_anonymous_repeats_do_not_form_a_live_thread() -> None:
+    items = [
+        {"uid": "", "text": "same topic", "units": "topic"},
+        {"uid": "", "text": "same topic again", "units": "topic"},
+    ]
+
+    assert active_topic_live_thread_source._best_thread(items) is None
 
 
 @pytest.mark.asyncio
