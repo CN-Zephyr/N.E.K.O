@@ -137,7 +137,8 @@ class LiveBridgeTransport:
             async with self._connect_factory(
                 url,
                 open_timeout=6,
-                ping_interval=None,
+                ping_interval=20,
+                ping_timeout=20,
                 close_timeout=3,
                 max_size=1024 * 1024,
                 proxy=None,
