@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import re
+
+
+_AB_CHOICE_RE = re.compile(r"(?<![a-z0-9])a\s*[/|]\s*b(?![a-z0-9])", re.I)
+
 
 def host_material_family(material: dict | None) -> str:
     if not isinstance(material, dict):
         return ""
+    explicit_family = str(material.get("family") or "").strip()
+    if explicit_family:
+        return explicit_family
     combined = " ".join(
         str(material.get(field) or "")
         for field in ("key", "title", "fun_axis", "shape", "preferred_shape")
@@ -31,12 +39,11 @@ def host_material_family(material: dict | None) -> str:
         for marker in (
             "choice",
             "eitheror",
-            "ab",
             "\u4e8c\u9009\u4e00",
             "\u8fd8\u662f",
             "\u9009\u4e00",
         )
-    ):
+    ) or _AB_CHOICE_RE.search(combined):
         return "choice_vote"
     if any(
         marker in dense

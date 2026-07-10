@@ -9,7 +9,9 @@ import pytest
 from plugin.plugins.neko_roast.core import (
     active_topic_candidate_picker,
     active_topic_live_thread_source,
+    active_topic_material_family,
     active_topic_mentions,
+    active_topic_pack,
     active_topic_recent_source,
     active_topic_rules,
     active_topic_trending_source,
@@ -24,6 +26,28 @@ def test_active_topic_slice_imports_without_later_material_or_content_slices() -
 
     assert runtime_api.RuntimeActiveTopicApiMixin
     assert active_topic_rules._active_topic_material_profile("pick A or B")
+
+
+@pytest.mark.parametrize("title", ("about", "table", "cable", "stable"))
+def test_normal_words_containing_ab_are_not_choice_votes(title: str) -> None:
+    material = {"title": title, "fun_axis": "mood"}
+
+    assert active_topic_material_family.host_material_family(material) != "choice_vote"
+    assert active_topic_pack.active_topic_pack(material) != "micro_poll"
+
+
+def test_explicit_material_family_wins_over_title_inference() -> None:
+    material = {"family": "room_mood", "title": "pick one"}
+
+    assert active_topic_material_family.host_material_family(material) == "room_mood"
+    assert active_topic_pack.active_topic_pack(material) == "room_mood"
+
+
+def test_explicit_ab_marker_remains_a_choice_vote() -> None:
+    assert (
+        active_topic_material_family.host_material_family({"title": "A/B vote"})
+        == "choice_vote"
+    )
 
 
 @pytest.mark.parametrize(
