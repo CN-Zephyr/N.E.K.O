@@ -99,7 +99,7 @@ def _active_event_has_reply_hook(event: dict[str, Any]) -> bool:
             "one side",
             "micro_poll",
         )
-    ) or not rendered.strip()
+    )
 
 
 def _dense_text(text: str) -> str:

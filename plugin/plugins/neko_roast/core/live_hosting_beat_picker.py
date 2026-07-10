@@ -9,6 +9,8 @@ from . import live_hosting_beat_state
 
 def next_idle_hosting_beat(runtime: Any) -> dict[str, Any]:
     candidates = runtime._idle_hosting_beat_candidates()
+    if not candidates:
+        return {}
     fallback = candidates[0]
     chosen = fallback
     chosen_offset: int | None = None

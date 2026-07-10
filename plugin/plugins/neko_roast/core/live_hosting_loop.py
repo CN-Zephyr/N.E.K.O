@@ -34,7 +34,7 @@ async def idle_hosting_loop(director: Any) -> None:
             result = await director.maybe_trigger_warmup_hosting()
             if result is not None and result.status in {"dry_run", "pushed"}:
                 continue
-            result = await runtime.maybe_trigger_active_engagement()
+            result = await _maybe_trigger_active_engagement(runtime)
             if result is not None and result.status in {"dry_run", "pushed"}:
                 continue
             await director.maybe_trigger_idle_hosting()
@@ -43,3 +43,10 @@ async def idle_hosting_loop(director: Any) -> None:
         except Exception as exc:
             message = f"idle_hosting_loop_failed: {type(exc).__name__}"
             runtime.audit.record("idle_hosting_loop_failed", message, level="warning")
+
+
+async def _maybe_trigger_active_engagement(runtime: Any) -> Any:
+    trigger = getattr(runtime, "maybe_trigger_active_engagement", None)
+    if not callable(trigger):
+        return None
+    return await trigger()

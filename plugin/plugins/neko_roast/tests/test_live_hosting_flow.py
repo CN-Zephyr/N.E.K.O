@@ -1,6 +1,20 @@
+from types import SimpleNamespace
+
+import pytest
+
+from plugin.plugins.neko_roast.core.active_hook_answers import (
+    is_active_hook_answer_event,
+)
 from plugin.plugins.neko_roast.core import live_hosting_director
+from plugin.plugins.neko_roast.core.contracts import ViewerEvent
+from plugin.plugins.neko_roast.core.live_hosting_beat_picker import (
+    next_idle_hosting_beat,
+)
 from plugin.plugins.neko_roast.core.live_hosting_beat_rules import (
     idle_hosting_beat_candidates,
+)
+from plugin.plugins.neko_roast.core.live_hosting_loop import (
+    _maybe_trigger_active_engagement,
 )
 from plugin.plugins.neko_roast.core.live_material_rules import (
     is_clean_live_material,
@@ -29,3 +43,24 @@ def test_live_material_title_similarity_handles_duplicates_and_variants():
 
     assert is_similar_live_material_title("Tonight tiny question", recent)
     assert not is_similar_live_material_title("Completely different topic", recent)
+
+
+def test_empty_idle_hosting_catalog_returns_no_beat():
+    runtime = SimpleNamespace(_idle_hosting_beat_candidates=lambda: [])
+
+    assert next_idle_hosting_beat(runtime) == {}
+
+
+def test_empty_active_hook_metadata_does_not_match_short_danmaku():
+    recent = [{"status": "pushed", "event": {"source": "active_engagement"}}]
+    event = ViewerEvent(uid="1", source="live_danmaku", danmaku_text="1")
+
+    assert not is_active_hook_answer_event(recent, event)
+
+    recent[0]["event"]["topic_shape"] = "tiny_answer"
+    assert is_active_hook_answer_event(recent, event)
+
+
+@pytest.mark.asyncio
+async def test_missing_active_engagement_api_degrades_to_skip():
+    assert await _maybe_trigger_active_engagement(SimpleNamespace()) is None
