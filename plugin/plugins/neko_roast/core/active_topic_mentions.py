@@ -13,7 +13,7 @@ def is_viewer_to_viewer_mention_text(text: str) -> bool:
     for part in compact.split("@")[1:]:
         target = []
         for ch in part.strip():
-            if ch.isspace() or ch in ":：,，、;；\\|[]()（）<>《》":
+            if ch.isspace() or ch in ":：,，、;；.!?。？！\\|[]()（）<>《》":
                 break
             target.append(ch)
         name = "".join(target).strip()

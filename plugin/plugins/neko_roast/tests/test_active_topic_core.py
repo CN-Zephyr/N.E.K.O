@@ -118,10 +118,16 @@ def test_anonymous_recent_danmaku_flood_is_rejected() -> None:
     assert selector._active_engagement_recent_topic_skip_reason == "single_viewer_flood"
 
 
-def test_neko_mention_wins_over_an_earlier_viewer_mention() -> None:
-    assert not active_topic_mentions.is_viewer_to_viewer_mention_text(
-        "@Alice @neko what do you think"
-    )
+@pytest.mark.parametrize(
+    "text",
+    (
+        "@Alice @neko what do you think",
+        "@Alice @neko?",
+        "@Alice @猫猫，今天播什么",
+    ),
+)
+def test_neko_mention_wins_over_an_earlier_viewer_mention(text: str) -> None:
+    assert not active_topic_mentions.is_viewer_to_viewer_mention_text(text)
 
 
 @pytest.mark.asyncio
