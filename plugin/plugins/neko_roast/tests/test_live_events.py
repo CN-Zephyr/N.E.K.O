@@ -15,6 +15,7 @@ from plugin.plugins.neko_roast.core.contracts import LiveEvent, RoastConfig
 from plugin.plugins.neko_roast.core.event_bus import EventBus
 from plugin.plugins.neko_roast.modules.bili_live_ingest.livedanmaku import LiveDanmaku
 from plugin.plugins.neko_roast.modules.live_events import LiveEventsModule
+from plugin.plugins.neko_roast.modules.live_events.room_topic import RoomTopicContext
 from plugin.plugins.neko_roast.modules.live_support_events import LiveSupportEventsModule
 
 
@@ -168,6 +169,59 @@ async def test_event_bus_routes_gift_events_to_support_lane_without_selection_wi
     assert hub._flush_task is None
     assert support.status()["last_event_type"] == "gift"
     assert not [record for record in ctx.audit.records if record["op"] == "live_event_selected"]
+    await support.teardown()
+
+
+def test_room_topic_accepts_dict_candidates_with_public_nickname():
+    topic = RoomTopicContext(now=lambda: 1.0)
+
+    context = topic._build_context(
+        [{"uid": "42", "nickname": "alice", "text": "怎么配置？", "score": 3.0}]
+    )
+
+    assert context["total_candidates"] == 1
+    assert context["themes"][0]["examples"][0]["nickname"] == "alice"
+
+
+async def test_rawless_live_event_reads_danmaku_fields_from_payload():
+    ctx = _FakeCtx(remaining=0.0)
+    hub = await _make_hub(ctx)
+
+    hub.submit(
+        LiveEvent(
+            type="danmaku",
+            uid="42",
+            payload={"nickname": "alice", "text": "hello envelope", "room_id": 7},
+        )
+    )
+    await _drain(hub)
+
+    assert len(ctx.payloads) == 1
+    assert ctx.payloads[0]["uid"] == "42"
+    assert ctx.payloads[0]["danmaku_text"] == "hello envelope"
+    assert ctx.payloads[0]["room_id"] == 7
+
+
+async def test_rawless_live_event_reads_support_fields_from_payload():
+    ctx = _FakeCtx(remaining=0.0)
+    support = LiveSupportEventsModule()
+    await support.setup(ctx)
+
+    ctx.event_bus.publish(
+        "gift",
+        LiveEvent(
+            type="gift",
+            uid="9",
+            payload={"nickname": "alice", "gift_name": "小心心", "gift_count": 2, "gift_value": 30},
+        ),
+    )
+    await _drain_support(support)
+
+    assert len(ctx.payloads) == 1
+    assert ctx.payloads[0]["event_type"] == "gift"
+    assert ctx.payloads[0]["gift_name"] == "小心心"
+    assert ctx.payloads[0]["gift_count"] == 2
+    assert ctx.payloads[0]["gift_value"] == 30
     await support.teardown()
 
 

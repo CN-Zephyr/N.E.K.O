@@ -186,8 +186,16 @@ def safe_public_url(value: Any) -> str:
 
 def _field(event: Any, name: str) -> Any:
     if isinstance(event, dict):
-        return event.get(name)
-    return getattr(event, name, None)
+        value = event.get(name)
+        payload = event.get("payload")
+    else:
+        value = getattr(event, name, None)
+        payload = getattr(event, "payload", None)
+    if value is not None:
+        return value
+    if isinstance(payload, dict):
+        return payload.get(name)
+    return None
 
 
 def _normalize_event_type(value: str) -> str:

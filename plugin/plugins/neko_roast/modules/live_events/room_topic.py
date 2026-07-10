@@ -349,7 +349,7 @@ class RoomTopicContext:
                 return None
             return DanmakuCandidate(
                 uid=event_uid(event),
-                nickname=public_text(event.get("nickname") or "", max_len=64),
+                nickname=public_text(event.get("nickname") or "", max_length=64),
                 text=text,
                 score=float(event.get("score") or 1.0),
                 ts=float(event.get("ts") or self._now()),
