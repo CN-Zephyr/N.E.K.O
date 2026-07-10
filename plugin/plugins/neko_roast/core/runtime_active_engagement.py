@@ -30,7 +30,10 @@ async def trigger_active_engagement(runtime: Any) -> InteractionResult:
         reason = str(active_status.get("reason") or "not_eligible")
         return record_active_engagement_skip(runtime, skip_event, f"active_engagement.{reason}")
     event = await active_engagement_event(runtime, live_state)
-    return await runtime.pipeline.handle_event(event)
+    result = await runtime.pipeline.handle_event(event)
+    if str(getattr(result, "status", "") or "") == "pushed":
+        runtime._active_engagement_last_attempt_at = float(runtime._active_engagement_now())
+    return result
 
 
 async def maybe_trigger_active_engagement(runtime: Any) -> InteractionResult | None:
@@ -45,9 +48,7 @@ async def maybe_trigger_active_engagement(runtime: Any) -> InteractionResult | N
     if not bool(active_status.get("eligible")):
         return None
 
-    result = await trigger_active_engagement(runtime)
-    runtime._active_engagement_last_attempt_at = now
-    return result
+    return await trigger_active_engagement(runtime)
 
 
 async def active_engagement_event(runtime: Any, live_state: dict[str, Any]) -> ViewerEvent:

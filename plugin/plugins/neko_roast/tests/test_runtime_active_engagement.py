@@ -74,6 +74,17 @@ async def test_trigger_active_engagement_requires_full_eligibility():
 
 
 @pytest.mark.asyncio
+async def test_manual_trigger_active_engagement_records_success_cooldown():
+    runtime = _Runtime({"candidate": True, "eligible": True, "reason": "eligible"})
+
+    result = await trigger_active_engagement(runtime)
+
+    assert result.status == "pushed"
+    assert runtime._active_engagement_last_attempt_at == 100.0
+    assert len(runtime.pipeline.events) == 1
+
+
+@pytest.mark.asyncio
 async def test_maybe_trigger_active_engagement_records_attempt_after_success():
     runtime = _Runtime({"candidate": True, "eligible": True, "reason": "eligible"})
 
