@@ -37,7 +37,11 @@ def test_normal_words_containing_ab_are_not_choice_votes(title: str) -> None:
 
 
 def test_explicit_material_family_wins_over_title_inference() -> None:
-    material = {"family": "room_mood", "title": "pick one"}
+    material = {
+        "family": "room_mood",
+        "title": "pick one",
+        "live_column": "NEKO micro poll",
+    }
 
     assert active_topic_material_family.host_material_family(material) == "room_mood"
     assert active_topic_pack.active_topic_pack(material) == "room_mood"
