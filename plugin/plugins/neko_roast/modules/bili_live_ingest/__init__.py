@@ -253,6 +253,9 @@ class BiliLiveIngestModule(BaseModule):
         gift = getattr(raw, "gift", None) if raw is not None else None
         parts = [
             live_event.type,
+            BiliLiveIngestModule._normalize_cmd(
+                payload.get("raw_cmd") or payload.get("cmd") or payload.get("raw_type") or ""
+            ),
             str(live_event.uid or payload.get("uid") or payload.get("user_id") or ""),
             str(
                 payload.get("gift_name")

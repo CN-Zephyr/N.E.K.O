@@ -665,23 +665,29 @@ class DanmakuListener:
         if not isinstance(gift_info, dict):
             gift_info = {}
         command = str(cmd or "").upper()
+        explicit_gift_command = "GIFT" in command
+        explicit_gift_fields = any(
+            key in inner
+            for key in ("gift_id", "giftId", "giftName", "gift_name", "gift_name_str", "giftNameStr")
+        )
+        nested_gift_fields = any(
+            key in gift_info
+            for key in ("gift_id", "giftId", "id", "giftName", "gift_name", "gift_name_str", "giftNameStr", "name")
+        )
+        support_hint = explicit_gift_command or explicit_gift_fields or nested_gift_fields
         gift_name = DanmakuListener._first_text(
             inner,
             gift_info,
-            keys=("giftName", "gift_name", "gift_name_str", "name", "giftNameStr"),
+            keys=("giftName", "gift_name", "gift_name_str", "giftNameStr"),
         )
+        if not gift_name and explicit_gift_command:
+            gift_name = DanmakuListener._first_text(inner, gift_info, keys=("name",))
+        elif not gift_name and nested_gift_fields:
+            gift_name = DanmakuListener._first_text(gift_info, keys=("name",))
         text_hint = DanmakuListener._first_text(
             inner,
             gift_info,
             keys=("toast_msg", "toastMsg", "message", "msg", "copy_writing", "copyWriting", "text", "content"),
-        )
-        support_hint = (
-            "GIFT" in command
-            or "MEDAL" in command
-            or "FANS" in command
-            or "TOAST" in command
-            or any(key in inner for key in ("gift_id", "giftId", "giftName", "gift_name", "gift_info", "giftInfo"))
-            or bool(gift_info)
         )
         if not gift_name and support_hint and DanmakuListener._looks_like_fans_medal_text(text_hint):
             gift_name = "fans medal"
