@@ -252,6 +252,18 @@ def test_fallback_support_gift_rejects_generic_medal_or_toast_packets():
     assert DanmakuListener._fallback_support_gift_payload("ROOM_TOAST_MESSAGE", toast) is None
 
 
+def test_fallback_support_gift_rejects_bare_nested_name():
+    packet = {
+        "data": {
+            "uid": 9,
+            "gift": {"name": "灯牌"},
+            "message": "点亮粉丝牌成功",
+        }
+    }
+
+    assert DanmakuListener._fallback_support_gift_payload("ROOM_RANK_UPDATE", packet) is None
+
+
 def test_fallback_support_gift_accepts_explicit_gift_evidence():
     payload = DanmakuListener._fallback_support_gift_payload(
         "UNKNOWN_SUPPORT_PACKET",

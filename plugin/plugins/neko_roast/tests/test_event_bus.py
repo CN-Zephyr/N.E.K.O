@@ -146,3 +146,19 @@ def test_support_dedupe_keeps_send_gift_and_combo_send_distinct():
     assert module._is_duplicate_support_event(send) is False
     assert module._is_duplicate_support_event(combo) is False
     assert module._is_duplicate_support_event(duplicate_combo) is True
+
+
+def test_support_dedupe_matches_lightweight_and_rich_super_chat():
+    module = BiliLiveIngestModule()
+    lightweight = module._to_live_event(
+        "SUPER_CHAT_MESSAGE",
+        {"user_id": 9, "user_name": "SCUser", "message": "hello", "price": 30},
+    )
+    rich = module._to_live_event(
+        "SUPER_CHAT_MESSAGE",
+        SimpleNamespace(uid=9, nickname="SCUser", text="hello", room_id=1),
+    )
+    rich.ts = lightweight.ts + 0.1
+
+    assert module._is_duplicate_support_event(lightweight) is False
+    assert module._is_duplicate_support_event(rich) is True

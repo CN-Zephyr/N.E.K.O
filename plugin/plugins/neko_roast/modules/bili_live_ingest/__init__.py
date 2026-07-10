@@ -251,12 +251,23 @@ class BiliLiveIngestModule(BaseModule):
         raw = live_event.raw
         payload = live_event.payload if isinstance(live_event.payload, dict) else {}
         gift = getattr(raw, "gift", None) if raw is not None else None
+        command = BiliLiveIngestModule._normalize_cmd(
+            payload.get("raw_cmd") or payload.get("cmd") or payload.get("raw_type") or ""
+        )
+        uid = str(live_event.uid or payload.get("uid") or payload.get("user_id") or "")
+        if live_event.type == "super_chat":
+            text = str(
+                payload.get("danmaku_text")
+                or payload.get("text")
+                or payload.get("message")
+                or getattr(raw, "text", "")
+                or ""
+            )
+            return "|".join(part.strip()[:80] for part in (live_event.type, command, uid, text))
         parts = [
             live_event.type,
-            BiliLiveIngestModule._normalize_cmd(
-                payload.get("raw_cmd") or payload.get("cmd") or payload.get("raw_type") or ""
-            ),
-            str(live_event.uid or payload.get("uid") or payload.get("user_id") or ""),
+            command,
+            uid,
             str(
                 payload.get("gift_name")
                 or payload.get("giftName")

@@ -672,7 +672,7 @@ class DanmakuListener:
         )
         nested_gift_fields = any(
             key in gift_info
-            for key in ("gift_id", "giftId", "id", "giftName", "gift_name", "gift_name_str", "giftNameStr", "name")
+            for key in ("gift_id", "giftId", "id", "giftName", "gift_name", "gift_name_str", "giftNameStr")
         )
         support_hint = explicit_gift_command or explicit_gift_fields or nested_gift_fields
         gift_name = DanmakuListener._first_text(
