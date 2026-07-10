@@ -69,4 +69,7 @@ def test_hosting_coalesce_key_separates_distinct_beats():
 def test_generic_english_roast_targets_are_rejected():
     assert DanmakuResponseModule._target_roast_nickname("roast that guy") == ""
     assert DanmakuResponseModule._target_roast_nickname("rate that person") == ""
+    assert DanmakuResponseModule._target_roast_nickname("roast @guy") == ""
+    assert DanmakuResponseModule._target_roast_nickname("rate @person") == ""
+    assert DanmakuResponseModule._target_roast_nickname("\u9510\u8bc4 @\u4ed6") == ""
     assert DanmakuResponseModule._target_roast_nickname("roast that Alice") == "Alice"

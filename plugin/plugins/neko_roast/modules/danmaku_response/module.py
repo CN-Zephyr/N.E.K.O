@@ -598,23 +598,6 @@ class DanmakuResponseModule(BaseModule):
     def _target_roast_nickname(text: str) -> str:
         cleaned = " ".join(str(text or "").replace("\uff20", "@").strip().split())
         aliases = {"neko", "\u732b\u732b", "\u5c0f\u5929", "\u732b\u5a18"}
-        for part in cleaned.split("@")[1:]:
-            target = []
-            for ch in part.strip():
-                if ch.isspace() or ch in ":：,，。.!！?？、；;|[]()（）<>《》":
-                    break
-                target.append(ch)
-            name = "".join(target).strip("@ \t\r\n")
-            if name and name.casefold() not in aliases:
-                return name[:24]
-        pattern = re.compile(
-            r"(?:\u5410\u69fd\u4e00\u4e0b|\u5410\u69fd|\u9510\u8bc4\u4e00\u4e0b|\u9510\u8bc4|\u8bc4\u4ef7\u4e00\u4e0b|\u8bc4\u4ef7|\u635f\u4e00\u4e0b|\u635f\u635f|\u8c03\u4f83\u4e00\u4e0b|\u8c03\u4f83|roast|rate)\s*(?:\u4e00\u4e0b|this|that)?\s*([\w\u4e00-\u9fff][\w\u4e00-\u9fff_-]{0,23})",
-            re.IGNORECASE,
-        )
-        match = pattern.search(cleaned)
-        if not match:
-            return ""
-        name = match.group(1).strip("@ \t\r\n")
         blocked = {
             "",
             "\u6211",
@@ -637,6 +620,23 @@ class DanmakuResponseModule(BaseModule):
             "him",
             "her",
         }
+        for part in cleaned.split("@")[1:]:
+            target = []
+            for ch in part.strip():
+                if ch.isspace() or ch in ":：,，。.!！?？、；;|[]()（）<>《》":
+                    break
+                target.append(ch)
+            name = "".join(target).strip("@ \t\r\n")
+            if name and name.casefold() not in aliases and name.casefold() not in blocked:
+                return name[:24]
+        pattern = re.compile(
+            r"(?:\u5410\u69fd\u4e00\u4e0b|\u5410\u69fd|\u9510\u8bc4\u4e00\u4e0b|\u9510\u8bc4|\u8bc4\u4ef7\u4e00\u4e0b|\u8bc4\u4ef7|\u635f\u4e00\u4e0b|\u635f\u635f|\u8c03\u4f83\u4e00\u4e0b|\u8c03\u4f83|roast|rate)\s*(?:\u4e00\u4e0b|this|that)?\s*([\w\u4e00-\u9fff][\w\u4e00-\u9fff_-]{0,23})",
+            re.IGNORECASE,
+        )
+        match = pattern.search(cleaned)
+        if not match:
+            return ""
+        name = match.group(1).strip("@ \t\r\n")
         return "" if name.casefold() in blocked else name[:24]
 
     @staticmethod
