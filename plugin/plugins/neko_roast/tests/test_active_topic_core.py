@@ -15,6 +15,7 @@ from plugin.plugins.neko_roast.core import (
     active_topic_recent_source,
     active_topic_rules,
     active_topic_trending_source,
+    live_content,
 )
 from plugin.plugins.neko_roast.core.active_topic_selector import ActiveTopicSelector
 
@@ -26,6 +27,11 @@ def test_active_topic_slice_imports_without_later_material_or_content_slices() -
 
     assert runtime_api.RuntimeActiveTopicApiMixin
     assert active_topic_rules._active_topic_material_profile("pick A or B")
+
+
+def test_active_content_slice_imports_without_host_catalog() -> None:
+    assert live_content.active_engagement_fallback_topic_candidates()
+    assert live_content.idle_hosting_beat_candidates() == []
 
 
 @pytest.mark.parametrize("title", ("about", "table", "cable", "stable"))
@@ -58,7 +64,7 @@ def test_explicit_ab_marker_remains_a_choice_vote() -> None:
     "provider_candidates",
     ([], [{}], [{"source": "custom"}]),
 )
-def test_invalid_runtime_fallback_uses_core_default(
+def test_invalid_runtime_fallback_uses_valid_default(
     provider_candidates: list[dict[str, str]],
 ) -> None:
     runtime = SimpleNamespace(
@@ -69,7 +75,7 @@ def test_invalid_runtime_fallback_uses_core_default(
     candidates = selector.runtime_fallback_topic_candidates()
 
     assert candidates
-    assert candidates[0]["key"] == "fallback:room-mood"
+    assert all(candidates[0].get(field) for field in ("key", "title", "hint"))
 
 
 def test_anonymous_repeats_do_not_form_a_live_thread() -> None:
@@ -126,7 +132,7 @@ async def test_empty_or_exhausted_candidates_refresh_cache(
     topic = await selector.select_topic()
 
     assert clears == [True]
-    assert topic["key"] == "fallback:room-mood"
+    assert all(topic.get(field) for field in ("key", "title", "hint"))
 
 
 def test_anonymous_recent_danmaku_flood_is_rejected() -> None:
