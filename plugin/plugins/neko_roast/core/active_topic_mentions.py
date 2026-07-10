@@ -79,6 +79,8 @@ def is_neko_mention_target(name: str, lowered_aliases: set[str]) -> bool:
         rest = lowered_name[len(alias) :].lstrip("_-")
         if not rest:
             return True
+        if "\u4e00" <= rest[0] <= "\u9fff":
+            return True
         if rest.startswith(live_address_prefixes):
             return True
     return False
