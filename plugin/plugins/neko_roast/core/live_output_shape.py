@@ -116,6 +116,9 @@ def _danmaku_viewer_nickname(metadata: dict | None) -> str:
 def ensure_danmaku_viewer_prefix(text: str, metadata: dict | None, *, limit: int) -> tuple[str, bool]:
     nickname = _danmaku_viewer_nickname(metadata)
     cleaned = str(text or "").strip()
+    max_chars = max(0, int(limit or 0))
+    if max_chars:
+        cleaned = cleaned[:max_chars].rstrip(" \uff0c,\u3001\uff1b;\u3002.!?\uff01\uff1f")
     if not nickname or not cleaned:
         return cleaned, False
     dense_name = _normalize_visible_target(nickname)
@@ -123,7 +126,7 @@ def ensure_danmaku_viewer_prefix(text: str, metadata: dict | None, *, limit: int
     if dense_name and dense_name in dense_text:
         return cleaned, False
     prefix = f"{nickname}\uff0c"
-    available = max(0, int(limit or 0) - len(prefix))
+    available = max(0, max_chars - len(prefix))
     if available <= 0:
         return cleaned, False
     body = cleaned[:available].rstrip(" \uff0c,\u3001\uff1b;\u3002.!?\uff01\uff1f")

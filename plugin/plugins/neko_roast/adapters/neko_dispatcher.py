@@ -147,7 +147,17 @@ def _coalesce_key_for_request(request: InteractionRequest, *, demo: bool = False
     source = str(request.event.source or "").strip()
     if source in _NEKO_ROAST_HOSTING_SOURCES:
         target = str(request.event.target_lanlan or "").strip() or str(request.identity.uid or "").strip()
-        return f"neko_roast:auto_host:{target or 'default'}"
+        raw = request.event.raw if isinstance(request.event.raw, dict) else {}
+        host_beat = raw.get("host_beat") if isinstance(raw.get("host_beat"), dict) else {}
+        topic = raw.get("topic_material") if isinstance(raw.get("topic_material"), dict) else {}
+        beat = str(
+            host_beat.get("key")
+            or topic.get("key")
+            or request.event.trace_id
+            or request.event.seen_at
+            or "default"
+        ).strip()
+        return f"neko_roast:auto_host:{target or 'default'}:{source}:{beat}"
     return ""
 
 

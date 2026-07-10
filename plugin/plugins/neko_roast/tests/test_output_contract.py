@@ -1,0 +1,72 @@
+from plugin.plugins.neko_roast.adapters.neko_dispatcher import _coalesce_key_for_request
+from plugin.plugins.neko_roast.core.contracts import (
+    InteractionRequest,
+    ViewerEvent,
+    ViewerIdentity,
+    ViewerProfile,
+)
+from plugin.plugins.neko_roast.core.live_output_quality import (
+    looks_like_unfulfilled_content_request,
+)
+from plugin.plugins.neko_roast.core.live_output_shape import shape_reply_text
+from plugin.plugins.neko_roast.modules.danmaku_response import DanmakuResponseModule
+
+
+def _hosting_request(*, source: str, beat_key: str) -> InteractionRequest:
+    event = ViewerEvent(
+        uid="host",
+        source=source,
+        target_lanlan="YUI",
+        raw={"host_beat": {"key": beat_key}},
+    )
+    return InteractionRequest(
+        event=event,
+        identity=ViewerIdentity(uid="host", nickname="YUI"),
+        profile=ViewerProfile(uid="host", nickname="YUI"),
+        prompt_text="host",
+        live_mode="solo_stream",
+        strength="normal",
+    )
+
+
+def test_viewer_prefix_never_exceeds_reply_limit():
+    metadata = {
+        "live_reply_contract": "short_tts_line",
+        "max_reply_chars": 10,
+        "response_module_hint": "danmaku_response",
+        "danmaku_profile": "question",
+        "danmaku_viewer_nickname": "Viewer",
+    }
+
+    shaped, _ = shape_reply_text("abcdefghij", metadata)
+
+    assert len(shaped) <= 10
+
+
+def test_short_content_with_substantive_answer_is_not_replaced():
+    metadata = {"danmaku_profile": "content_request"}
+
+    assert not looks_like_unfulfilled_content_request(
+        "\u53ef\u4ee5\uff0c\u7b11\u8bdd\u662f\u4e00\u53ea\u732b\u8d70\u8fdb\u9152\u5427",
+        metadata,
+    )
+    assert looks_like_unfulfilled_content_request(
+        "\u53ef\u4ee5\uff0c\u6211\u7ed9\u4f60\u8bb2\u4e2a\u7b11\u8bdd",
+        metadata,
+    )
+
+
+def test_hosting_coalesce_key_separates_distinct_beats():
+    first = _hosting_request(source="idle_hosting", beat_key="beat-a")
+    second = _hosting_request(source="idle_hosting", beat_key="beat-b")
+    warmup = _hosting_request(source="warmup_hosting", beat_key="beat-a")
+
+    assert _coalesce_key_for_request(first) != _coalesce_key_for_request(second)
+    assert _coalesce_key_for_request(first) != _coalesce_key_for_request(warmup)
+    assert _coalesce_key_for_request(first) == _coalesce_key_for_request(first)
+
+
+def test_generic_english_roast_targets_are_rejected():
+    assert DanmakuResponseModule._target_roast_nickname("roast that guy") == ""
+    assert DanmakuResponseModule._target_roast_nickname("rate that person") == ""
+    assert DanmakuResponseModule._target_roast_nickname("roast that Alice") == "Alice"

@@ -371,6 +371,12 @@ def looks_like_unfulfilled_content_request(text: str, metadata: Mapping[str, Any
         term.casefold() in lowered or normalize_text(term) in dense
         for term in CONTENT_DELIVERY_TERMS
     )
+    remaining = dense
+    for term in UNFULFILLED_CONTENT_PROMISE_TERMS:
+        remaining = remaining.replace(normalize_text(term), "")
+    has_substantive_tail = len(remaining) >= 6
+    if has_delivery or has_substantive_tail:
+        return False
     if len(dense) <= 24:
         return True
     if "\u7b11\u8bdd" in dense and not has_delivery:
