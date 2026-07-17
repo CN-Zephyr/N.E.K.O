@@ -5,10 +5,93 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from twitchio.eventsub import websockets as twitchio_websockets
 from twitchio.authentication import Scopes
+from twitchio.exceptions import WebsocketConnectionException
 
 from plugin.plugins.neko_roast.modules.twitch_live_ingest import TwitchLiveIngestModule, _public_scopes
 from plugin.plugins.neko_roast.core.runtime_live_controls import _resolve_connection_auth_mode
+from plugin.plugins.neko_roast.modules.twitch_live_ingest.twitch_client import (
+    NekoTwitchClient,
+    create_twitch_client,
+)
+
+
+async def _ignore_callback(_payload: Any) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_neko_twitch_client_http_session_trusts_environment() -> None:
+    client = create_twitch_client(
+        client_id="client123",
+        on_message=_ignore_callback,
+        on_chat_notification=_ignore_callback,
+        on_token_refreshed=_ignore_callback,
+    )
+    assert isinstance(client, NekoTwitchClient)
+    try:
+        assert client._neko_http_session.trust_env is True
+    finally:
+        await client.close(save_tokens=False)
+
+
+@pytest.mark.asyncio
+async def test_neko_twitch_client_closes_injected_http_session() -> None:
+    client = create_twitch_client(
+        client_id="client123",
+        on_message=_ignore_callback,
+        on_chat_notification=_ignore_callback,
+        on_token_refreshed=_ignore_callback,
+    )
+    session = client._neko_http_session
+
+    await client.close(save_tokens=False)
+    await client.close(save_tokens=False)
+
+    assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_eventsub_websocket_connection_failure_uses_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_kwargs: dict[str, Any] = {}
+
+    class _FailingSession:
+        async def __aenter__(self) -> "_FailingSession":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def ws_connect(self, *_args: Any, **_kwargs: Any) -> None:
+            raise OSError("simulated websocket connection failure")
+
+    class _FakeAiohttp:
+        @staticmethod
+        def ClientSession(**kwargs: Any) -> _FailingSession:
+            session_kwargs.update(kwargs)
+            return _FailingSession()
+
+    monkeypatch.setattr(twitchio_websockets, "aiohttp", _FakeAiohttp())
+    client = create_twitch_client(
+        client_id="client123",
+        on_message=_ignore_callback,
+        on_chat_notification=_ignore_callback,
+        on_token_refreshed=_ignore_callback,
+    )
+    socket = twitchio_websockets.Websocket(
+        client=None,
+        token_for="123",
+        http=SimpleNamespace(),
+    )
+    try:
+        with pytest.raises(WebsocketConnectionException):
+            await socket.connect(fail_once=True)
+        assert session_kwargs.get("trust_env") is True
+    finally:
+        await client.close(save_tokens=False)
 
 
 class _Bus:
