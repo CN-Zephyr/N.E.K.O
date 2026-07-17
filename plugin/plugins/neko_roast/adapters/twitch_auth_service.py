@@ -7,10 +7,15 @@ access token has been validated against Twitch.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
+
+from utils.http.aiohttp_proxy import aiohttp_session_kwargs_for_url
 
 
 CredentialProvider = Callable[[], Awaitable[dict[str, Any] | None]]
@@ -42,12 +47,14 @@ class TwitchAuthService:
     def __init__(
         self,
         *,
+        logger: Any = None,
         credential_provider: CredentialProvider,
         credential_saver: CredentialSaver,
         credential_reloader: CredentialReloader,
         request_json: RequestJson | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        self.logger = logger
         self._credential_provider = credential_provider
         self._credential_saver = credential_saver
         self._credential_reloader = credential_reloader
@@ -59,11 +66,32 @@ class TwitchAuthService:
         normalized_client_id = _client_id(client_id)
         if not normalized_client_id:
             self._device_session = None
+            self._log("warning", "stage=invalid_client_id flow=device_authorization")
             return _error("invalid twitch client id")
-        status, data = await self._request_json(
-            "POST",
-            _DEVICE_URL,
-            data={"client_id": normalized_client_id, "scopes": " ".join(_SCOPES)},
+        request_started = time.perf_counter()
+        self._log(
+            "info",
+            "stage=request_start flow=device_authorization "
+            f"client_id_len={len(normalized_client_id)} "
+            f"trust_env={aiohttp_session_kwargs_for_url(_DEVICE_URL).get('trust_env') is True} "
+            f"proxy_env_present={_proxy_env_present()}",
+        )
+        try:
+            status, data = await self._request(
+                "POST",
+                _DEVICE_URL,
+                data={"client_id": normalized_client_id, "scopes": " ".join(_SCOPES)},
+            )
+        except Exception as exc:
+            self._log(
+                "error",
+                "stage=request_error flow=device_authorization "
+                f"error_type={type(exc).__name__} elapsed_ms={_elapsed_ms(request_started)}",
+            )
+            raise
+        self._log(
+            "info",
+            f"stage=response status={status} flow=device_authorization elapsed_ms={_elapsed_ms(request_started)}",
         )
         device_code = _text(data.get("device_code"), limit=512)
         user_code = _text(data.get("user_code"), limit=64)
@@ -72,6 +100,12 @@ class TwitchAuthService:
         interval = _positive_int(data.get("interval"), default=5, maximum=60)
         if status != 200 or not all((device_code, user_code, verification_uri, expires_in)):
             self._device_session = None
+            self._log(
+                "warning",
+                "stage=response_invalid flow=device_authorization "
+                f"status={status} user_code_present={bool(user_code)} "
+                f"verification_uri_present={bool(verification_uri)}",
+            )
             return _error("twitch device authorization could not be started")
         self._device_session = _DeviceSession(
             client_id=normalized_client_id,
@@ -81,6 +115,12 @@ class TwitchAuthService:
             expires_at=self._clock() + expires_in,
             expires_in=expires_in,
             interval=interval,
+        )
+        self._log(
+            "info",
+            "stage=ready "
+            f"user_code={user_code} verification_uri={verification_uri} "
+            f"expires_in={expires_in} interval={interval}",
         )
         return {
             "platform": "twitch",
@@ -92,6 +132,50 @@ class TwitchAuthService:
             "interval": interval,
         }
 
+    def _log(self, level: str, message: str) -> None:
+        logger = self.logger
+        if logger is None:
+            return
+        writer = getattr(logger, level, None)
+        if not callable(writer):
+            return
+        try:
+            writer(f"[Twitch OAuth] {message}")
+        except Exception:
+            return
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        data: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        endpoint = _endpoint_name(url)
+        for attempt in (1, 2):
+            self._log(
+                "info",
+                f"stage=request_attempt endpoint={endpoint} attempt={attempt}",
+            )
+            try:
+                return await self._request_json(
+                    method,
+                    url,
+                    headers=headers,
+                    data=data,
+                )
+            except Exception as exc:
+                if attempt >= 2 or not _retryable_request_error(exc):
+                    raise
+                self._log(
+                    "warning",
+                    f"stage=request_retry endpoint={endpoint} attempt={attempt} "
+                    f"error_type={type(exc).__name__}",
+                )
+                await asyncio.sleep(0.25)
+        raise RuntimeError("unreachable twitch request retry state")
+
     async def check_device_authorization(self, client_id: Any) -> dict[str, Any]:
         normalized_client_id = _client_id(client_id)
         session = self._device_session
@@ -100,7 +184,7 @@ class TwitchAuthService:
         if self._clock() >= session.expires_at:
             self._device_session = None
             return _error("twitch device authorization expired")
-        status, data = await self._request_json(
+        status, data = await self._request(
             "POST",
             _TOKEN_URL,
             data={
@@ -148,7 +232,7 @@ class TwitchAuthService:
         refresh_token = _secret(current, "refresh_token")
         if not refresh_token:
             return _error("twitch authorization expired")
-        status, token_data = await self._request_json(
+        status, token_data = await self._request(
             "POST",
             _TOKEN_URL,
             data={
@@ -186,7 +270,7 @@ class TwitchAuthService:
         )
 
     async def _validate_token(self, access_token: str, client_id: str) -> dict[str, Any] | None:
-        status, data = await self._request_json(
+        status, data = await self._request(
             "GET",
             _VALIDATE_URL,
             headers={"Authorization": f"OAuth {access_token}"},
@@ -217,7 +301,8 @@ async def _request_json(
     import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    session_kwargs = aiohttp_session_kwargs_for_url(url)
+    async with aiohttp.ClientSession(timeout=timeout, **session_kwargs) as session:
         async with session.request(method, url, headers=headers, data=data) as response:
             try:
                 payload = await response.json(content_type=None)
@@ -305,9 +390,55 @@ def _positive_int(value: Any, *, default: int, maximum: int) -> int:
     return number if 0 < number <= maximum else default
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def _proxy_env_present() -> bool:
+    return any(
+        bool(os.environ.get(name))
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
+    )
+
+
+def _endpoint_name(url: str) -> str:
+    if url == _DEVICE_URL:
+        return "device"
+    if url == _TOKEN_URL:
+        return "token"
+    if url == _VALIDATE_URL:
+        return "validate"
+    return "unknown"
+
+
+def _retryable_request_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    try:
+        import aiohttp
+    except Exception:
+        return False
+    return isinstance(exc, aiohttp.ClientConnectionError)
+
+
 def _verification_uri(value: Any) -> str:
     text = _text(value, limit=200)
-    return text if text in {"https://www.twitch.tv/activate", "https://twitch.tv/activate"} else ""
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"twitch.tv", "www.twitch.tv"}
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/activate"
+        or parsed.fragment
+    ):
+        return ""
+    return text
 
 
 def _oauth_error(data: Any) -> str:

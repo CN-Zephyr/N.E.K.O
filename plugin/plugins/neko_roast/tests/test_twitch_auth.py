@@ -6,7 +6,11 @@ from typing import Any
 
 import pytest
 
-from plugin.plugins.neko_roast.adapters.twitch_auth_service import TwitchAuthService
+from plugin.plugins.neko_roast.adapters.twitch_auth_service import (
+    TwitchAuthService,
+    _request_json,
+    _verification_uri,
+)
 from plugin.plugins.neko_roast.core import runtime_twitch_auth
 
 
@@ -43,6 +47,24 @@ class _Http:
         return self.responses.pop(0)
 
 
+class _Logger:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.lines.append(f"INFO {message}")
+
+    def warning(self, message: str) -> None:
+        self.lines.append(f"WARNING {message}")
+
+    def error(self, message: str) -> None:
+        self.lines.append(f"ERROR {message}")
+
+
+def test_verification_uri_rejects_malformed_twitch_port() -> None:
+    assert _verification_uri("https://www.twitch.tv:not-a-port/activate") == ""
+
+
 def _service(store: _Store, http: _Http) -> TwitchAuthService:
     async def reload() -> None:
         return None
@@ -54,6 +76,145 @@ def _service(store: _Store, http: _Http) -> TwitchAuthService:
         request_json=http,
         clock=lambda: 1_700_000_000.0,
     )
+
+
+@pytest.mark.asyncio
+async def test_external_twitch_http_requests_trust_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import aiohttp
+
+    captured: dict[str, Any] = {}
+
+    class _Response:
+        status = 400
+
+        async def __aenter__(self) -> _Response:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def json(self, *, content_type: Any = None) -> dict[str, Any]:
+            return {"message": "invalid client id"}
+
+    class _Session:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def request(self, *_args: Any, **_kwargs: Any) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", _Session)
+
+    status, _payload = await _request_json(
+        "POST",
+        "https://id.twitch.tv/oauth2/device",
+        data={"client_id": "aaaaaaaa", "scopes": "user:read:chat"},
+    )
+
+    assert status == 400
+    assert captured["trust_env"] is True
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_logs_public_code_and_never_logs_secret_device_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    store = _Store()
+    logger = _Logger()
+    http = _Http(
+        [
+            (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate?public=true&device-code=ABCD-EFGH",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            )
+        ]
+    )
+
+    async def reload() -> None:
+        return None
+
+    service = TwitchAuthService(
+        logger=logger,
+        credential_provider=store.load,
+        credential_saver=store.save,
+        credential_reloader=reload,
+        request_json=http,
+        clock=lambda: 1_700_000_000.0,
+    )
+
+    result = await service.start_device_authorization("clientid123")
+
+    lines = "\n".join(logger.lines)
+    assert result["started"] is True
+    assert "stage=request_start" in lines
+    assert "trust_env=True proxy_env_present=True" in lines
+    assert "stage=response status=200" in lines
+    assert "stage=ready user_code=ABCD-EFGH" in lines
+    assert (
+        "verification_uri=https://www.twitch.tv/activate?public=true&device-code=ABCD-EFGH"
+        in lines
+    )
+    assert "secret-device-code" not in lines
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_retries_one_transient_proxy_connection_failure() -> None:
+    store = _Store()
+    logger = _Logger()
+
+    class _TransientHttp:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, *_args: Any, **_kwargs: Any) -> tuple[int, dict[str, Any]]:
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("proxy reset")
+            return (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            )
+
+    http = _TransientHttp()
+
+    async def reload() -> None:
+        return None
+
+    service = TwitchAuthService(
+        logger=logger,
+        credential_provider=store.load,
+        credential_saver=store.save,
+        credential_reloader=reload,
+        request_json=http,
+        clock=lambda: 1_700_000_000.0,
+    )
+
+    result = await service.start_device_authorization("clientid123")
+
+    lines = "\n".join(logger.lines)
+    assert result["started"] is True
+    assert http.calls == 2
+    assert "stage=request_retry endpoint=device attempt=1 error_type=ConnectionError" in lines
+    assert "stage=request_attempt endpoint=device attempt=2" in lines
 
 
 @pytest.mark.asyncio

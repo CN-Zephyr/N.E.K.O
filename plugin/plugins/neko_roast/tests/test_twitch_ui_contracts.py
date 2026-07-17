@@ -3,10 +3,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from plugin.plugins.neko_roast import NekoRoastPlugin
 from plugin.plugins.neko_roast.core.runtime_dashboard_actions import dashboard_actions
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_twitch_network_actions_declare_entry_timeouts_above_host_default() -> None:
+    expected = {
+        "twitch_device_authorization_start": 25.0,
+        "twitch_device_authorization_check": 40.0,
+        "twitch_credential_validate": 55.0,
+    }
+
+    for method_name, timeout in expected.items():
+        method = getattr(NekoRoastPlugin, method_name)
+        meta = getattr(method, "__neko_event_meta__")
+        assert meta.timeout == timeout
 
 
 def test_twitch_auth_actions_are_exposed_to_hosted_ui() -> None:

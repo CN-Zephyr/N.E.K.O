@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from plugin.sdk.plugin import Err, NekoPluginBase, Ok, SdkError, lifecycle, neko_plugin, plugin_entry, tr, ui
@@ -382,6 +383,7 @@ class NekoRoastPlugin(NekoPluginBase):
         id="twitch_device_authorization_start",
         name=tr("entries.twitch_device_authorization_start.name", default="开始 Twitch 设备授权"),
         description=tr("entries.twitch_device_authorization_start.description", default="使用 Client ID 启动 Twitch Device Code Flow；不需要 Client Secret。"),
+        timeout=25.0,
         input_schema={
             "type": "object",
             "properties": {"client_id": {"type": "string", "description": "Twitch Developer Client ID"}},
@@ -389,10 +391,38 @@ class NekoRoastPlugin(NekoPluginBase):
         },
     )
     async def twitch_device_authorization_start(self, client_id="", **_):
+        started_at = time.perf_counter()
+        logger = self.logger
+        if logger is not None:
+            logger.info(
+                "[Twitch OAuth] stage=entry_start "
+                f"client_id_len={len(client_id.strip()) if isinstance(client_id, str) else 0}"
+            )
         try:
             await self._runtime().update_config({"twitch_client_id": client_id})
-            return Ok(await self._runtime().twitch_device_authorization_start())
+            if logger is not None:
+                logger.info(
+                    "[Twitch OAuth] stage=config_saved "
+                    f"elapsed_ms={max(0, int((time.perf_counter() - started_at) * 1000))}"
+                )
+            result = await self._runtime().twitch_device_authorization_start()
+            if logger is not None:
+                logger.info(
+                    "[Twitch OAuth] stage=entry_result "
+                    f"started={result.get('started') is True} pending={result.get('pending') is True} "
+                    f"user_code={str(result.get('user_code') or '')} "
+                    f"verification_uri={str(result.get('verification_uri') or '')} "
+                    f"message={str(result.get('message') or '')} "
+                    f"elapsed_ms={max(0, int((time.perf_counter() - started_at) * 1000))}"
+                )
+            return Ok(result)
         except Exception as exc:
+            if logger is not None:
+                logger.error(
+                    "[Twitch OAuth] stage=entry_error "
+                    f"error_type={type(exc).__name__} "
+                    f"elapsed_ms={max(0, int((time.perf_counter() - started_at) * 1000))}"
+                )
             return Err(SdkError(str(exc)))
 
     @ui.action(id="twitch_device_authorization_check", label=tr("actions.twitch_device_authorization_check.label", default="检查 Twitch 授权"), group="auth", order=100, refresh_context=True)
@@ -400,6 +430,7 @@ class NekoRoastPlugin(NekoPluginBase):
         id="twitch_device_authorization_check",
         name=tr("entries.twitch_device_authorization_check.name", default="检查 Twitch 设备授权"),
         description=tr("entries.twitch_device_authorization_check.description", default="手动检查一次 Device Code Flow；成功后加密保存 token。"),
+        timeout=40.0,
     )
     async def twitch_device_authorization_check(self, **_):
         try:
@@ -424,6 +455,7 @@ class NekoRoastPlugin(NekoPluginBase):
         id="twitch_credential_validate",
         name=tr("entries.twitch_credential_validate.name", default="校验 Twitch 授权"),
         description=tr("entries.twitch_credential_validate.description", default="向 Twitch 校验 token，并在需要时原子刷新加密凭据。"),
+        timeout=55.0,
     )
     async def twitch_credential_validate(self, **_):
         try:

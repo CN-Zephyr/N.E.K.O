@@ -26,6 +26,7 @@ def create_credential_store(plugin: Any, audit: Any) -> CredentialStore:
 
 def create_auth_service(runtime: Any) -> TwitchAuthService:
     return TwitchAuthService(
+        logger=getattr(getattr(runtime, "plugin", None), "logger", None),
         credential_provider=runtime.twitch_credential_store.load,
         credential_saver=runtime.twitch_credential_store.save,
         credential_reloader=runtime.reload_twitch_credential,
