@@ -11,9 +11,19 @@ from twitchio import eventsub
 from ...core.contracts import LiveRoomStatus, ViewerEvent
 from .._base import BaseModule
 from .helix import lookup_channel_status
-from .projection import project_chat_message
+from .projection import project_chat_message, project_chat_notification
 from .room_ref import parse_twitch_room_ref
 from .twitch_client import create_twitch_client
+
+
+_TWITCH_SUPPORT_EVIDENCE = "twitch_eventsub_typed_event"
+_TWITCH_SUPPORT_EVENT_TYPES = {
+    "TWITCH_CHEER",
+    "TWITCH_SUB",
+    "TWITCH_RESUB",
+    "TWITCH_SUB_GIFT",
+    "TWITCH_COMMUNITY_SUB_GIFT",
+}
 
 
 class TwitchLiveIngestModule(BaseModule):
@@ -67,6 +77,7 @@ class TwitchLiveIngestModule(BaseModule):
                 client = self._client_factory(
                     client_id=client_id,
                     on_message=lambda message: self._on_message(message, generation),
+                    on_chat_notification=lambda notification: self._on_chat_notification(notification, generation),
                     on_token_refreshed=lambda payload: self._on_token_refreshed(payload, generation),
                 )
                 self._client = client
@@ -89,6 +100,15 @@ class TwitchLiveIngestModule(BaseModule):
                 )
                 await client.subscribe_websocket(
                     subscription,
+                    as_bot=False,
+                    token_for=account_user_id,
+                )
+                notification_subscription = eventsub.ChatNotificationSubscription(
+                    broadcaster_user_id=str(status.room_id),
+                    user_id=account_user_id,
+                )
+                await client.subscribe_websocket(
+                    notification_subscription,
                     as_bot=False,
                     token_for=account_user_id,
                 )
@@ -160,6 +180,7 @@ class TwitchLiveIngestModule(BaseModule):
         client = self._client_factory(
             client_id=client_id,
             on_message=_ignore_event,
+            on_chat_notification=_ignore_event,
             on_token_refreshed=self._on_temporary_token_refreshed,
         )
         try:
@@ -183,6 +204,15 @@ class TwitchLiveIngestModule(BaseModule):
         if not self._owns_target(generation):
             return
         event = project_chat_message(message, room_ref=self._room_ref)
+        self._publish_event(event)
+
+    async def _on_chat_notification(self, notification: Any, generation: int) -> None:
+        if not self._owns_target(generation):
+            return
+        event = project_chat_notification(notification, room_ref=self._room_ref)
+        self._publish_event(event)
+
+    def _publish_event(self, event: Any) -> None:
         if event is None:
             return
         event.session_generation = _safe_generation(getattr(self.ctx, "_live_session_generation", 0))
@@ -265,6 +295,37 @@ class TwitchLiveIngestModule(BaseModule):
             "event_type": _safe_text(safe.get("event_type"), 32),
             "chatter_login": _safe_login(safe.get("chatter_login")),
         }
+        parsed_room = parse_twitch_room_ref(safe.get("room_ref"))
+        if parsed_room.ok:
+            raw["room_ref"] = parsed_room.room_ref
+        if raw["event_type"] == "gift":
+            gift_name = _safe_text(safe.get("gift_name"), 80)
+            gift_count = _safe_positive_int(safe.get("gift_count"), maximum=10_000_000)
+            gift_value = _safe_positive_int(safe.get("gift_value"), maximum=10_000_000)
+            provider_event_id = _safe_public_token(safe.get("provider_event_id"), 80)
+            provider_event_type = _safe_text(safe.get("provider_event_type"), 48)
+            verified = (
+                safe.get("support_verified") is True
+                and safe.get("support_evidence") == _TWITCH_SUPPORT_EVIDENCE
+                and provider_event_id
+                and provider_event_type in _TWITCH_SUPPORT_EVENT_TYPES
+            )
+            if gift_name:
+                raw["gift_name"] = gift_name
+            if gift_count:
+                raw["gift_count"] = gift_count
+            if gift_value:
+                raw["gift_value"] = gift_value
+            if verified:
+                raw.update(
+                    {
+                        "coin_type": "gold",
+                        "support_verified": True,
+                        "support_evidence": _TWITCH_SUPPORT_EVIDENCE,
+                        "provider_event_id": provider_event_id,
+                        "provider_event_type": provider_event_type,
+                    }
+                )
         return ViewerEvent(
             uid=uid,
             nickname=_safe_text(safe.get("nickname"), 80),
@@ -303,6 +364,13 @@ def _safe_text(value: Any, limit: int) -> str:
 def _safe_login(value: Any) -> str:
     text = _safe_text(value, 25).lower()
     return text if text.isascii() and text.replace("_", "").isalnum() else ""
+
+
+def _safe_public_token(value: Any, limit: int) -> str:
+    text = value.strip()[:limit] if isinstance(value, str) else ""
+    if not text or not text.isascii():
+        return ""
+    return text if all(char.isalnum() or char in {"-", "_", ":", "."} for char in text) else ""
 
 
 def _safe_client_id(value: Any) -> str:

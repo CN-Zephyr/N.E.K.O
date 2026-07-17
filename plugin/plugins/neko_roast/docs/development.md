@@ -1097,8 +1097,13 @@ token validate 与 refresh。Access/refresh token 只进入 `twitch` namespace �
 adapter；刷新回调必须同时原子替换两枚 token，保存失败立即停止监听。
 
 目标只接受 Twitch login 或无 query/fragment 的规范频道 URL，授权账号与目标频道分离。
-首阶段只订阅 `channel.chat.message` 并投影为不保留 raw 的
-`LiveEvent(type="danmaku")`；不接首页/推荐、bits/subs/raid、后台 OAuth 轮询或任何写能力。
+当前以 `user:read:chat` 同时订阅 `channel.chat.message` 与
+`channel.chat.notification`，普通消息投影为不保留 raw 的
+`LiveEvent(type="danmaku")`；带 typed Cheer metadata 的消息以及可见的 sub / resub /
+standalone sub gift / community sub gift 通知投影为可信 `LiveEvent(type="gift")`，复用
+`live_support_events` 的去重、调度、Pipeline、Safety 与 Dispatcher。community gift 子通知必须
+丢弃以避免重复感谢，匿名赠礼统一投影为 `twitch:anonymous`。本阶段不增加 OAuth scope、后台
+轮询、依赖或持久礼物账本，也不接权威收入账务、首页/推荐、raid/redemption 或任何写能力。
 完整边界见 `docs/modules/twitch_live_ingest.md`。
 
 ## Douyin Live Bridge

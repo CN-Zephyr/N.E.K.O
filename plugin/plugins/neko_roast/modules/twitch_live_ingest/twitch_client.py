@@ -14,6 +14,7 @@ class NekoTwitchClient(twitchio.Client):
         *,
         client_id: str,
         on_message: Callable[[Any], Awaitable[None]],
+        on_chat_notification: Callable[[Any], Awaitable[None]],
         on_token_refreshed: Callable[[Any], Awaitable[None]],
     ) -> None:
         super().__init__(
@@ -22,10 +23,14 @@ class NekoTwitchClient(twitchio.Client):
             fetch_client_user=False,
         )
         self._neko_on_message = on_message
+        self._neko_on_chat_notification = on_chat_notification
         self._neko_on_token_refreshed = on_token_refreshed
 
     async def event_message(self, payload: Any) -> None:
         await self._neko_on_message(payload)
+
+    async def event_chat_notification(self, payload: Any) -> None:
+        await self._neko_on_chat_notification(payload)
 
     async def event_token_refreshed(self, payload: Any) -> None:
         await self._neko_on_token_refreshed(payload)

@@ -1,6 +1,6 @@
 # twitch_live_ingest
 
-`twitch_live_ingest` is NEKO Live's first read-only Twitch slice. It uses
+`twitch_live_ingest` is NEKO Live's read-only Twitch provider. It uses
 `twitchio==3.2.2` for Helix and EventSub WebSocket delivery, while NEKO owns the
 client-secret-free Device Code Flow and encrypted token persistence.
 
@@ -14,7 +14,7 @@ client-secret-free Device Code Flow and encrypted token persistence.
    `https://www.twitch.tv/<login>` URL. The authorized account and target channel
    are independent.
 4. Query the channel and start listening. Helix supplies online/offline metadata;
-   EventSub `channel.chat.message` supplies read-only chat events.
+   EventSub supplies read-only chat and visible support events.
 
 Only the `user:read:chat` scope is requested. Access and refresh tokens are
 stored in the `twitch` namespace of `CredentialStore`, encrypted at rest. Device
@@ -26,16 +26,40 @@ if that save fails, the listener stops in `auth_required` state.
 
 ## Public event boundary
 
-The provider subscribes only to `channel.chat.message`. A message is projected
-to `LiveEvent(type="danmaku")` with bounded public fields: Twitch-prefixed user
-ID, display name, channel login, text, message ID, and normalized room reference.
-The TwitchIO object and raw EventSub payload are not retained. The shared
-EventBus, pipeline, safety guard, and dispatcher remain unchanged.
+The provider subscribes to `channel.chat.message` and
+`channel.chat.notification` on the same EventSub WebSocket connection.
+
+- Ordinary chat becomes `LiveEvent(type="danmaku")`.
+- A chat message with typed Cheer metadata becomes a verified
+  `LiveEvent(type="gift")`; Bits are projected as the public gift value.
+- Visible `sub`, `resub`, standalone `sub_gift`, and `community_sub_gift`
+  notices become verified gift events. A community gift's aggregate notice is
+  retained and its child `sub_gift` notices are ignored to prevent duplicate
+  thanks. Anonymous gifts use the stable public identity `twitch:anonymous`.
+- Raid, announcement, redemption, and other notification types are ignored.
+
+Every support event requires a bounded provider event ID and carries
+`support_evidence=twitch_eventsub_typed_event`. Only bounded public fields enter
+the shared EventBus and support scheduler; the TwitchIO object and raw EventSub
+payload are never retained. Selected events continue through the normal
+pipeline, safety guard, and dispatcher before NEKO speaks.
+
+## Permission and cost decision
+
+The approved low-permission design keeps the existing `user:read:chat` scope.
+It adds one EventSub subscription but no OAuth scope, reauthorization, polling,
+dependency, or persistent gift ledger. This reports support activity visible in
+chat; it is not an authoritative broadcaster revenue feed. Adding authoritative
+Bits or subscription accounting later would require a separate owner review and
+the broader broadcaster scopes such as `bits:read` or
+`channel:read:subscriptions`. Rollback only requires removing the chat
+notification subscription and Cheer projection.
 
 ## Deliberately out of scope
 
 - Twitch homepage, discovery, recommendations, or followed-channel feeds
-- bits, subscriptions, raids, redemptions, or other EventSub types
+- authoritative broadcaster revenue/accounting feeds
+- raids, channel-point redemptions, announcements, or other notification types
 - sending chat messages or any other Twitch write operation
 - background Device Flow polling
 - bundled Client ID or Client Secret

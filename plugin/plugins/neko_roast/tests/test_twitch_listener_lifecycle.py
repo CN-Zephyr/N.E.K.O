@@ -132,6 +132,10 @@ async def test_listener_starts_without_twitchio_token_files_and_subscribes_targe
     subscription, kwargs = client.subscriptions[0]
     assert subscription.condition == {"broadcaster_user_id": "100", "user_id": "42"}
     assert kwargs == {"as_bot": False, "token_for": "42"}
+    notification_subscription, notification_kwargs = client.subscriptions[1]
+    assert notification_subscription.type == "channel.chat.notification"
+    assert notification_subscription.condition == {"broadcaster_user_id": "100", "user_id": "42"}
+    assert notification_kwargs == {"as_bot": False, "token_for": "42"}
     assert module.listener_state()["state"] == "connected"
     assert module.listener_state()["room_ref"] == "target_channel"
 
@@ -173,6 +177,45 @@ async def test_listener_projects_messages_and_drops_stale_generation_after_stop(
 
     await module.stop_listening()
     await emit(message)
+
+    assert len(ctx.event_bus.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_projects_chat_notifications_to_gift_bus_events() -> None:
+    clients: list[_Client] = []
+
+    def factory(**callbacks: Any) -> _Client:
+        client = _Client(**callbacks)
+        clients.append(client)
+        return client
+
+    module = TwitchLiveIngestModule(client_factory=factory)
+    ctx = _context(module, _Store())
+    module.ctx = ctx
+    await module.start_listening("target_channel")
+    emit = clients[0].callbacks["on_chat_notification"]
+    notice = SimpleNamespace(
+        id="notice-sub-1",
+        notice_type="sub",
+        anonymous=False,
+        chatter=SimpleNamespace(id="201", name="subscriber", display_name="Subscriber"),
+        text="",
+        system_message="Subscriber subscribed at Tier 1!",
+        sub=SimpleNamespace(tier="1000", months=1, prime=False),
+    )
+
+    await emit(notice)
+
+    assert len(ctx.event_bus.events) == 1
+    event_type, event = ctx.event_bus.events[0]
+    assert event_type == "gift"
+    assert event.payload["provider_event_type"] == "TWITCH_SUB"
+    assert event.session_generation == 7
+    assert module.listener_state()["state"] == "receiving"
+
+    await module.stop_listening()
+    await emit(notice)
 
     assert len(ctx.event_bus.events) == 1
 
