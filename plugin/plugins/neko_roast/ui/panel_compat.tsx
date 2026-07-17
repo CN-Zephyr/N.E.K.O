@@ -50,6 +50,7 @@ type RoastConfig = {
   live_platform?: string
   live_room_ref?: string
   live_room_id?: number
+  twitch_client_id?: string
   live_enabled?: boolean
   avatar_roast_enabled?: boolean
   avatar_analysis_enabled?: boolean
@@ -102,6 +103,7 @@ const configDefaults = {
   live_platform: "bilibili",
   live_room_ref: "",
   live_room_id: "0",
+  twitch_client_id: "",
   douyin_cookie: "",
   douyin_uid: "",
   douyin_nickname: "",
@@ -1266,6 +1268,7 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
   const [queriedRoomRef, setQueriedRoomRef] = useState("")
   const [loginState, setLoginState] = useState<any>(null)
   const [douyinAuthState, setDouyinAuthState] = useState<any>(null)
+  const [twitchAuthState, setTwitchAuthState] = useState<any>(null)
   const [consoleDialog, setConsoleDialog] = useState<"account" | "room" | "theme" | "pacing" | "diagnostics" | "">("")
   const [interactionDialog, setInteractionDialog] = useState<"avatar_roast" | "danmaku_response" | "live_support_events" | "warmup_hosting" | "idle_hosting" | "active_engagement" | "">("")
   const [connectPending, setConnectPending] = useState(false)
@@ -1325,6 +1328,7 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
       idle_hosting_enabled: config.idle_hosting_enabled !== false,
       active_engagement_enabled: config.active_engagement_enabled !== false,
       live_room_id: String(config.live_room_id || ""),
+      twitch_client_id: String(config.twitch_client_id || ""),
       douyin_cookie: configForm.values.douyin_cookie || "",
       douyin_uid: configForm.values.douyin_uid || "",
       douyin_nickname: configForm.values.douyin_nickname || "",
@@ -1356,6 +1360,7 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
     config.idle_hosting_enabled,
     config.active_engagement_enabled,
     config.live_room_id,
+    config.twitch_client_id,
     config.developer_tools_enabled,
     config.live_mode,
     config.activity_level,
@@ -1816,6 +1821,87 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
     }
   }
 
+  async function twitchAuthorize() {
+    if (authPending || sessionInProgress) return
+    const clientId = String(configForm.values.twitch_client_id || "").trim()
+    if (!clientId) {
+      toast.error(t("panel.placeholders.twitchClientId"))
+      return
+    }
+    setAuthPending("twitch_device_authorization_start")
+    try {
+      const result = unwrapActionResult(await props.api.call("twitch_device_authorization_start", { client_id: clientId }))
+      setTwitchAuthState(result)
+      toast.info(t("panel.twitchAuth.deviceHint"))
+      await refreshDashboard(true)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthPending("")
+    }
+  }
+
+  async function twitchCheckAuthorization() {
+    if (authPending || sessionInProgress) return
+    setAuthPending("twitch_device_authorization_check")
+    try {
+      const result = unwrapActionResult(await props.api.call("twitch_device_authorization_check"))
+      setTwitchAuthState(result)
+      if (result.logged_in) toast.success(t("panel.twitchAuth.authorized"))
+      else toast.info(result.message || t("panel.twitchAuth.deviceHint"))
+      await refreshDashboard(true)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthPending("")
+    }
+  }
+
+  async function twitchStatus() {
+    if (authPending) return
+    setAuthPending("twitch_login_status")
+    try {
+      const result = unwrapActionResult(await props.api.call("twitch_login_status"))
+      setTwitchAuthState(result)
+      toast.info(result.logged_in ? t("panel.twitchAuth.authorized") : t("panel.twitchAuth.notAuthorized"))
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthPending("")
+    }
+  }
+
+  async function twitchValidate() {
+    if (authPending) return
+    setAuthPending("twitch_credential_validate")
+    try {
+      const result = unwrapActionResult(await props.api.call("twitch_credential_validate"))
+      setTwitchAuthState(result)
+      if (result.logged_in) toast.success(t("panel.twitchAuth.authorized"))
+      else toast.warning(result.message || t("panel.twitchAuth.notAuthorized"))
+      await refreshDashboard(true)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthPending("")
+    }
+  }
+
+  async function twitchLogout() {
+    if (authPending || sessionInProgress) return
+    setAuthPending("twitch_logout")
+    try {
+      const result = unwrapActionResult(await props.api.call("twitch_logout"))
+      setTwitchAuthState(result)
+      toast.success(t("panel.actions.twitchLogout"))
+      await refreshDashboard(true)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthPending("")
+    }
+  }
+
   useEffect(() => {
     ;(async () => {
       try {
@@ -1827,6 +1913,11 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
         setDouyinAuthState(unwrapActionResult(await props.api.call("douyin_cookie_status")))
       } catch {
         /* Douyin auth status is optional until that provider is selected. */
+      }
+      try {
+        setTwitchAuthState(unwrapActionResult(await props.api.call("twitch_login_status")))
+      } catch {
+        /* Twitch auth status is optional until that provider is selected. */
       }
     })()
   }, [])
@@ -2029,9 +2120,10 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
     panelText(t, `${keyPrefix}.${value}`, labelFallback(group, value))
   )
   const livePlatform = String(configForm.values.live_platform || config.live_platform || "bilibili")
-  const livePlatformLabel = t(`panel.platform.${livePlatform === "douyin" ? "douyin" : "bilibili"}`)
-  const roomFieldLabel = livePlatform === "douyin" ? t("panel.fields.douyinRoom") : t("panel.fields.roomId")
-  const roomPlaceholder = livePlatform === "douyin" ? t("panel.placeholders.douyinRoom") : t("panel.placeholders.roomId")
+  const livePlatformKey = livePlatform === "douyin" ? "douyin" : livePlatform === "twitch" ? "twitch" : "bilibili"
+  const livePlatformLabel = t(`panel.platform.${livePlatformKey}`)
+  const roomFieldLabel = livePlatform === "douyin" ? t("panel.fields.douyinRoom") : livePlatform === "twitch" ? t("panel.fields.twitchRoom") : t("panel.fields.roomId")
+  const roomPlaceholder = livePlatform === "douyin" ? t("panel.placeholders.douyinRoom") : livePlatform === "twitch" ? t("panel.placeholders.twitchRoom") : t("panel.placeholders.roomId")
   const configuredRoomRef = String(config.live_room_ref || config.live_room_id || "").trim()
   const currentRoomRef = String(connection.room_ref || configuredRoomRef || "").trim()
   const lookupRoomRef = String(liveRoomResult?.room_ref || liveRoomResult?.room_id || "").trim()
@@ -2047,6 +2139,9 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
   const douyinSavedAt = String((douyinAuthState && douyinAuthState.saved_at) || "")
   const douyinValidationMessage = String((douyinAuthState && douyinAuthState.message) || "")
   const douyinValidationStatus = String((douyinAuthState && douyinAuthState.live_status) || "")
+  const twitchLoggedIn = twitchAuthState?.logged_in === true
+  const twitchLogin = String(twitchAuthState?.display_name || twitchAuthState?.login || "")
+  const twitchUserId = String(twitchAuthState?.user_id || "")
   const connectionPlan = connection && typeof connection.connection_plan === "object" ? connection.connection_plan : null
   const connectionMissing = connectionPlan && Array.isArray(connectionPlan.missing) ? connectionPlan.missing.map((item: any) => String(item)).filter(Boolean) : []
   const reconnectState = connection && typeof connection.reconnect === "object" ? connection.reconnect : null
@@ -2074,13 +2169,13 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
     !!connectionLastError
   )
   const consoleState = connectPending || connectionTransitioning ? "connecting" : connectionFailed ? "error" : started ? "live" : "ready"
-  const accountReady = livePlatform === "douyin" ? douyinLoggedIn : loginLoggedIn
+  const accountReady = livePlatform === "douyin" ? douyinLoggedIn : livePlatform === "twitch" ? twitchLoggedIn : loginLoggedIn
   const connectionAuthMode = String(connection.auth_mode || "unknown")
   const limitedConnection = livePlatform === "bilibili" && !loginLoggedIn && (
     allowLimitedConnection || connectionAuthMode === "limited_accountless"
   )
   const loginRequired = livePlatform === "bilibili" && !loginLoggedIn && !limitedConnection
-  const canStart = roomConfigured && (livePlatform === "bilibili" ? (loginLoggedIn || limitedConnection) : douyinLoggedIn) && !connectPending && !sessionInProgress
+  const canStart = roomConfigured && (livePlatform === "bilibili" ? (loginLoggedIn || limitedConnection) : livePlatform === "twitch" ? twitchLoggedIn : douyinLoggedIn) && !connectPending && !sessionInProgress
   const primaryStatusLabel = started
     ? t("panel.console.state.live")
     : connectPending
@@ -2104,7 +2199,7 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
   const safetyStatus = String(safety.status || "")
   const showSafetyStatus = started || (!!safetyStatus && safetyStatus !== "disconnected" && safetyStatus !== "unknown")
   const accountLabel = accountReady
-    ? (livePlatform === "douyin" ? (douyinNickname || douyinUid || t("panel.douyinAuth.cookieReady")) : (loginName || loginUid || t("panel.auth.loggedIn")))
+    ? (livePlatform === "douyin" ? (douyinNickname || douyinUid || t("panel.douyinAuth.cookieReady")) : livePlatform === "twitch" ? (twitchLogin || twitchUserId || t("panel.twitchAuth.authorized")) : (loginName || loginUid || t("panel.auth.loggedIn")))
     : (limitedConnection ? t("panel.console.limitedConnection") : t("panel.auth.loggedOut"))
   const modules = Array.isArray(safeState.modules) ? safeState.modules : []
 
@@ -2230,6 +2325,8 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
                     ? t("panel.messages.roomRequired")
                     : livePlatform === "douyin" && !douyinLoggedIn
                       ? t("panel.douyinAuth.cookieMissing")
+                      : livePlatform === "twitch" && !twitchLoggedIn
+                        ? t("panel.twitchAuth.notAuthorized")
                       : loginRequired
                         ? t("panel.console.loginRequired")
                       : t("panel.console.readyHint")}
@@ -2271,6 +2368,7 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
               options={[
                 { value: "bilibili", label: t("panel.platform.bilibili") },
                 { value: "douyin", label: `${t("panel.platform.douyin")} ${t("panel.platform.incompleteSuffix")}` },
+                { value: "twitch", label: t("panel.platform.twitch") },
               ]}
               onChange={(value) => switchLivePlatform(String(value))}
             />
@@ -2295,6 +2393,23 @@ export default function NekoRoastPanel(props: CompatPluginSurfaceProps<Dashboard
                 <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={douyinCookieDelete}>{t("panel.actions.douyinCookieDelete")}</Button>
               </Grid>
               <Text>{t("panel.douyinAuth.manualHint")}</Text>
+            </Stack>
+          ) : livePlatform === "twitch" ? (
+            <Stack>
+              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : t("panel.twitchAuth.notAuthorized")} />
+              <Field label={t("panel.fields.twitchClientId")}>
+                <Input disabled={sessionInProgress || !!authPending} value={configForm.values.twitch_client_id} placeholder={t("panel.placeholders.twitchClientId")} onChange={(value) => { configForm.setField("twitch_client_id", value) }} />
+              </Field>
+              {twitchAuthState?.user_code ? <CodeBlock>{`${t("panel.twitchAuth.userCode")}: ${String(twitchAuthState.user_code)}`}</CodeBlock> : null}
+              {twitchAuthState?.verification_uri ? <Text>{t("panel.twitchAuth.verificationUri")}: {String(twitchAuthState.verification_uri)}</Text> : null}
+              {twitchAuthState?.pending ? <Text>{t("panel.twitchAuth.deviceHint")}</Text> : null}
+              <Grid cols={3}>
+                <Button tone="success" disabled={sessionInProgress || !!authPending} onClick={twitchAuthorize}>{t("panel.actions.twitchAuthorize")}</Button>
+                <Button tone="info" disabled={sessionInProgress || !!authPending} onClick={twitchCheckAuthorization}>{t("panel.actions.twitchCheckAuthorization")}</Button>
+                <Button tone="info" disabled={!!authPending} onClick={twitchStatus}>{t("panel.actions.twitchStatus")}</Button>
+                <Button tone="info" disabled={!!authPending} onClick={twitchValidate}>{t("panel.actions.twitchValidate")}</Button>
+                <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={twitchLogout}>{t("panel.actions.twitchLogout")}</Button>
+              </Grid>
             </Stack>
           ) : (
             <Stack>

@@ -1,0 +1,126 @@
+"""Twitch Device Code Flow and encrypted credential runtime actions."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..adapters.twitch_auth_service import TwitchAuthService
+from ..stores.credential_store import CredentialStore
+
+
+_TWITCH_FIELDS = (
+    "access_token",
+    "refresh_token",
+    "client_id",
+    "user_id",
+    "login",
+    "display_name",
+    "scopes",
+    "expires_at",
+)
+
+
+def create_credential_store(plugin: Any, audit: Any) -> CredentialStore:
+    return CredentialStore(plugin, audit, namespace="twitch", fields=_TWITCH_FIELDS)
+
+
+def create_auth_service(runtime: Any) -> TwitchAuthService:
+    return TwitchAuthService(
+        credential_provider=runtime.twitch_credential_store.load,
+        credential_saver=runtime.twitch_credential_store.save,
+        credential_reloader=runtime.reload_twitch_credential,
+    )
+
+
+async def reload_credential(runtime: Any) -> None:
+    try:
+        data = await runtime.twitch_credential_store.load()
+    except Exception:
+        data = None
+    runtime.twitch_credential = data if _credential_present(data) else None
+
+
+async def start_device_authorization(runtime: Any) -> dict[str, Any]:
+    result = await runtime.twitch_auth.start_device_authorization(_client_id(runtime))
+    runtime.audit.record(
+        "twitch_device_authorization_started" if result.get("started") is True else "twitch_device_authorization_failed",
+        "twitch device authorization started" if result.get("started") is True else str(result.get("message") or "twitch device authorization failed"),
+        level="info" if result.get("started") is True else "warning",
+    )
+    return result
+
+
+async def check_device_authorization(runtime: Any) -> dict[str, Any]:
+    result = await runtime.twitch_auth.check_device_authorization(_client_id(runtime))
+    if result.get("logged_in") is True:
+        runtime.audit.record(
+            "twitch_authorized",
+            "twitch credential saved (encrypted)",
+            detail={"user_id": result.get("user_id", ""), "login": result.get("login", "")},
+        )
+    elif result.get("pending") is not True:
+        runtime.audit.record(
+            "twitch_authorization_failed",
+            str(result.get("message") or "twitch authorization failed"),
+            level="warning",
+        )
+    return result
+
+
+async def credential_status(runtime: Any) -> dict[str, Any]:
+    if runtime.twitch_credential is None and runtime.twitch_credential_store.has_credential():
+        await reload_credential(runtime)
+    data = runtime.twitch_credential
+    if not _credential_present(data):
+        return {"platform": "twitch", "logged_in": False, "login": "", "user_id": "", "scopes": []}
+    scopes = data.get("scopes", "").split() if isinstance(data.get("scopes"), str) else []
+    return {
+        "platform": "twitch",
+        "logged_in": True,
+        "login": _public_text(data.get("login"), 25),
+        "display_name": _public_text(data.get("display_name"), 80),
+        "user_id": _public_text(data.get("user_id"), 64),
+        "scopes": sorted(scope for scope in scopes if scope == "user:read:chat"),
+        "expires_at": _public_text(data.get("expires_at"), 24),
+    }
+
+
+async def validate_credential(runtime: Any) -> dict[str, Any]:
+    result = await runtime.twitch_auth.check_credential(_client_id(runtime))
+    runtime.audit.record(
+        "twitch_credential_validated" if result.get("logged_in") is True else "twitch_credential_validation_failed",
+        "twitch credential validated" if result.get("logged_in") is True else str(result.get("message") or "twitch credential invalid"),
+        level="info" if result.get("logged_in") is True else "warning",
+        detail={"refreshed": result.get("refreshed") is True},
+    )
+    return result
+
+
+async def logout(runtime: Any) -> dict[str, Any]:
+    removed = await runtime.twitch_credential_store.delete()
+    runtime.twitch_credential = None
+    runtime.audit.record("twitch_logout", "twitch credential removed", detail={"files": removed})
+    return {
+        "platform": "twitch",
+        "logged_out": True,
+        "logged_in": False,
+        "removed": removed,
+    }
+
+
+def _client_id(runtime: Any) -> Any:
+    return getattr(getattr(runtime, "config", None), "twitch_client_id", "")
+
+
+def _credential_present(data: Any) -> bool:
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("access_token"), str)
+        and bool(data["access_token"].strip())
+        and isinstance(data.get("refresh_token"), str)
+        and bool(data["refresh_token"].strip())
+    )
+
+
+def _public_text(value: Any, limit: int) -> str:
+    return " ".join(value.split()).strip()[:limit] if isinstance(value, str) else ""

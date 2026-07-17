@@ -14,7 +14,7 @@
 
 更新日期：2026-07-03
 
-核心闭环：**真实 B站直播间监听 → EventBus → live_events Selection → Roast Pipeline → Runtime → Dashboard**。`neko_roast` v0.1 已进入主线，产品命名已统一为 **NEKO Live**；「弹幕锐评」是第一个落地的垂直切片。锐评采用**自适应焦点**（昵称与头像哪个更有料就主打哪个，看不到的头像绝不脑补）。
+核心闭环：**真实平台直播监听 → EventBus → live_events Selection → Roast Pipeline → Runtime → Dashboard**。当前 provider 包含 B 站、实验性抖音和 Twitch 首阶段只读接入。`neko_roast` v0.1 已进入主线，产品命名已统一为 **NEKO Live**；「弹幕锐评」是第一个落地的垂直切片。锐评采用**自适应焦点**（昵称与头像哪个更有料就主打哪个，看不到的头像绝不脑补）。
 
 协作基线：Phase 1 已落地 Canonical Source、PR 拆分规则和 Reviewer Checklist；Phase 2A 已落地模块 Owner Model 与 Protected Modules / Review Gate。Reviewer Checklist 的唯一 Canonical Source 是 `AGENTS.md`。
 
@@ -1087,6 +1087,20 @@ uv run python -m plugin.neko_plugin_cli.cli check plugin/plugins/neko_roast
 开发者模式是独立的调试上下文；退出开发者模式只发送 `NEKO_ROAST_DEVELOPER_RESTORE_INSTRUCTIONS`，不要误发完整插件关闭恢复语境。
 
 维护时不要只给字段说明。需要保留“猫猫是直播间同播伙伴，不是后台系统或插件播报员”的场景，让模型把弹幕当作直播现场互动来接话。即时事件提示词可以包含 UID、昵称、弹幕、强度、直播模式等结构化字段，但输出要求必须强调自然短句、不要复述字段、不要解释流程。
+## Twitch read-only provider
+
+`twitch_live_ingest` 使用固定版本 `twitchio==3.2.2` 负责 Helix 和 EventSub WebSocket；
+`runtime_twitch_auth` / `twitch_auth_service` 自行实现无需 Client Secret 的 Device Code Flow、
+token validate 与 refresh。Access/refresh token 只进入 `twitch` namespace 的加密
+`CredentialStore`，device code 只留内存。TwitchIO 必须以 `load_tokens=False`、
+`save_tokens=False`、`with_adapter=False` 启动，禁止 `.tio.tokens.json` 和内置 OAuth
+adapter；刷新回调必须同时原子替换两枚 token，保存失败立即停止监听。
+
+目标只接受 Twitch login 或无 query/fragment 的规范频道 URL，授权账号与目标频道分离。
+首阶段只订阅 `channel.chat.message` 并投影为不保留 raw 的
+`LiveEvent(type="danmaku")`；不接首页/推荐、bits/subs/raid、后台 OAuth 轮询或任何写能力。
+完整边界见 `docs/modules/twitch_live_ingest.md`。
+
 ## Douyin Live Bridge
 
 The Douyin live input path is a read-only provider bridge owned by `modules/douyin_live_ingest`. `modules/live_bridge` owns the provider-neutral localhost WebSocket transport and bundled-process lifecycle, while `core/runtime_douyin_auth.py` owns encrypted cookie import, validation, status, and deletion through the `douyin` credential namespace. `modules/douyin_identity` projects only sanitized stable identity fields.

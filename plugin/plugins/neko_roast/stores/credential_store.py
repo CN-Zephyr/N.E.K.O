@@ -88,17 +88,27 @@ class CredentialStore:
     # ── 同步实现（在 to_thread 里跑） ──────────────────────────
 
     def _save_sync(self, payload: dict) -> bool:
+        temp_path: Path | None = None
         try:
             cred = {key: str(payload.get(key) or "") for key in self.fields}
             fernet = self._get_fernet()
             enc = fernet.encrypt(json.dumps(cred, ensure_ascii=False).encode("utf-8"))
             cred_path = self._data_dir() / self._cred_file()
             cred_path.parent.mkdir(parents=True, exist_ok=True)
-            cred_path.write_bytes(enc)
+            temp_path = cred_path.with_suffix(f"{cred_path.suffix}.tmp")
+            temp_path.write_bytes(enc)
+            self._chmod600(temp_path)
+            os.replace(temp_path, cred_path)
             self._chmod600(cred_path)
             return True
         except Exception:
             return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _load_sync(self) -> dict | None:
         try:
