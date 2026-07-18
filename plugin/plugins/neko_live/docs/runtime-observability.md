@@ -167,6 +167,44 @@ Initial skip reasons:
 - `config.persist_timeout`
 - `config.persist_failed`
 
+Co-stream participation policy reason codes are also stable runtime facts. They
+cover allow, defer, skip, and downgrade decisions rather than only terminal
+skips:
+
+- `co_stream.policy.solo_passthrough`
+- `co_stream.policy.capability_off`
+- `co_stream.policy.host_speaking`
+- `co_stream.policy.host_holding`
+- `co_stream.policy.turn_yielded`
+- `co_stream.policy.turn_unknown`
+- `co_stream.policy.host_support_only`
+- `co_stream.policy.nonverbal_safe`
+
+These reasons may be projected with capability id, requested/effective
+participation level, activation mode, bounded priority, host-turn state,
+reliability, confidence, and signal source. Do not project captured audio,
+transcripts, raw platform payloads, viewer text, or private conversation
+context. The policy decision is an explanation of a boundary; it is not a
+second dispatcher and must not itself produce output.
+
+There is no enforced co-stream speech path in this phase. The runtime has no
+manual handoff action, dedicated output module, or Pipeline route. No audio,
+transcript, or raw host-turn payload is added to timeline or audit data.
+
+`conditional_auto` keeps the saved choice separate from enforcement consent.
+The capability projection exposes `effective_activation` and
+`auto_enforcement_confirmed`; a preview selection without the exact current
+consent version is evaluated as `off`. Generic config updates cannot write the
+consent version. A future host-runtime integration must obtain a new explicit
+confirmation before automatic speech becomes possible.
+
+During the read-only wiring phase, dashboard state exposes these facts under
+`co_stream_participation`. The projection must keep `read_only=true` and
+`enforced=false`, must not consume or mutate the latest normalized host signal,
+and must not be interpreted as an Event Outcome or Dispatcher Outcome. `solo_stream` may show
+`co_stream.policy.solo_passthrough` in this projection solely to prove the
+isolation contract; the projection does not gate or alter the solo path.
+
 ### Dispatcher Outcome
 
 Dispatcher Outcome is the final output-boundary result for an event that reaches Dispatcher.
