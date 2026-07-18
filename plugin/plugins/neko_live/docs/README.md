@@ -58,6 +58,10 @@
 | UI 架构、模块 UI 贡献、Hosted UI 限制、`panel_compat.tsx` 兼容入口策略 | `ui-architecture.md` | `development.md` 只保留测试门禁和短约束 |
 | 阶段目标、完成状态、下一阶段顺序 | `live-center-roadmap.md` | 不承载详细开发规范 |
 | 宿主 / SDK 历史事故和取舍 | `devlog.md` | roadmap 只保留状态链接 |
+| B站直播协议实现细节、WBI 签名、buvid3、-352 风控、重连机制 | `modules/bili_live_ingest.md` | — |
+| 决策日志（已拍板的架构和存储决策） | `decision-log.md` | 不替代 spec，只记录决策理由 |
+| 迁移执行检查清单（matrix 的进度跟踪） | `migration-checklist.md` | — |
+| 可信支持事件账本设计 | `modules/support_event_ledger.md` | — |
 
 ## 文档更新路由
 
@@ -72,5 +76,9 @@
 - 改面板结构、模块 UI 贡献模型、Hosted UI 约束或 `panel_compat.tsx` 兼容入口策略：更新 `ui-architecture.md`。
 - 发现宿主 / SDK 侧历史问题或跨层取舍：更新 `devlog.md`。
 - 改硬规则、禁止事项、Reviewer Checklist、必跑命令：更新 `../AGENTS.md`。
+- 改 B站协议细节、WBI 签名、buvid3、-352 风控、重连机制：更新 `modules/bili_live_ingest.md`。
+- 新增架构或存储决策：更新 `decision-log.md`。
+- 更新迁移执行状态：更新 `migration-checklist.md`。
+- 改可信支持事件账本设计：更新 `modules/support_event_ledger.md`。
 
 新增 UI 文案时同步更新 8 个 locale 文件。Python 命令统一使用 `uv run`。如果一项改动跨越多个事实类型，先更新对应的权威文档，再在其他文档中保留短链接。
