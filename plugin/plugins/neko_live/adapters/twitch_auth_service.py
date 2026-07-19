@@ -189,6 +189,7 @@ class TwitchAuthService:
             _TOKEN_URL,
             data={
                 "client_id": session.client_id,
+                "scopes": " ".join(_SCOPES),
                 "device_code": session.device_code,
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             },

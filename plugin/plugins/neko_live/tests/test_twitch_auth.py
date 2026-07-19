@@ -254,6 +254,7 @@ async def test_device_authorization_stays_in_memory_and_pending_check_is_public(
     assert pending["logged_in"] is False
     assert "secret-device-code" not in str(pending)
     assert store.saved == []
+    assert http.calls[1]["data"]["scopes"] == "user:read:chat"
     assert http.calls[1]["data"]["device_code"] == "secret-device-code"
 
 
