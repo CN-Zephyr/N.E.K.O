@@ -177,6 +177,7 @@ def _context(module: TwitchLiveIngestModule, store: _Store) -> SimpleNamespace:
     async def reload_credential() -> None:
         return None
 
+    safety_updates: list[bool] = []
     return SimpleNamespace(
         config=SimpleNamespace(live_platform="twitch", live_room_ref="target_channel", live_mode="co_stream"),
         twitch_credential=credential,
@@ -185,6 +186,10 @@ def _context(module: TwitchLiveIngestModule, store: _Store) -> SimpleNamespace:
         live_provider=router,
         event_bus=_Bus(),
         audit=SimpleNamespace(record=lambda *_args, **_kwargs: None),
+        safety_guard=SimpleNamespace(set_connected=safety_updates.append),
+        safety_updates=safety_updates,
+        live_connection_state="connected",
+        live_connection_auth_mode="authenticated",
         _accepting_live_events=True,
         _live_session_generation=7,
     )
@@ -227,6 +232,59 @@ async def test_listener_starts_without_twitchio_token_files_and_subscribes_targe
     assert client.closed.is_set()
     assert module.is_listening() is False
     assert module.listener_state()["state"] == "disconnected"
+    assert module.listener_state()["last_error"] == ""
+    assert module._client_supervisor_task is None
+
+
+@pytest.mark.asyncio
+async def test_listener_consumes_runner_failure_and_clears_connected_state() -> None:
+    class _FailingClient(_Client):
+        def __init__(self, **callbacks: Any) -> None:
+            super().__init__(**callbacks)
+            self.fail = asyncio.Event()
+
+        async def start(self, token: str, **kwargs: Any) -> None:
+            self.start_kwargs = {"token": token, **kwargs}
+            self.ready.set()
+            await self.fail.wait()
+            raise RuntimeError("socket token=secret-access disconnected")
+
+    clients: list[_FailingClient] = []
+
+    def factory(**callbacks: Any) -> _FailingClient:
+        client = _FailingClient(**callbacks)
+        clients.append(client)
+        return client
+
+    audit_records: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    module = TwitchLiveIngestModule(client_factory=factory)
+    ctx = _context(module, _Store())
+    ctx.audit = SimpleNamespace(record=lambda *args, **kwargs: audit_records.append((args, kwargs)))
+    module.ctx = ctx
+    assert await module.start_listening("target_channel") is True
+    supervisor = module._client_supervisor_task
+    assert supervisor is not None
+
+    clients[0].fail.set()
+    await asyncio.wait_for(supervisor, timeout=1)
+
+    assert module.is_listening() is False
+    assert module.listener_state()["state"] == "disconnected"
+    assert module.listener_state()["last_error"] == "twitch listener failed: RuntimeError"
+    assert module._client is None
+    assert module._client_task is None
+    assert module._client_supervisor_task is None
+    assert clients[0].closed.is_set()
+    assert ctx._accepting_live_events is False
+    assert ctx.live_connection_state == "disconnected"
+    assert ctx.live_connection_auth_mode == "unknown"
+    assert ctx.safety_updates == [False]
+    assert audit_records == [
+        (
+            ("twitch_listener_stopped", "Twitch listener stopped unexpectedly"),
+            {"level": "warning", "detail": {"error": "twitch listener failed: RuntimeError"}},
+        )
+    ]
 
 
 @pytest.mark.asyncio

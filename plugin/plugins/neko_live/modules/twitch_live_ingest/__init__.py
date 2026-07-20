@@ -38,6 +38,7 @@ class TwitchLiveIngestModule(BaseModule):
         self._client: Any = None
         self._client_factory = client_factory or create_twitch_client
         self._client_task: asyncio.Task[Any] | None = None
+        self._client_supervisor_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._generation = 0
         self._stop_requested = True
@@ -81,7 +82,7 @@ class TwitchLiveIngestModule(BaseModule):
                     on_token_refreshed=lambda payload: self._on_token_refreshed(payload, generation),
                 )
                 self._client = client
-                self._client_task = asyncio.create_task(
+                runner = asyncio.create_task(
                     client.start(
                         token=access_token,
                         with_adapter=False,
@@ -89,7 +90,8 @@ class TwitchLiveIngestModule(BaseModule):
                         save_tokens=False,
                     )
                 )
-                await self._wait_for_ready(client, self._client_task)
+                self._client_task = runner
+                await self._wait_for_ready(client, runner)
                 await client.add_token(access_token, refresh_token)
                 status = await lookup_channel_status(client, parsed.room_ref, token_for=account_user_id)
                 if not status.ok or status.room_id <= 0:
@@ -119,6 +121,9 @@ class TwitchLiveIngestModule(BaseModule):
             self._listening = True
             self._state = "connected"
             self._last_error = ""
+            self._client_supervisor_task = asyncio.create_task(
+                self._supervise_client_task(generation, client, runner)
+            )
             return True
 
     async def stop_listening(self) -> None:
@@ -130,8 +135,10 @@ class TwitchLiveIngestModule(BaseModule):
         self._generation += 1
         self._listening = False
         client, task = self._client, self._client_task
+        supervisor = self._client_supervisor_task
         self._client = None
         self._client_task = None
+        self._client_supervisor_task = None
         if client is not None:
             try:
                 await client.close()
@@ -143,9 +150,72 @@ class TwitchLiveIngestModule(BaseModule):
             except (asyncio.CancelledError, TimeoutError, Exception):
                 if not task.done():
                     task.cancel()
+        if supervisor is not None and supervisor is not asyncio.current_task():
+            supervisor.cancel()
+            try:
+                await supervisor
+            except asyncio.CancelledError:
+                pass
         self._state = "disconnected"
         if clear_error:
             self._last_error = ""
+
+    async def _supervise_client_task(
+        self,
+        generation: int,
+        client: Any,
+        runner: asyncio.Task[Any],
+    ) -> None:
+        failure = "twitch client stopped unexpectedly"
+        try:
+            await asyncio.shield(runner)
+        except asyncio.CancelledError:
+            if generation != self._generation or self._stop_requested:
+                return
+            failure = "twitch listener failed: CancelledError"
+        except Exception as exc:
+            failure = _safe_error(exc)
+        async with self._lifecycle_lock:
+            if generation != self._generation or self._stop_requested or self._client_task is not runner:
+                if self._client_task is runner and runner.done():
+                    self._client_task = None
+                if self._client_supervisor_task is asyncio.current_task():
+                    self._client_supervisor_task = None
+                return
+            self._stop_requested = True
+            self._generation += 1
+            self._listening = False
+            self._client = None
+            self._client_task = None
+            self._client_supervisor_task = None
+            self._state = "disconnected"
+            self._last_error = failure
+            try:
+                await client.close()
+            except Exception:
+                pass
+            self._sync_unexpected_disconnect(failure)
+
+    def _sync_unexpected_disconnect(self, failure: str) -> None:
+        runtime = self.ctx
+        if runtime is None:
+            return
+        runtime._accepting_live_events = False
+        runtime.live_connection_state = "disconnected"
+        runtime.live_connection_auth_mode = "unknown"
+        safety_guard = getattr(runtime, "safety_guard", None)
+        set_connected = getattr(safety_guard, "set_connected", None)
+        if callable(set_connected):
+            set_connected(False)
+        audit = getattr(runtime, "audit", None)
+        record = getattr(audit, "record", None)
+        if callable(record):
+            record(
+                "twitch_listener_stopped",
+                "Twitch listener stopped unexpectedly",
+                level="warning",
+                detail={"error": failure},
+            )
 
     @staticmethod
     async def _wait_for_ready(client: Any, runner: asyncio.Task[Any]) -> None:
