@@ -69,11 +69,25 @@ async def check_device_authorization(runtime: Any) -> dict[str, Any]:
 
 
 async def cancel_device_authorization(runtime: Any) -> dict[str, Any]:
-    result = runtime.twitch_auth.cancel_device_authorization(_client_id(runtime))
+    result = await runtime.twitch_auth.cancel_device_authorization(_client_id(runtime))
+    cancelled = result.get("cancelled") is True
+    completed = result.get("logged_in") is True
     runtime.audit.record(
-        "twitch_device_authorization_cancelled",
-        "twitch device authorization cancelled",
-        detail={"active_session": result.get("cancelled") is True},
+        (
+            "twitch_device_authorization_cancelled"
+            if cancelled
+            else "twitch_device_authorization_completed_before_cancel"
+            if completed
+            else "twitch_device_authorization_cancel_skipped"
+        ),
+        (
+            "twitch device authorization cancelled"
+            if cancelled
+            else "twitch device authorization completed before cancellation"
+            if completed
+            else "twitch device authorization was not active"
+        ),
+        detail={"active_session": cancelled},
     )
     return result
 
@@ -120,7 +134,7 @@ async def validate_credential(runtime: Any) -> dict[str, Any]:
 async def logout(runtime: Any) -> dict[str, Any]:
     auth = getattr(runtime, "twitch_auth", None)
     if auth is not None:
-        auth.cancel_device_authorization(_client_id(runtime))
+        await auth.cancel_device_authorization(_client_id(runtime))
     removed = await runtime.twitch_credential_store.delete()
     runtime.twitch_credential = None
     runtime.audit.record("twitch_logout", "twitch credential removed", detail={"files": removed})

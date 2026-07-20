@@ -214,6 +214,8 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
   const presetViewerDanmaku = t("panel.dev.emitter.defaultDanmaku")
   const twitchPollTimerRef = useRef<number | null>(null)
   const twitchPollGenerationRef = useRef(0)
+  const twitchPollIntervalRef = useRef(5)
+  const twitchPollBackoffRef = useRef(0)
   const twitchValidationClientRef = useRef("")
   const twitchValidationGenerationRef = useRef(0)
 
@@ -773,11 +775,15 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
   async function twitchCancelAuthorization() {
     if (authPending || sessionInProgress) return
     stopTwitchAuthorizationPolling()
+    setTwitchAuthState(null)
     setAuthPending("twitch_device_authorization_cancel")
     try {
       const result = unwrapActionResult(await props.api.call("twitch_device_authorization_cancel"))
       setTwitchAuthState(result)
-      toast.info(t("panel.twitchAuth.cancelled"))
+      if (result.cancelled === true) toast.info(t("panel.twitchAuth.cancelled"))
+      else if (result.logged_in === true) toast.success(t("panel.twitchAuth.authorized"))
+      else if (result.pending === true) toast.info(t("panel.twitchAuth.deviceHint"))
+      else toast.warning(t("panel.twitchAuth.notAuthorized"))
       await refreshDashboard(true)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err))
@@ -833,8 +839,9 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
     const generation = twitchPollGenerationRef.current + 1
     twitchPollGenerationRef.current = generation
     const expiresAt = Date.now() + Math.max(0, Number(twitchAuthState.expires_in) || 0) * 1000
-    let networkBackoffSeconds = 0
     const safeInterval = (value: unknown) => Math.min(60, Math.max(5, Number(value) || 5))
+    twitchPollIntervalRef.current = safeInterval(twitchAuthState.interval)
+    twitchPollBackoffRef.current = 0
     const clearPollTimer = () => {
       if (twitchPollTimerRef.current !== null) {
         window.clearTimeout(twitchPollTimerRef.current)
@@ -865,16 +872,20 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
           return
         }
         if (result.pending === true) {
-          networkBackoffSeconds = 0
-          schedule(Number(result.interval))
+          twitchPollIntervalRef.current = safeInterval(result.interval)
+          twitchPollBackoffRef.current = 0
+          schedule(twitchPollIntervalRef.current)
           return
         }
         toast.warning(t("panel.twitchAuth.notAuthorized"))
         await refreshDashboard(true)
       } catch {
         if (twitchPollGenerationRef.current !== generation) return
-        networkBackoffSeconds = Math.min(60, networkBackoffSeconds > 0 ? networkBackoffSeconds * 2 : safeInterval(twitchAuthState.interval))
-        schedule(networkBackoffSeconds)
+        twitchPollBackoffRef.current = Math.min(
+          60,
+          twitchPollBackoffRef.current > 0 ? twitchPollBackoffRef.current * 2 : twitchPollIntervalRef.current,
+        )
+        schedule(twitchPollBackoffRef.current)
       }
     }
     const handleTwitchVisibilityChange = () => {
@@ -882,10 +893,10 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
         clearPollTimer()
         return
       }
-      schedule(Number(twitchAuthState.interval))
+      schedule(twitchPollBackoffRef.current || twitchPollIntervalRef.current)
     }
     document.addEventListener("visibilitychange", handleTwitchVisibilityChange)
-    schedule(Number(twitchAuthState.interval))
+    schedule(twitchPollIntervalRef.current)
     return () => {
       document.removeEventListener("visibilitychange", handleTwitchVisibilityChange)
       if (twitchPollGenerationRef.current === generation) stopTwitchAuthorizationPolling()

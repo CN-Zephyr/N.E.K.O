@@ -59,7 +59,9 @@ def test_both_panels_expose_twitch_account_channel_and_device_flow_controls() ->
         'result.started === true && result.pending === true',
         'authorization_state === "unverified"',
         'window.setTimeout',
-        'Number(result.interval)',
+        'twitchPollIntervalRef.current = safeInterval(result.interval)',
+        'schedule(twitchPollBackoffRef.current || twitchPollIntervalRef.current)',
+        'result.cancelled === true',
         'target="_blank"',
         'twitchCancelAuthorization',
     }
@@ -70,6 +72,10 @@ def test_both_panels_expose_twitch_account_channel_and_device_flow_controls() ->
         assert "function twitchCheckAuthorization" not in source
         assert "function twitchStatus" not in source
         assert "function twitchValidate" not in source
+        visibility_handler = source.split("const handleTwitchVisibilityChange", 1)[1].split(
+            'document.addEventListener("visibilitychange", handleTwitchVisibilityChange)', 1
+        )[0]
+        assert "twitchAuthState.interval" not in visibility_handler
 
 
 def test_twitch_config_fields_exist_in_modular_and_compat_panel_defaults() -> None:

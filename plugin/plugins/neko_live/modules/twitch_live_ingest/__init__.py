@@ -9,6 +9,7 @@ from typing import Any
 from twitchio import eventsub
 
 from ...core.contracts import LiveRoomStatus, ViewerEvent
+from ...core.runtime_live_listener import handle_unexpected_live_listener_stop
 from .._base import BaseModule
 from .helix import lookup_channel_status
 from .projection import project_chat_message, project_chat_notification
@@ -194,19 +195,18 @@ class TwitchLiveIngestModule(BaseModule):
                 await client.close()
             except Exception:
                 pass
-            self._sync_unexpected_disconnect(failure)
+            await self._sync_unexpected_disconnect(failure)
 
-    def _sync_unexpected_disconnect(self, failure: str) -> None:
+    async def _sync_unexpected_disconnect(
+        self,
+        failure: str,
+        *,
+        connection_state: str = "disconnected",
+    ) -> None:
         runtime = self.ctx
         if runtime is None:
             return
-        runtime._accepting_live_events = False
-        runtime.live_connection_state = "disconnected"
-        runtime.live_connection_auth_mode = "unknown"
-        safety_guard = getattr(runtime, "safety_guard", None)
-        set_connected = getattr(safety_guard, "set_connected", None)
-        if callable(set_connected):
-            set_connected(False)
+        await handle_unexpected_live_listener_stop(runtime, connection_state=connection_state)
         audit = getattr(runtime, "audit", None)
         record = getattr(audit, "record", None)
         if callable(record):
@@ -339,6 +339,10 @@ class TwitchLiveIngestModule(BaseModule):
                     await client.close()
                 except Exception:
                     pass
+            await self._sync_unexpected_disconnect(
+                self._last_error,
+                connection_state="auth_required",
+            )
 
     def _credential(self) -> dict[str, Any]:
         candidate = getattr(self.ctx, "twitch_credential", None) if self.ctx is not None else None

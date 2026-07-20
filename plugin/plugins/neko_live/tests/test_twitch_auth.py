@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -330,7 +331,7 @@ async def test_device_authorization_status_can_resume_and_cancel_public_session(
 
     await service.start_device_authorization("clientid123")
     resumed = service.device_authorization_status("clientid123")
-    cancelled = service.cancel_device_authorization("clientid123")
+    cancelled = await service.cancel_device_authorization("clientid123")
 
     assert resumed is not None
     assert resumed["authorization_state"] == "pending"
@@ -339,6 +340,64 @@ async def test_device_authorization_status_can_resume_and_cancel_public_session(
     assert cancelled["cancelled"] is True
     assert cancelled["authorization_state"] == "unauthorized"
     assert service.device_authorization_status("clientid123") is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_blocked_save_and_never_reports_false_success() -> None:
+    save_started = asyncio.Event()
+    release_save = asyncio.Event()
+
+    class _BlockingStore(_Store):
+        async def save(self, payload: dict[str, Any]) -> bool:
+            self.saved.append(dict(payload))
+            save_started.set()
+            await release_save.wait()
+            self.credential = dict(payload)
+            return True
+
+    store = _BlockingStore()
+    http = _Http(
+        [
+            (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            ),
+            (200, {"access_token": "new-access", "refresh_token": "new-refresh"}),
+            (
+                200,
+                {
+                    "client_id": "clientid123",
+                    "login": "account_login",
+                    "user_id": "42",
+                    "scopes": ["user:read:chat"],
+                    "expires_in": 14400,
+                },
+            ),
+        ]
+    )
+    service = _service(store, http)
+
+    await service.start_device_authorization("clientid123")
+    check_task = asyncio.create_task(service.check_device_authorization("clientid123"))
+    await asyncio.wait_for(save_started.wait(), timeout=1)
+    cancel_task = asyncio.create_task(service.cancel_device_authorization("clientid123"))
+    await asyncio.sleep(0)
+
+    assert cancel_task.done() is False
+
+    release_save.set()
+    checked, cancelled = await asyncio.gather(check_task, cancel_task)
+
+    assert checked["logged_in"] is True
+    assert cancelled["cancelled"] is False
+    assert cancelled["logged_in"] is True
+    assert len(store.saved) == 1
 
 
 @pytest.mark.asyncio

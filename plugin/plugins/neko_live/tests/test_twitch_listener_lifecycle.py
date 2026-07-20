@@ -102,6 +102,22 @@ class _Bus:
         self.events.append((event_type, event))
 
 
+class _Resettable:
+    def __init__(self) -> None:
+        self.reset_count = 0
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+
+class _AudienceSession:
+    def __init__(self) -> None:
+        self.finish_count = 0
+
+    def finish_session(self) -> None:
+        self.finish_count += 1
+
+
 class _Store:
     def __init__(self, save_ok: bool = True) -> None:
         self.save_ok = save_ok
@@ -178,8 +194,13 @@ def _context(module: TwitchLiveIngestModule, store: _Store) -> SimpleNamespace:
         return None
 
     safety_updates: list[bool] = []
-    return SimpleNamespace(
-        config=SimpleNamespace(live_platform="twitch", live_room_ref="target_channel", live_mode="co_stream"),
+    context = SimpleNamespace(
+        config=SimpleNamespace(
+            live_platform="twitch",
+            live_room_ref="target_channel",
+            live_mode="co_stream",
+            live_enabled=True,
+        ),
         twitch_credential=credential,
         twitch_credential_store=store,
         reload_twitch_credential=reload_credential,
@@ -192,7 +213,21 @@ def _context(module: TwitchLiveIngestModule, store: _Store) -> SimpleNamespace:
         live_connection_auth_mode="authenticated",
         _accepting_live_events=True,
         _live_session_generation=7,
+        _live_listener_started_at=123.0,
+        live_room_context={"platform": "twitch", "room_ref": "target_channel", "live_status": "offline"},
+        live_audience_session=_AudienceSession(),
+        live_events=_Resettable(),
+        live_support_events=_Resettable(),
     )
+    restore_calls: list[bool] = []
+
+    async def restore_instructions(*, force: bool = False) -> str:
+        restore_calls.append(force)
+        return "restored"
+
+    context.restore_instructions = restore_instructions
+    context.restore_calls = restore_calls
+    return context
 
 
 @pytest.mark.asyncio
@@ -278,6 +313,13 @@ async def test_listener_consumes_runner_failure_and_clears_connected_state() -> 
     assert ctx._accepting_live_events is False
     assert ctx.live_connection_state == "disconnected"
     assert ctx.live_connection_auth_mode == "unknown"
+    assert ctx.config.live_enabled is False
+    assert ctx._live_listener_started_at == 0.0
+    assert ctx.live_audience_session.finish_count == 1
+    assert ctx.live_events.reset_count == 1
+    assert ctx.live_support_events.reset_count == 1
+    assert ctx.live_room_context == {"live_status": "unknown"}
+    assert ctx.restore_calls == [True]
     assert ctx.safety_updates == [False]
     assert audit_records == [
         (
@@ -285,6 +327,11 @@ async def test_listener_consumes_runner_failure_and_clears_connected_state() -> 
             {"level": "warning", "detail": {"error": "twitch listener failed: RuntimeError"}},
         )
     ]
+
+    assert await module.start_listening("target_channel") is True
+    assert len(clients) == 2
+    assert module.is_listening() is True
+    await module.stop_listening()
 
 
 @pytest.mark.asyncio
@@ -402,7 +449,8 @@ async def test_failed_rotated_token_save_stops_listener() -> None:
         return client
 
     module = TwitchLiveIngestModule(client_factory=factory)
-    module.ctx = _context(module, _Store(save_ok=False))
+    ctx = _context(module, _Store(save_ok=False))
+    module.ctx = ctx
     await module.start_listening("target_channel")
 
     await clients[0].callbacks["on_token_refreshed"](
@@ -418,6 +466,11 @@ async def test_failed_rotated_token_save_stops_listener() -> None:
     assert module.is_listening() is False
     assert module.listener_state()["state"] == "auth_required"
     assert module.listener_state()["last_error"] == "twitch refreshed credential could not be saved"
+    assert ctx.config.live_enabled is False
+    assert ctx.live_connection_state == "auth_required"
+    assert ctx._live_listener_started_at == 0.0
+    assert ctx.live_audience_session.finish_count == 1
+    assert ctx.restore_calls == [True]
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,7 @@ class TwitchAuthService:
         self._request_json = request_json or _request_json
         self._clock = clock
         self._device_session: _DeviceSession | None = None
+        self._device_authorization_lock = asyncio.Lock()
 
     async def start_device_authorization(self, client_id: Any) -> dict[str, Any]:
         normalized_client_id = _client_id(client_id)
@@ -135,20 +136,22 @@ class TwitchAuthService:
             return None
         return _pending_status(session, now=self._clock())
 
-    def cancel_device_authorization(self, client_id: Any) -> dict[str, Any]:
+    async def cancel_device_authorization(self, client_id: Any) -> dict[str, Any]:
         """Cancel the active Device Flow session without exposing its secrets."""
         normalized_client_id = _client_id(client_id)
-        session = self._device_session
-        cancelled = session is not None and normalized_client_id == session.client_id
-        if cancelled:
-            self._device_session = None
-        return {
-            "platform": "twitch",
-            "logged_in": False,
-            "pending": False,
-            "authorization_state": "unauthorized",
-            "cancelled": cancelled,
-        }
+        requested_session = self._device_session
+        if requested_session is None or normalized_client_id != requested_session.client_id:
+            return _cancelled_status(cancelled=False)
+        async with self._device_authorization_lock:
+            if self._device_session is requested_session:
+                self._device_session = None
+                return _cancelled_status(cancelled=True)
+            credential = await self._credential_provider()
+            if _credential_matches_client(credential, normalized_client_id):
+                result = _public_status(credential or {}, refreshed=False)
+                result["cancelled"] = False
+                return result
+            return _cancelled_status(cancelled=False)
 
     def _log(self, level: str, message: str) -> None:
         logger = self.logger
@@ -195,6 +198,10 @@ class TwitchAuthService:
         raise RuntimeError("unreachable twitch request retry state")
 
     async def check_device_authorization(self, client_id: Any) -> dict[str, Any]:
+        async with self._device_authorization_lock:
+            return await self._check_device_authorization_locked(client_id)
+
+    async def _check_device_authorization_locked(self, client_id: Any) -> dict[str, Any]:
         normalized_client_id = _client_id(client_id)
         session = self._device_session
         if session is None or normalized_client_id != session.client_id:
@@ -369,6 +376,25 @@ def _error(message: str) -> dict[str, Any]:
         "authorization_state": "unauthorized",
         "message": message,
     }
+
+
+def _cancelled_status(*, cancelled: bool) -> dict[str, Any]:
+    return {
+        "platform": "twitch",
+        "logged_in": False,
+        "pending": False,
+        "authorization_state": "unauthorized",
+        "cancelled": cancelled,
+    }
+
+
+def _credential_matches_client(credential: Any, client_id: str) -> bool:
+    return (
+        isinstance(credential, dict)
+        and _client_id(credential.get("client_id")) == client_id
+        and bool(_secret(credential, "access_token"))
+        and bool(_secret(credential, "refresh_token"))
+    )
 
 
 def _pending_status(session: _DeviceSession, *, now: float, started: bool = False) -> dict[str, Any]:
