@@ -27,6 +27,7 @@ def test_twitch_auth_actions_are_exposed_to_hosted_ui() -> None:
     expected = {
         "twitch_device_authorization_start",
         "twitch_device_authorization_check",
+        "twitch_device_authorization_cancel",
         "twitch_login_status",
         "twitch_credential_validate",
         "twitch_logout",
@@ -49,6 +50,7 @@ def test_both_panels_expose_twitch_account_channel_and_device_flow_controls() ->
         'panel.placeholders.twitchRoom',
         'twitch_device_authorization_start',
         'twitch_device_authorization_check',
+        'twitch_device_authorization_cancel',
         'twitch_login_status',
         'twitch_credential_validate',
         'twitch_logout',
@@ -56,11 +58,18 @@ def test_both_panels_expose_twitch_account_channel_and_device_flow_controls() ->
         'user_code',
         'result.started === true && result.pending === true',
         'authorization_state === "unverified"',
+        'window.setTimeout',
+        'Number(result.interval)',
+        'target="_blank"',
+        'twitchCancelAuthorization',
     }
     for filename in ("panel.tsx", "panel_compat.tsx"):
         source = (ROOT / "ui" / filename).read_text(encoding="utf-8")
         missing = required - {item for item in required if item in source}
         assert not missing, f"{filename} missing Twitch UI contracts: {sorted(missing)}"
+        assert "function twitchCheckAuthorization" not in source
+        assert "function twitchStatus" not in source
+        assert "function twitchValidate" not in source
 
 
 def test_twitch_config_fields_exist_in_modular_and_compat_panel_defaults() -> None:
@@ -84,15 +93,22 @@ def test_all_locales_define_twitch_panel_action_and_entry_copy() -> None:
         "panel.twitchAuth.notAuthorized",
         "panel.twitchAuth.unverified",
         "panel.twitchAuth.deviceHint",
+        "panel.twitchAuth.waiting",
+        "panel.twitchAuth.waitingCountdown",
+        "panel.twitchAuth.validating",
+        "panel.twitchAuth.cancelled",
+        "panel.twitchAuth.expired",
         "panel.twitchAuth.userCode",
         "panel.twitchAuth.verificationUri",
         "panel.actions.twitchAuthorize",
+        "panel.actions.twitchCancelAuthorization",
         "panel.actions.twitchCheckAuthorization",
         "panel.actions.twitchStatus",
         "panel.actions.twitchValidate",
         "panel.actions.twitchLogout",
         "actions.twitch_device_authorization_start.label",
         "actions.twitch_device_authorization_check.label",
+        "actions.twitch_device_authorization_cancel.label",
         "actions.twitch_login_status.label",
         "actions.twitch_credential_validate.label",
         "actions.twitch_logout.label",
@@ -100,6 +116,8 @@ def test_all_locales_define_twitch_panel_action_and_entry_copy() -> None:
         "entries.twitch_device_authorization_start.description",
         "entries.twitch_device_authorization_check.name",
         "entries.twitch_device_authorization_check.description",
+        "entries.twitch_device_authorization_cancel.name",
+        "entries.twitch_device_authorization_cancel.description",
         "entries.twitch_login_status.name",
         "entries.twitch_login_status.description",
         "entries.twitch_credential_validate.name",

@@ -260,7 +260,9 @@ async def test_device_authorization_stays_in_memory_and_pending_check_is_public(
     assert started == {
         "platform": "twitch",
         "started": True,
+        "logged_in": False,
         "pending": True,
+        "authorization_state": "pending",
         "user_code": "ABCD-EFGH",
         "verification_uri": "https://www.twitch.tv/activate",
         "expires_in": 900,
@@ -273,6 +275,97 @@ async def test_device_authorization_stays_in_memory_and_pending_check_is_public(
     assert store.saved == []
     assert http.calls[1]["data"]["scopes"] == "user:read:chat"
     assert http.calls[1]["data"]["device_code"] == "secret-device-code"
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_slow_down_increases_all_following_intervals() -> None:
+    store = _Store()
+    http = _Http(
+        [
+            (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            ),
+            (400, {"message": "slow_down"}),
+            (400, {"message": "authorization_pending"}),
+        ]
+    )
+    service = _service(store, http)
+
+    await service.start_device_authorization("clientid123")
+    slowed = await service.check_device_authorization("clientid123")
+    pending = await service.check_device_authorization("clientid123")
+
+    assert slowed["pending"] is True
+    assert slowed["message"] == "slow_down"
+    assert slowed["interval"] == 10
+    assert pending["message"] == "authorization_pending"
+    assert pending["interval"] == 10
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_status_can_resume_and_cancel_public_session() -> None:
+    store = _Store()
+    http = _Http(
+        [
+            (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            )
+        ]
+    )
+    service = _service(store, http)
+
+    await service.start_device_authorization("clientid123")
+    resumed = service.device_authorization_status("clientid123")
+    cancelled = service.cancel_device_authorization("clientid123")
+
+    assert resumed is not None
+    assert resumed["authorization_state"] == "pending"
+    assert resumed["user_code"] == "ABCD-EFGH"
+    assert "device_code" not in resumed
+    assert cancelled["cancelled"] is True
+    assert cancelled["authorization_state"] == "unauthorized"
+    assert service.device_authorization_status("clientid123") is None
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_denial_ends_session() -> None:
+    store = _Store()
+    http = _Http(
+        [
+            (
+                200,
+                {
+                    "device_code": "secret-device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://www.twitch.tv/activate",
+                    "expires_in": 900,
+                    "interval": 5,
+                },
+            ),
+            (400, {"message": "access_denied"}),
+        ]
+    )
+    service = _service(store, http)
+
+    await service.start_device_authorization("clientid123")
+    denied = await service.check_device_authorization("clientid123")
+
+    assert denied["pending"] is False
+    assert service.device_authorization_status("clientid123") is None
 
 
 @pytest.mark.asyncio

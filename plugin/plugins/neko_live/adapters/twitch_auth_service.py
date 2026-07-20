@@ -42,7 +42,7 @@ class _DeviceSession:
 
 
 class TwitchAuthService:
-    """One-shot Device Flow polling and token validation/refresh."""
+    """Device Flow session management and token validation/refresh."""
 
     def __init__(
         self,
@@ -122,14 +122,32 @@ class TwitchAuthService:
             f"user_code_present={bool(user_code)} verification_uri_present={bool(verification_uri)} "
             f"expires_in={expires_in} interval={interval}",
         )
+        return _pending_status(self._device_session, now=self._clock(), started=True)
+
+    def device_authorization_status(self, client_id: Any) -> dict[str, Any] | None:
+        """Return a public view of the active Device Flow session, if any."""
+        normalized_client_id = _client_id(client_id)
+        session = self._device_session
+        if session is None or normalized_client_id != session.client_id:
+            return None
+        if self._clock() >= session.expires_at:
+            self._device_session = None
+            return None
+        return _pending_status(session, now=self._clock())
+
+    def cancel_device_authorization(self, client_id: Any) -> dict[str, Any]:
+        """Cancel the active Device Flow session without exposing its secrets."""
+        normalized_client_id = _client_id(client_id)
+        session = self._device_session
+        cancelled = session is not None and normalized_client_id == session.client_id
+        if cancelled:
+            self._device_session = None
         return {
             "platform": "twitch",
-            "started": True,
-            "pending": True,
-            "user_code": user_code,
-            "verification_uri": verification_uri,
-            "expires_in": expires_in,
-            "interval": interval,
+            "logged_in": False,
+            "pending": False,
+            "authorization_state": "unauthorized",
+            "cancelled": cancelled,
         }
 
     def _log(self, level: str, message: str) -> None:
@@ -194,20 +212,22 @@ class TwitchAuthService:
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             },
         )
+        if self._device_session is not session:
+            return _error("twitch device authorization is not active")
         if status != 200:
             message = _oauth_error(data)
+            if message == "slow_down":
+                session.interval = min(60, session.interval + 5)
             if message in {"authorization_pending", "slow_down"}:
-                return {
-                    "platform": "twitch",
-                    "pending": True,
-                    "logged_in": False,
-                    "message": message,
-                    "interval": session.interval,
-                }
-            if message in {"expired_token", "invalid device code"}:
+                result = _pending_status(session, now=self._clock())
+                result["message"] = message
+                return result
+            if message in {"access_denied", "expired_token", "invalid device code"}:
                 self._device_session = None
             return _error("twitch authorization failed")
         credential = await self._validated_credential(session.client_id, data)
+        if self._device_session is not session:
+            return _error("twitch device authorization is not active")
         if credential is None:
             self._device_session = None
             return _error("twitch access token validation failed")
@@ -331,6 +351,7 @@ def _public_status(credential: dict[str, Any], *, refreshed: bool) -> dict[str, 
         "platform": "twitch",
         "logged_in": True,
         "pending": False,
+        "authorization_state": "authorized",
         "user_id": _text(credential.get("user_id"), limit=64),
         "login": _login(credential.get("login")),
         "display_name": _text(credential.get("display_name"), limit=80),
@@ -345,7 +366,22 @@ def _error(message: str) -> dict[str, Any]:
         "platform": "twitch",
         "logged_in": False,
         "pending": False,
+        "authorization_state": "unauthorized",
         "message": message,
+    }
+
+
+def _pending_status(session: _DeviceSession, *, now: float, started: bool = False) -> dict[str, Any]:
+    return {
+        "platform": "twitch",
+        "started": started,
+        "logged_in": False,
+        "pending": True,
+        "authorization_state": "pending",
+        "user_code": session.user_code,
+        "verification_uri": session.verification_uri,
+        "expires_in": max(0, int(session.expires_at - now)),
+        "interval": session.interval,
     }
 
 
@@ -446,4 +482,4 @@ def _oauth_error(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
     message = _text(data.get("message"), limit=80).lower()
-    return message if message in {"authorization_pending", "slow_down", "expired_token", "invalid device code"} else ""
+    return message if message in {"access_denied", "authorization_pending", "slow_down", "expired_token", "invalid device code"} else ""

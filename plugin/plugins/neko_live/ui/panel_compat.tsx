@@ -28,6 +28,7 @@ import {
   useCallback,
   useEffect,
   useForm,
+  useRef,
   useState,
   useToast,
 } from "@neko/plugin-ui"
@@ -1308,6 +1309,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
   const [loginState, setLoginState] = useState<any>(null)
   const [douyinAuthState, setDouyinAuthState] = useState<any>(null)
   const [twitchAuthState, setTwitchAuthState] = useState<any>(null)
+  const [twitchRemainingSeconds, setTwitchRemainingSeconds] = useState(0)
   const [consoleDialog, setConsoleDialog] = useState<"account" | "room" | "theme" | "pacing" | "diagnostics" | "">("")
   const [interactionDialog, setInteractionDialog] = useState<"avatar_roast" | "danmaku_response" | "live_support_events" | "warmup_hosting" | "idle_hosting" | "active_engagement" | "">("")
   const [connectPending, setConnectPending] = useState(false)
@@ -1346,6 +1348,18 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
   const sandboxForm = useForm({ ...sandboxDefaults })
   const presetViewerNickname = t("panel.dev.emitter.defaultNickname")
   const presetViewerDanmaku = t("panel.dev.emitter.defaultDanmaku")
+  const twitchPollTimerRef = useRef<number | null>(null)
+  const twitchPollGenerationRef = useRef(0)
+  const twitchValidationClientRef = useRef("")
+  const twitchValidationGenerationRef = useRef(0)
+
+  function stopTwitchAuthorizationPolling() {
+    twitchPollGenerationRef.current += 1
+    if (twitchPollTimerRef.current !== null) {
+      window.clearTimeout(twitchPollTimerRef.current)
+      twitchPollTimerRef.current = null
+    }
+  }
 
   useEffect(() => {
     try {
@@ -1355,6 +1369,10 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
     } catch {
       /* The panel remains usable when the host blocks browser storage. */
     }
+  }, [])
+
+  useEffect(() => () => {
+    twitchValidationGenerationRef.current += 1
   }, [])
 
   useEffect(() => {
@@ -1888,47 +1906,23 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
     }
   }
 
-  async function twitchCheckAuthorization() {
+  async function twitchCancelAuthorization() {
     if (authPending || sessionInProgress) return
-    setAuthPending("twitch_device_authorization_check")
+    stopTwitchAuthorizationPolling()
+    setAuthPending("twitch_device_authorization_cancel")
     try {
-      const result = unwrapActionResult(await props.api.call("twitch_device_authorization_check"))
+      const result = unwrapActionResult(await props.api.call("twitch_device_authorization_cancel"))
       setTwitchAuthState(result)
-      if (result.logged_in) toast.success(t("panel.twitchAuth.authorized"))
-      else toast.info(result.message || t("panel.twitchAuth.deviceHint"))
+      toast.info(t("panel.twitchAuth.cancelled"))
       await refreshDashboard(true)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err))
-    } finally {
-      setAuthPending("")
-    }
-  }
-
-  async function twitchStatus() {
-    if (authPending) return
-    setAuthPending("twitch_login_status")
-    try {
-      const result = unwrapActionResult(await props.api.call("twitch_login_status"))
-      setTwitchAuthState(result)
-      toast.info(result.logged_in ? t("panel.twitchAuth.authorized") : result.authorization_state === "unverified" ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized"))
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err))
-    } finally {
-      setAuthPending("")
-    }
-  }
-
-  async function twitchValidate() {
-    if (authPending) return
-    setAuthPending("twitch_credential_validate")
-    try {
-      const result = unwrapActionResult(await props.api.call("twitch_credential_validate"))
-      setTwitchAuthState(result)
-      if (result.logged_in) toast.success(t("panel.twitchAuth.authorized"))
-      else toast.warning(result.message || t("panel.twitchAuth.notAuthorized"))
-      await refreshDashboard(true)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err))
+      setTwitchAuthState(null)
+      try {
+        setTwitchAuthState(unwrapActionResult(await props.api.call("twitch_login_status")))
+      } catch {
+        /* A later panel refresh can recover the pending session. */
+      }
     } finally {
       setAuthPending("")
     }
@@ -1936,6 +1930,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
 
   async function twitchLogout() {
     if (authPending || sessionInProgress) return
+    stopTwitchAuthorizationPolling()
     setAuthPending("twitch_logout")
     try {
       const result = unwrapActionResult(await props.api.call("twitch_logout"))
@@ -1968,6 +1963,112 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
       }
     })()
   }, [])
+
+  useEffect(() => {
+    if (twitchAuthState?.pending !== true) return
+    const generation = twitchPollGenerationRef.current + 1
+    twitchPollGenerationRef.current = generation
+    const expiresAt = Date.now() + Math.max(0, Number(twitchAuthState.expires_in) || 0) * 1000
+    let networkBackoffSeconds = 0
+    const safeInterval = (value: unknown) => Math.min(60, Math.max(5, Number(value) || 5))
+    const clearPollTimer = () => {
+      if (twitchPollTimerRef.current !== null) {
+        window.clearTimeout(twitchPollTimerRef.current)
+        twitchPollTimerRef.current = null
+      }
+    }
+    const schedule = (seconds: number) => {
+      if (twitchPollGenerationRef.current !== generation) return
+      if (document.visibilityState !== "visible") return
+      clearPollTimer()
+      twitchPollTimerRef.current = window.setTimeout(poll, safeInterval(seconds) * 1000)
+    }
+    const poll = async () => {
+      if (twitchPollGenerationRef.current !== generation) return
+      if (document.visibilityState !== "visible") return
+      if (expiresAt > 0 && Date.now() >= expiresAt) {
+        setTwitchAuthState({ platform: "twitch", logged_in: false, pending: false, authorization_state: "unauthorized" })
+        toast.warning(t("panel.twitchAuth.expired"))
+        return
+      }
+      try {
+        const result = unwrapActionResult(await props.api.call("twitch_device_authorization_check"))
+        if (twitchPollGenerationRef.current !== generation) return
+        setTwitchAuthState(result)
+        if (result.logged_in === true) {
+          toast.success(t("panel.twitchAuth.authorized"))
+          await refreshDashboard(true)
+          return
+        }
+        if (result.pending === true) {
+          networkBackoffSeconds = 0
+          schedule(Number(result.interval))
+          return
+        }
+        toast.warning(t("panel.twitchAuth.notAuthorized"))
+        await refreshDashboard(true)
+      } catch {
+        if (twitchPollGenerationRef.current !== generation) return
+        networkBackoffSeconds = Math.min(60, networkBackoffSeconds > 0 ? networkBackoffSeconds * 2 : safeInterval(twitchAuthState.interval))
+        schedule(networkBackoffSeconds)
+      }
+    }
+    const handleTwitchVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        clearPollTimer()
+        return
+      }
+      schedule(Number(twitchAuthState.interval))
+    }
+    document.addEventListener("visibilitychange", handleTwitchVisibilityChange)
+    schedule(Number(twitchAuthState.interval))
+    return () => {
+      document.removeEventListener("visibilitychange", handleTwitchVisibilityChange)
+      if (twitchPollGenerationRef.current === generation) stopTwitchAuthorizationPolling()
+    }
+  }, [twitchAuthState?.pending])
+
+  useEffect(() => {
+    if (twitchAuthState?.pending !== true) {
+      setTwitchRemainingSeconds(0)
+      return
+    }
+    const deadline = Date.now() + Math.max(0, Number(twitchAuthState.expires_in) || 0) * 1000
+    let timer: number | null = null
+    const updateRemaining = () => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
+      setTwitchRemainingSeconds(remaining)
+      if (remaining > 0) timer = window.setTimeout(updateRemaining, 1000)
+    }
+    updateRemaining()
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [twitchAuthState?.pending, twitchAuthState?.expires_in])
+
+  useEffect(() => {
+    const selectedPlatform = String(configForm.values.live_platform || config.live_platform || "bilibili")
+    const clientId = String(configForm.values.twitch_client_id || "").trim()
+    if (consoleDialog !== "account" || selectedPlatform !== "twitch" || twitchAuthState?.authorization_state !== "unverified" || !clientId) return
+    if (twitchValidationClientRef.current === clientId) return
+    twitchValidationClientRef.current = clientId
+    const generation = twitchValidationGenerationRef.current + 1
+    twitchValidationGenerationRef.current = generation
+    ;(async () => {
+      try {
+        const result = unwrapActionResult(await props.api.call("twitch_credential_validate"))
+        if (twitchValidationGenerationRef.current !== generation) return
+        setTwitchAuthState(result)
+        if (result.logged_in !== true) toast.warning(t("panel.twitchAuth.notAuthorized"))
+        await refreshDashboard(true)
+      } catch {
+        if (twitchValidationGenerationRef.current === generation) {
+          twitchValidationClientRef.current = ""
+          toast.warning(t("panel.twitchAuth.notAuthorized"))
+        }
+      }
+    })()
+  }, [consoleDialog, configForm.values.live_platform, configForm.values.twitch_client_id, twitchAuthState?.authorization_state])
 
   async function callSimple(action: string) {
     if (simpleActionPending) return
@@ -2196,6 +2297,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
   const douyinValidationMessage = String((douyinAuthState && douyinAuthState.message) || "")
   const douyinValidationStatus = String((douyinAuthState && douyinAuthState.live_status) || "")
   const twitchLoggedIn = twitchAuthState?.logged_in === true
+  const twitchAuthorizationPending = twitchAuthState?.pending === true
   const twitchAuthorizationUnverified = twitchAuthState?.authorization_state === "unverified"
   const twitchLogin = String(twitchAuthState?.display_name || twitchAuthState?.login || "")
   const twitchUserId = String(twitchAuthState?.user_id || "")
@@ -2471,20 +2573,22 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
             </Stack>
           ) : livePlatform === "twitch" ? (
             <Stack>
-              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : twitchAuthorizationUnverified ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized")} />
+              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : twitchAuthorizationPending ? t("panel.twitchAuth.waiting") : twitchAuthorizationUnverified ? t("panel.twitchAuth.validating") : t("panel.twitchAuth.notAuthorized")} />
               <Field label={t("panel.fields.twitchClientId")}>
-                <Input disabled={sessionInProgress || !!authPending} value={configForm.values.twitch_client_id} placeholder={t("panel.placeholders.twitchClientId")} onChange={(value) => { configForm.setField("twitch_client_id", value) }} />
+                <Input disabled={sessionInProgress || !!authPending || twitchAuthorizationPending || twitchLoggedIn} value={configForm.values.twitch_client_id} placeholder={t("panel.placeholders.twitchClientId")} onChange={(value) => { configForm.setField("twitch_client_id", value) }} />
               </Field>
-              {twitchAuthState?.user_code ? <CodeBlock>{`${t("panel.twitchAuth.userCode")}: ${String(twitchAuthState.user_code)}`}</CodeBlock> : null}
-              {twitchAuthState?.verification_uri ? <Text>{t("panel.twitchAuth.verificationUri")}: {String(twitchAuthState.verification_uri)}</Text> : null}
-              {twitchAuthState?.pending ? <Text>{t("panel.twitchAuth.deviceHint")}</Text> : null}
-              <Grid cols={3}>
-                <Button tone="success" disabled={sessionInProgress || !!authPending} onClick={twitchAuthorize}>{t("panel.actions.twitchAuthorize")}</Button>
-                <Button tone="info" disabled={sessionInProgress || !!authPending} onClick={twitchCheckAuthorization}>{t("panel.actions.twitchCheckAuthorization")}</Button>
-                <Button tone="info" disabled={!!authPending} onClick={twitchStatus}>{t("panel.actions.twitchStatus")}</Button>
-                <Button tone="info" disabled={!!authPending} onClick={twitchValidate}>{t("panel.actions.twitchValidate")}</Button>
+              {twitchAuthorizationPending && twitchAuthState?.user_code ? <CodeBlock>{`${t("panel.twitchAuth.userCode")}: ${String(twitchAuthState.user_code)}`}</CodeBlock> : null}
+              {twitchAuthorizationPending && twitchAuthState?.verification_uri ? <Text>{t("panel.twitchAuth.verificationUri")}: <a href={String(twitchAuthState.verification_uri)} target="_blank" rel="noreferrer">{String(twitchAuthState.verification_uri)}</a></Text> : null}
+              {twitchAuthorizationPending ? <Alert tone="info">{t("panel.twitchAuth.waitingCountdown", { seconds: twitchRemainingSeconds })}</Alert> : null}
+              {twitchAuthorizationPending ? (
+                <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={twitchCancelAuthorization}>{t("panel.actions.twitchCancelAuthorization")}</Button>
+              ) : twitchLoggedIn ? (
                 <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={twitchLogout}>{t("panel.actions.twitchLogout")}</Button>
-              </Grid>
+              ) : twitchAuthorizationUnverified ? (
+                <Text>{t("panel.twitchAuth.validating")}</Text>
+              ) : (
+                <Button tone="success" disabled={sessionInProgress || !!authPending} onClick={twitchAuthorize}>{t("panel.actions.twitchAuthorize")}</Button>
+              )}
             </Stack>
           ) : (
             <Stack>

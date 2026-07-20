@@ -57,8 +57,12 @@ class RuntimeAuthApiMixin:
         return await runtime_twitch_auth.start_device_authorization(self)
 
     async def twitch_device_authorization_check(self) -> dict[str, Any]:
-        """Perform one manual Device Code Flow token check."""
+        """Perform one scheduled Device Code Flow token check."""
         return await runtime_twitch_auth.check_device_authorization(self)
+
+    async def twitch_device_authorization_cancel(self) -> dict[str, Any]:
+        """Cancel the active Twitch Device Code Flow session."""
+        return await runtime_twitch_auth.cancel_device_authorization(self)
 
     async def twitch_login_status(self) -> dict[str, Any]:
         """Return local Twitch credential metadata without tokens."""

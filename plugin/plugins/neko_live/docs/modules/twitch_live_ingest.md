@@ -9,7 +9,8 @@ client-secret-free Device Code Flow and encrypted token persistence.
 1. Create a Twitch Developer application and copy its Client ID. A Client Secret
    is not requested or stored.
 2. Start device authorization, open `https://www.twitch.tv/activate`, enter the
-   displayed user code, and manually check authorization in the panel.
+   displayed user code, and wait while the panel checks authorization at the
+   interval returned by Twitch. The pending flow can be cancelled from the panel.
 3. Enter any target channel login or a canonical
    `https://www.twitch.tv/<login>` URL. The authorized account and target channel
    are independent.
@@ -47,7 +48,7 @@ pipeline, safety guard, and dispatcher before NEKO speaks.
 ## Permission and cost decision
 
 The approved low-permission design keeps the existing `user:read:chat` scope.
-It adds one EventSub subscription but no OAuth scope, reauthorization, polling,
+It adds one EventSub subscription but no OAuth scope, reauthorization,
 dependency, or persistent gift ledger. This reports support activity visible in
 chat; it is not an authoritative broadcaster revenue feed. Adding authoritative
 Bits or subscription accounting later would require a separate owner review and
@@ -55,13 +56,25 @@ the broader broadcaster scopes such as `bits:read` or
 `channel:read:subscriptions`. Rollback only requires removing the chat
 notification subscription and Cheer projection.
 
+Device authorization polling is an explicit, bounded external-request cost. It
+starts only after the user selects **Authorize Twitch**, permits one request in
+flight, waits at least Twitch's returned interval (five seconds when omitted),
+adds five seconds after `slow_down`, and backs off transient network failures up
+to 60 seconds. It stops on success, denial, expiry, cancellation, or panel
+unmount. With Twitch's typical 1,800-second device-code lifetime and five-second
+interval, the upper-bound baseline is about 360 token checks for one user-started
+authorization attempt. See Twitch's [Device Code Grant
+Flow](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#device-code-grant-flow)
+and [RFC 8628 section 3.5](https://www.rfc-editor.org/rfc/rfc8628#section-3.5).
+
 ## Deliberately out of scope
 
 - Twitch homepage, discovery, recommendations, or followed-channel feeds
 - authoritative broadcaster revenue/accounting feeds
 - raids, channel-point redemptions, announcements, or other notification types
 - sending chat messages or any other Twitch write operation
-- background Device Flow polling
+- always-on Device Flow polling outside an active user-started authorization
+  session
 - bundled Client ID or Client Secret
 
 Rollback is provider-local: stop/unregister `twitch_live_ingest` and

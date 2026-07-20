@@ -68,12 +68,34 @@ async def check_device_authorization(runtime: Any) -> dict[str, Any]:
     return result
 
 
+async def cancel_device_authorization(runtime: Any) -> dict[str, Any]:
+    result = runtime.twitch_auth.cancel_device_authorization(_client_id(runtime))
+    runtime.audit.record(
+        "twitch_device_authorization_cancelled",
+        "twitch device authorization cancelled",
+        detail={"active_session": result.get("cancelled") is True},
+    )
+    return result
+
+
 async def credential_status(runtime: Any) -> dict[str, Any]:
+    auth = getattr(runtime, "twitch_auth", None)
+    pending = auth.device_authorization_status(_client_id(runtime)) if auth is not None else None
+    if pending is not None:
+        return pending
     if runtime.twitch_credential is None and runtime.twitch_credential_store.has_credential():
         await reload_credential(runtime)
     data = runtime.twitch_credential
     if not _credential_present(data):
-        return {"platform": "twitch", "logged_in": False, "login": "", "user_id": "", "scopes": []}
+        return {
+            "platform": "twitch",
+            "logged_in": False,
+            "pending": False,
+            "authorization_state": "unauthorized",
+            "login": "",
+            "user_id": "",
+            "scopes": [],
+        }
     return {
         "platform": "twitch",
         "logged_in": False,
@@ -96,6 +118,9 @@ async def validate_credential(runtime: Any) -> dict[str, Any]:
 
 
 async def logout(runtime: Any) -> dict[str, Any]:
+    auth = getattr(runtime, "twitch_auth", None)
+    if auth is not None:
+        auth.cancel_device_authorization(_client_id(runtime))
     removed = await runtime.twitch_credential_store.delete()
     runtime.twitch_credential = None
     runtime.audit.record("twitch_logout", "twitch credential removed", detail={"files": removed})
@@ -103,6 +128,8 @@ async def logout(runtime: Any) -> dict[str, Any]:
         "platform": "twitch",
         "logged_out": True,
         "logged_in": False,
+        "pending": False,
+        "authorization_state": "unauthorized",
         "removed": removed,
     }
 

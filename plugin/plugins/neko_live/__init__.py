@@ -433,12 +433,24 @@ class NekoLivePlugin(NekoPluginBase):
     @plugin_entry(
         id="twitch_device_authorization_check",
         name=tr("entries.twitch_device_authorization_check.name", default="检查 Twitch 设备授权"),
-        description=tr("entries.twitch_device_authorization_check.description", default="手动检查一次 Device Code Flow；成功后加密保存 token。"),
+        description=tr("entries.twitch_device_authorization_check.description", default="执行一次定时 Device Code Flow 检查；成功后加密保存 token。"),
         timeout=40.0,
     )
     async def twitch_device_authorization_check(self, **_):
         try:
             return Ok(await self._runtime().twitch_device_authorization_check())
+        except Exception as exc:
+            return Err(SdkError(str(exc)))
+
+    @ui.action(id="twitch_device_authorization_cancel", label=tr("actions.twitch_device_authorization_cancel.label", default="取消 Twitch 授权"), group="auth", order=105, refresh_context=True)
+    @plugin_entry(
+        id="twitch_device_authorization_cancel",
+        name=tr("entries.twitch_device_authorization_cancel.name", default="取消 Twitch 设备授权"),
+        description=tr("entries.twitch_device_authorization_cancel.description", default="停止当前 Device Code Flow 并清除临时授权会话。"),
+    )
+    async def twitch_device_authorization_cancel(self, **_):
+        try:
+            return Ok(await self._runtime().twitch_device_authorization_cancel())
         except Exception as exc:
             return Err(SdkError(str(exc)))
 
