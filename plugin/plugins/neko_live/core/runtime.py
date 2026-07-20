@@ -10,7 +10,14 @@ from ..stores.avatar_cache import AvatarCache
 from ..stores.viewer_store import ViewerStore
 from .contracts import RoastConfig
 from .event_bus import EventBus
-from . import runtime_bili_auth, runtime_douyin_auth, runtime_modules, runtime_state, runtime_twitch_auth
+from . import (
+    runtime_bili_auth,
+    runtime_co_stream_policy,
+    runtime_douyin_auth,
+    runtime_modules,
+    runtime_state,
+    runtime_twitch_auth,
+)
 from .runtime_auth_api import RuntimeAuthApiMixin
 from .runtime_config_api import RuntimeConfigApiMixin
 from .permission_gate import PermissionGate
@@ -78,6 +85,7 @@ class RoastRuntime(
         self.twitch_credential: dict[str, Any] | None = None
         self.twitch_auth = runtime_twitch_auth.create_auth_service(self)
         runtime_state.initialize_runtime_state(self)
+        runtime_co_stream_policy.initialize_co_stream_policy(self)
         self.live_hosting_director = LiveHostingDirector(self)
         self.active_topic_selector = ActiveTopicSelector(self)
 

@@ -42,7 +42,7 @@ async def plugin_is_running(plugin_id: str) -> bool:
             plugin_id,
             type(exc).__name__,
         )
-        return False
+        raise
 
 
 async def stop_plugin_for_upgrade(plugin_id: str) -> None:
@@ -91,7 +91,18 @@ async def restore_directory(backup_dir: Path, target_dir: Path) -> None:
 
 
 async def remove_directory(target_dir: Path) -> None:
-    await asyncio.to_thread(shutil.rmtree, target_dir, ignore_errors=True)
+    if not target_dir.exists():
+        return
+    await asyncio.to_thread(shutil.rmtree, target_dir)
+
+
+async def merge_directory_contents(source_dir: Path, target_dir: Path) -> None:
+    if not source_dir.exists():
+        return
+    if not source_dir.is_dir():
+        raise NotADirectoryError(source_dir)
+    await asyncio.to_thread(target_dir.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(shutil.copytree, source_dir, target_dir, dirs_exist_ok=True)
 
 
 async def run_rollback(
@@ -129,14 +140,27 @@ async def _rollback_targets(
     *,
     targets: tuple[Path, ...],
     backups: dict[Path, Path],
+    preexisting_targets: frozenset[Path],
+    remove_created_targets: bool,
 ) -> bool:
     restored = True
     for target in reversed(targets):
+        backup = backups.get(target)
+        if backup is None:
+            if remove_created_targets and target not in preexisting_targets:
+                try:
+                    await remove_directory(target)
+                except Exception as exc:
+                    restored = False
+                    logger.error(
+                        "plugin upgrade created-target cleanup failed target={} err_type={}",
+                        target.name,
+                        type(exc).__name__,
+                    )
+            continue
         try:
             await remove_directory(target)
-            backup = backups.get(target)
-            if backup is not None:
-                await restore_directory(backup, target)
+            await restore_directory(backup, target)
         except Exception as exc:
             restored = False
             logger.error(
@@ -158,6 +182,7 @@ async def perform_safe_upgrade(
     start: Callable[[str], Awaitable[None]],
     cleanup_backup: Callable[[Path], Awaitable[None]],
     additional_targets: tuple[Path, ...] = (),
+    preserve_targets: tuple[Path, ...] = (),
 ) -> SafeUpgradeResult:
     if getattr(plan, "action", "") != "upgrade":
         raise ValueError("safe upgrade requires an upgrade install plan")
@@ -172,6 +197,9 @@ async def perform_safe_upgrade(
         await stop(plugin_id)
 
     targets = (target_dir, *additional_targets)
+    if any(target not in targets for target in preserve_targets):
+        raise ValueError("preserve targets must also be upgrade targets")
+    preexisting_targets = frozenset(target for target in targets if target.exists())
     backups: dict[Path, Path] = {}
     backup_dir = backup_path_for(target_dir)
     try:
@@ -185,7 +213,12 @@ async def perform_safe_upgrade(
             await asyncio.to_thread(target.rename, backup)
             backups[target] = backup
     except Exception as exc:
-        recovered = await _rollback_targets(targets=targets, backups=backups)
+        recovered = await _rollback_targets(
+            targets=targets,
+            backups=backups,
+            preexisting_targets=preexisting_targets,
+            remove_created_targets=False,
+        )
         if was_running:
             try:
                 await start(plugin_id)
@@ -206,6 +239,11 @@ async def perform_safe_upgrade(
         install_result = await install_new()
         stage = "validate"
         await validate_new()
+        stage = "preserve"
+        for target in preserve_targets:
+            backup = backups.get(target)
+            if backup is not None:
+                await merge_directory_contents(backup, target)
         if was_running:
             stage = "restart"
             await start(plugin_id)
@@ -227,7 +265,12 @@ async def perform_safe_upgrade(
             backup_dir=backup_dir,
         )
     except Exception as exc:
-        restored = await _rollback_targets(targets=targets, backups=backups)
+        restored = await _rollback_targets(
+            targets=targets,
+            backups=backups,
+            preexisting_targets=preexisting_targets,
+            remove_created_targets=True,
+        )
         if was_running:
             try:
                 await start(plugin_id)

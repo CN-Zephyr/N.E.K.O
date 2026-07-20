@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+import zipfile
 
 import pytest
 
@@ -19,6 +20,7 @@ def _upgrade_plan() -> PluginInstallPlan:
     return PluginInstallPlan(
         action="upgrade",
         package_type="plugin",
+        package_id="demo",
         plugin_id="demo",
         directory_name="demo",
         current_version="1.0.0",
@@ -97,7 +99,8 @@ async def test_safe_upgrade_restores_old_directory_after_each_failure(
     assert (profile / "default.toml").read_text(encoding="utf-8") == "version = 1\n"
     assert "stop:demo" in calls
     assert "start:demo" in calls
-    assert not list(tmp_path.glob("demo.bak.*"))
+    assert not list((tmp_path / ".upgrade-backups").glob("demo.bak.*"))
+    assert not list((profile.parent / ".upgrade-backups").glob("demo.bak.*"))
 
 
 @pytest.mark.asyncio
@@ -140,7 +143,63 @@ async def test_safe_upgrade_replaces_plugin_and_cleans_backup_on_success(tmp_pat
     assert 'version = "2.0.0"' in (target / "plugin.toml").read_text(encoding="utf-8")
     assert calls[0:2] == ["stop:demo", "start:demo"]
     assert calls[2].startswith("cleanup:demo.bak.")
-    assert not list(tmp_path.glob("demo.bak.*"))
+    assert not result.backup_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_rollback_keeps_targets_that_were_not_backed_up(tmp_path: Path) -> None:
+    target = tmp_path / "demo"
+    backup = tmp_path / ".upgrade-backups" / "demo.bak"
+    backup.mkdir(parents=True)
+    (backup / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    profile = tmp_path / "profiles" / "demo"
+    profile.mkdir(parents=True)
+    (profile / "default.toml").write_text("user_value = true\n", encoding="utf-8")
+
+    restored = await upgrade_support._rollback_targets(
+        targets=(target, profile),
+        backups={target: backup},
+        preexisting_targets=frozenset({target, profile}),
+        remove_created_targets=False,
+    )
+
+    assert restored is True
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 1\n"
+    assert (profile / "default.toml").read_text(encoding="utf-8") == "user_value = true\n"
+
+
+@pytest.mark.asyncio
+async def test_safe_upgrade_removes_profile_created_by_failed_install(tmp_path: Path) -> None:
+    target = tmp_path / "demo"
+    target.mkdir()
+    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    profile = tmp_path / "profiles" / "demo"
+
+    async def install_new() -> dict[str, object]:
+        target.mkdir()
+        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        profile.mkdir(parents=True)
+        (profile / "default.toml").write_text("new_value = true\n", encoding="utf-8")
+        return {"ok": True}
+
+    async def validate_new() -> None:
+        raise RuntimeError("validation failed")
+
+    with pytest.raises(SafeUpgradeError, match="validate"):
+        await perform_safe_upgrade(
+            plan=_upgrade_plan(),
+            target_dir=target,
+            install_new=install_new,
+            validate_new=validate_new,
+            is_running=lambda _plugin_id: _async_true(),
+            stop=lambda _plugin_id: _async_none(),
+            start=lambda _plugin_id: _async_none(),
+            cleanup_backup=lambda _path: _async_none(),
+            additional_targets=(profile,),
+        )
+
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 1\n"
+    assert not profile.exists()
 
 
 async def _async_none() -> None:
@@ -172,6 +231,21 @@ def _write_plugin(root: Path, plugin_id: str, version: str) -> Path:
     )
     (plugin_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
     return plugin_dir
+
+
+def _rewrite_package_manifest_id(package_path: Path, package_id: str) -> None:
+    entries: list[tuple[zipfile.ZipInfo, bytes]] = []
+    with zipfile.ZipFile(package_path) as src:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "manifest.toml":
+                manifest = data.decode("utf-8")
+                data = manifest.replace('id = "demo"', f'id = "{package_id}"', 1).encode("utf-8")
+            entries.append((info, data))
+
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+        for info, data in entries:
+            dst.writestr(info, data)
 
 
 @pytest.mark.asyncio
@@ -216,3 +290,104 @@ async def test_service_rejects_changed_target_before_stopping(
 
     assert exc_info.value.code == "PLUGIN_UPGRADE_PLAN_CHANGED"
     assert stop_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    [("directory_name", "../outside"), ("package_id", "../outside")],
+)
+async def test_service_rejects_unsafe_upgrade_plan_paths_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    unsafe_value: str,
+) -> None:
+    source = _write_plugin(tmp_path / "source", "demo", "2.0.0")
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / "demo-2.0.0.neko-plugin"
+    build_plugin(source, package_path)
+    plugins_root = tmp_path / "plugins"
+    _write_plugin(plugins_root, "demo", "1.0.0")
+    profiles_root = tmp_path / "profiles"
+
+    import plugin.settings as plugin_settings
+
+    monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", tmp_path / "builtin")
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", plugins_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
+    monkeypatch.setattr(plugin_settings, "USER_PACKAGE_PROFILES_ROOT", profiles_root)
+
+    service = PluginCliService()
+    plan = await service.plan_install(package=str(package_path))
+    plan[field] = unsafe_value
+
+    async def unsafe_plan_install(**_kwargs: object) -> dict[str, object]:
+        return plan
+
+    backup_attempted = False
+
+    async def unexpected_upgrade(**_kwargs: object) -> object:
+        nonlocal backup_attempted
+        backup_attempted = True
+        return object()
+
+    monkeypatch.setattr(service, "plan_install", unsafe_plan_install)
+    monkeypatch.setattr(upgrade_support, "perform_safe_upgrade", unexpected_upgrade)
+
+    with pytest.raises(ValueError, match=field):
+        await service.install(
+            package=str(package_path),
+            confirm_upgrade=True,
+            confirmation_token=str(plan["confirmation_token"]),
+        )
+
+    assert backup_attempted is False
+
+
+@pytest.mark.asyncio
+async def test_service_backs_up_profile_by_package_id_during_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_plugin(tmp_path / "source", "demo", "2.0.0")
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / "demo-2.0.0.neko-plugin"
+    build_plugin(source, package_path)
+    _rewrite_package_manifest_id(package_path, "demo-package")
+
+    plugins_root = tmp_path / "plugins"
+    _write_plugin(plugins_root, "demo", "1.0.0")
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / "demo-package"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "default.toml").write_text("old_profile = true\n", encoding="utf-8")
+    (profile_dir / "custom.toml").write_text("custom = true\n", encoding="utf-8")
+
+    import plugin.settings as plugin_settings
+
+    monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", tmp_path / "builtin")
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", plugins_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
+    monkeypatch.setattr(plugin_settings, "USER_PACKAGE_PROFILES_ROOT", profiles_root)
+
+    async def not_running(_plugin_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(upgrade_support, "plugin_is_running", not_running)
+
+    service = PluginCliService()
+    plan = await service.plan_install(package=str(package_path))
+    assert plan["package_id"] == "demo-package"
+    result = await service.install(
+        package=str(package_path),
+        confirm_upgrade=True,
+        confirmation_token=str(plan["confirmation_token"]),
+    )
+
+    assert result["operation"] == "upgrade"
+    assert 'version = "2.0.0"' in (plugins_root / "demo" / "plugin.toml").read_text(encoding="utf-8")
+    assert (profile_dir / "default.toml").read_text(encoding="utf-8") == "old_profile = true\n"
+    assert (profile_dir / "custom.toml").read_text(encoding="utf-8") == "custom = true\n"

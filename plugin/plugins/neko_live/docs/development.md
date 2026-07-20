@@ -348,6 +348,7 @@ Owner 是职责角色，不绑定具体人名。一个 PR 可以由多人实现�
 | Core Architecture Owner | `core/contracts.py` 兼容门面、`core/contracts_*` 契约组、`core/event_bus.py`、`core/module_registry.py`、`core/module_registry_lifecycle.py`、`core/module_registry_snapshot.py`、跨模块契约 | 统一事件模型、模块生命周期、模块失败隔离、模块状态投影、扩展边界、兼容性 |
 | Event Layer Owner | `modules/bili_live_ingest/**`、B 站协议解析、直播间查询、事件归一化 | 真实直播稳定性、协议变更、风控降级、LiveEvent 输入质量 |
 | Selection Owner | `modules/live_events/**`、窗口择优、事件竞争策略 | “猫只有一张嘴”的选择权、冷却窗口、评分权重、避免重复输出 |
+| Co-stream Participation Policy Owner | `core/host_turn.py`、`core/live_interaction_policy.py`、对应契约导出与测试 | 人猫同播话轮信号归一化、能力开关、参与级别、保守降级、猫猫独播隔离 |
 | Support Events Owner | `modules/live_support_events/**`、可信支持事件调度、礼物 / SC / Guard 短句致谢 | provider 事件证据、去重 / 连击状态机、有界优先队列、会话回收、Pipeline / Safety / Dispatcher 唯一出口 |
 | Pipeline Owner | `core/pipeline.py`、`core/pipeline_flow.py`、`core/pipeline_routing.py`、`core/pipeline_viewers.py`、`core/pipeline_requests.py`、`core/pipeline_session.py`、`core/pipeline_results.py`、`core/pipeline_skip_results.py`、`core/pipeline_dispatch_results.py`、`core/pipeline_failure_results.py`、`core/safety_guard.py`、`core/safety_guard_cooldown.py`、`core/safety_guard_failures.py`、`core/safety_guard_types.py`、`adapters/neko_dispatcher.py`、输出边界 | 安全门、限流、dry-run、唯一出口、NEKO 输出语义、事件 route 语义、viewer/profile 准备、request 构造、session gate、result / audit 口径 |
 | Output Contract Owner | `core/live_reply_contract.py`、`core/live_reply_policy.py`、`core/live_output_policy.py`、`core/live_output_quality.py`、`core/live_output_shape.py`、`core/live_output_memory.py`、`core/live_output_contract_prompt.py`、`core/meme_knowledge.py`、`data/meme_knowledge.json`、`adapters/output_contract_bridge.py` | 插件侧短句合约、质量兜底、recent-output 负例、热梗检索提示、metadata 桥接、宿主核心冻结边界 |
@@ -372,6 +373,7 @@ Protected Modules 是需要核心维护者 review 的高风险区域。触碰这
 - Core architecture：`core/contracts.py` 兼容门面、`core/contracts_*` 契约组、`core/event_bus.py`、`core/module_registry.py`、`core/module_registry_lifecycle.py`、`core/module_registry_snapshot.py`。
 - Event layer：`modules/bili_live_ingest/**`、直播协议解析、LiveEvent schema 或事件归一化。
 - Selection：`modules/live_events/**`、`get_score` 权重、冷却窗口、事件竞争策略。
+- Co-stream participation policy：`core/host_turn.py`、`core/live_interaction_policy.py`、对应契约导出、话轮信号来源与 runtime 接入点。
 - Support events：`modules/live_support_events/**`、可信礼物 / SC / Guard 证据投影、provider ID 去重、连击状态机、有界优先队列、短句致谢 request 合约和会话任务回收。
 - Pipeline / output：`core/pipeline.py`、`core/pipeline_flow.py`、`core/pipeline_routing.py`、`core/pipeline_viewers.py`、`core/pipeline_requests.py`、`core/pipeline_session.py`、`core/pipeline_results.py`、`core/pipeline_skip_results.py`、`core/pipeline_dispatch_results.py`、`core/pipeline_failure_results.py`、`core/safety_guard.py`、`core/safety_guard_cooldown.py`、`core/safety_guard_failures.py`、`core/safety_guard_types.py`、`adapters/neko_dispatcher.py`、`core/live_reply_contract.py`、`core/live_reply_policy.py`、`core/live_output_policy.py`、`core/live_output_quality.py`、`core/live_output_shape.py`、`core/live_output_memory.py`、`core/live_output_contract_prompt.py`、`core/meme_knowledge.py`、`data/meme_knowledge.json`、`adapters/output_contract_bridge.py`。
 - Runtime：`core/runtime.py`、`core/runtime_state.py`、`core/runtime_modules.py`、`core/runtime_*_api.py`、`core/runtime_live_status_helpers.py`、插件 action、hosted-ui context、对外入口兼容。
@@ -396,6 +398,8 @@ Protected Modules 是需要核心维护者 review 的高风险区域。触碰这
 - `core/pipeline_routing.py` 必须保持纯路由规则，不触碰 dispatcher、viewer store、safety guard、request/result 或 result 记录。
 - `core/pipeline_viewers.py` 和直播 runtime 调用点必须保持平台中立，只能通过 `live_provider_router` 解析直播 provider / identity provider，不得直接依赖 B 站或抖音 ingest / identity 富模型。
 - `core/pipeline_results.py` 只负责 `InteractionResult` 构造、audit / `record_result` 口径和安全失败记账，不做 route、不调 dispatcher、不查 viewer store。
+- `core/host_turn.py` 只归一化“主播正在说 / 可能仍持有话轮 / 已让出 / 未知”信号，不决定猫猫是否开口；`core/live_interaction_policy.py` 必须保持纯决策，不读取 runtime/config/store、不生成文本、不调 pipeline/dispatcher。
+- 人猫同播策略对 `solo_stream` 必须无条件 passthrough；新增话轮检测或同播能力不得改变猫猫独播的选择、节奏或输出路径。
 - `core/live_content_*catalog*.py` must stay as static material data or compatibility aggregates: no runtime / pipeline / dispatcher / live status reads; aggregate files must preserve original key order to avoid material-rotation drift.
 - `core/live_hosting_beats.py` 只做 host beat 选择和近期素材避让，不创建 `ViewerEvent`、不记录 `InteractionResult`、不触发 pipeline。
 - `core/live_hosting_events.py` 只做 warmup/idle hosting 事件和 gate skip result，不选择 host beat、不触发 pipeline、不管理 loop。
@@ -850,7 +854,32 @@ danmaku_core on_event(cmd, 富模型)
 
 `build_request()` 只构造请求、不触发 NEKO；强度取 `ctx.config.roast_strength`。`avatar_roast` 会显式设置 `allow_avatar_image=True`，因此 `dispatcher.push_roast()` 才会按 `avatar_vision_ok` / 压缩结果附加头像 image part（详见「输出边界」「Message Plane 预算」）。
 
-> 已知限制：自适应焦点由 LLM 依据 prompt 判断，非确定性；`pendant` 依赖 `bilibili_api` 返回 `pendant` 字段，缺失则无该 META；`co_stream_output_policy` / `solo_output_policy` 目前仅作语义占位，投递节奏的差异化尚未接入（当前只用 `live_mode` 给 prompt 节奏提示）。
+> 已知限制：自适应焦点由 LLM 依据 prompt 判断，非确定性；`pendant` 依赖 `bilibili_api` 返回 `pendant` 字段，缺失则无该 META；人猫同播已经具备独立的纯话轮/参与策略、默认关闭的能力配置和只读 runtime 投影。`conditional_auto` 尚未接入主程序的标准话轮信号，因此不会自动开口，也不在 Hosted UI 暴露操作入口。猫猫独播继续沿用原路径。
+
+## 人猫同播话轮策略与只读接线
+
+当前阶段建立可测试、可替换的策略边界和只读运行态事实，不改变当前直播行为：
+
+- `core/host_turn.py` 负责把不同来源归一为 `HostTurnSignal`，并用只读状态存储保存主程序提供的最新标准话轮信号。插件不得申请麦克风权限、采集音频、运行 VAD 或接收转写内容，也不能把检测实现写进策略。
+- `core/live_interaction_policy.py` 接收候选能力和话轮信号，返回 `allow / defer / skip / downgrade`，不读取配置、不触发 pipeline、不生成台词。
+- `core/co_stream_capabilities.py` 是能力注册表。首个能力 `host_pause_fill` 表示主播停顿时的完整补位发言，配置键为 `co_stream_host_pause_fill_activation`，默认 `off`，仅接受 `off` 或 `conditional_auto`。新增能力必须单独注册和配置，不能复用一个总开关隐式开启整组行为。
+- `core/runtime_co_stream_policy.py` 组装信号存储、策略和能力配置，只在 dashboard 的 `co_stream_participation` 字段中投影当前决策。当前没有手动交棒 action、Hosted UI 卡片、输出模块或 Pipeline 专用路由。`conditional_auto` 的保存选择与真实开口同意是两个状态；只有未来专用确认动作写入匹配的 consent version 后才可 enforcement，普通设置更新不得写该版本。dashboard 投影固定标记 `read_only=true`、`enforced=false`，读取投影不会写 audit、创建 request 或触发输出。
+- 能力激活方式固定为 `off / conditional_auto`。主播完成一次配置后，运行期不应依赖临场按钮或重复操作。
+- 参与级别固定为 `L0`（仅内部/无台前表现）、`L1`（非语言表现）、`L2`（低打断的主播辅助）、`L3`（会占用话轮的完整发言）。话轮信号不可靠时，自动 `L3` 必须降到 `L2`，不能猜主播已经说完。
+- 条件自动模式在主播说话或可能仍持有话轮时 defer；只有主程序提供可靠的可用话轮信号后，策略才允许完整发言。
+- `solo_stream` 在策略入口无条件 passthrough。该分支是猫猫独播隔离契约，后续 runtime 接线、配置 schema 和 UI 都必须补回归测试证明其行为不变。
+
+策略 reason code 的 Canonical Source 是 `docs/runtime-observability.md`。运行态只允许记录 capability id、激活方式、请求/生效参与级别、有界 priority、话轮状态、可靠性、置信度、来源和 reason code；不得记录麦克风原始音频、转写文本、原始平台包、观众私密内容或后台对话。任何真正开口仍必须经过现有 Selection / Pipeline / Safety Guard / Dispatcher 链路。
+
+本阶段不增加后台计时器、队列、网络请求、依赖、模型 token、音频采集或持久化内容；dashboard 读取时只对一个静态能力做一次纯策略评估。回滚时删除新增配置键和只读投影即可，现有 Selection / Pipeline / Safety Guard / Dispatcher 以及 `solo_stream` 路径均不需要迁移。进入真实自动话轮接线前，维护者仍需分别确认主程序信号契约与可靠性、自动触发阈值、独立用户授权、能力与现有 Selection 的竞争关系、降级与关闭路径，以及相应回归和隐私可观测方案。
+
+### 本阶段决策点
+
+- 成本与预算：采用零后台任务、零网络、零新依赖、零额外模型调用的只读接线；每次 dashboard 读取只评估当前静态能力目录。
+- 模块与接口：只扩展 `RoastConfig`、静态能力目录、runtime 组装和 dashboard 公开投影；不修改 Hosted UI、Selection、Pipeline、Safety Guard、Dispatcher 或现有事件 handler。
+- 方案取舍：当前选择“一能力一标量配置 + 静态注册表”，避免嵌套任意字典带来的迁移和未知 key 风险；能力数量明显增长后再评估版本化映射契约。
+- 发布与降级：`host_pause_fill` 默认 `off`，投影固定 `enforced=false`，当前不存在任何可触发输出的 action 或模块。删除新增配置键和投影即可完整回滚，不需要迁移数据。
+- 验证与可观测：必须覆盖配置归一化/持久化、能力目录唯一性、主程序话轮信号只读不消费、未知话轮保守降级、公开投影隐私边界、`solo_stream` passthrough，以及手动 action / 输出模块 / UI 入口不存在，并运行插件全量测试与 CLI check。
 
 ## 输出边界
 

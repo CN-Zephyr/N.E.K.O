@@ -194,6 +194,35 @@ def test_active_engagement_prompt_keeps_viewer_derived_topic_material_internal()
     assert "private viewer evidence" in prompt
 
 
+def test_active_engagement_prompt_sanitizes_and_bounds_all_topic_fields() -> None:
+    secret = "token=super-secret " + ("x" * 400)
+
+    fields = (
+        "source",
+        "shape",
+        "title",
+        "fun_axis",
+        "family",
+        "hook",
+        "pattern",
+        "intent",
+        "live_column",
+        "topic_pack",
+        "reply_affordance",
+        "interest",
+        "relevance",
+        "risk",
+        "hint",
+    )
+    material = {field: secret for field in fields}
+    material["evidence"] = [secret]
+    block = ActiveEngagementModule._topic_material_block(material)
+
+    assert "super-secret" not in block
+    assert "x" * 150 not in block
+    assert "[redacted]" in block
+
+
 @pytest.mark.asyncio
 async def test_active_engagement_topic_material_rotates_shapes_and_titles(runtime: RoastRuntime) -> None:
     async def fetch_topics(limit: int = 6) -> dict:
