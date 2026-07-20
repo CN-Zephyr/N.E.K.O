@@ -41,8 +41,10 @@ async def test_twitch_authorize_action_logs_config_and_public_result_without_cli
     assert result.is_ok() is True
     assert "stage=entry_start client_id_len=11" in lines
     assert "stage=config_saved" in lines
-    assert "stage=entry_result started=True pending=True user_code=ABCD-EFGH" in lines
+    assert "stage=entry_result started=True pending=True user_code_present=True verification_uri_present=True" in lines
     assert "clientid123" not in lines
+    assert "ABCD-EFGH" not in lines
+    assert "https://www.twitch.tv/activate" not in lines
 
 
 @pytest.mark.asyncio

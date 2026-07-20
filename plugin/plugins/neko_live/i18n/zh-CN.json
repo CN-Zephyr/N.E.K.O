@@ -785,6 +785,7 @@
   "panel.placeholders.twitchRoom": "频道登录名或 https://www.twitch.tv/频道登录名",
   "panel.twitchAuth.authorized": "Twitch 已授权",
   "panel.twitchAuth.notAuthorized": "需要 Twitch 授权",
+  "panel.twitchAuth.unverified": "Twitch 授权待校验",
   "panel.twitchAuth.deviceHint": "打开激活页面并输入设备码，然后点击“检查授权”。",
   "panel.twitchAuth.userCode": "设备码",
   "panel.twitchAuth.verificationUri": "激活页面",

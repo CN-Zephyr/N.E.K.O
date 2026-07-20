@@ -54,6 +54,8 @@ def test_both_panels_expose_twitch_account_channel_and_device_flow_controls() ->
         'twitch_logout',
         'verification_uri',
         'user_code',
+        'result.started === true && result.pending === true',
+        'authorization_state === "unverified"',
     }
     for filename in ("panel.tsx", "panel_compat.tsx"):
         source = (ROOT / "ui" / filename).read_text(encoding="utf-8")
@@ -80,6 +82,7 @@ def test_all_locales_define_twitch_panel_action_and_entry_copy() -> None:
         "panel.placeholders.twitchRoom",
         "panel.twitchAuth.authorized",
         "panel.twitchAuth.notAuthorized",
+        "panel.twitchAuth.unverified",
         "panel.twitchAuth.deviceHint",
         "panel.twitchAuth.userCode",
         "panel.twitchAuth.verificationUri",

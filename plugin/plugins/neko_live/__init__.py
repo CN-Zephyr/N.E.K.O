@@ -414,8 +414,8 @@ class NekoLivePlugin(NekoPluginBase):
                 logger.info(
                     "[Twitch OAuth] stage=entry_result "
                     f"started={result.get('started') is True} pending={result.get('pending') is True} "
-                    f"user_code={str(result.get('user_code') or '')} "
-                    f"verification_uri={str(result.get('verification_uri') or '')} "
+                    f"user_code_present={bool(result.get('user_code'))} "
+                    f"verification_uri_present={bool(result.get('verification_uri'))} "
                     f"message={str(result.get('message') or '')} "
                     f"elapsed_ms={max(0, int((time.perf_counter() - started_at) * 1000))}"
                 )

@@ -785,6 +785,7 @@
   "panel.placeholders.twitchRoom": "channel_login or https://www.twitch.tv/channel_login",
   "panel.twitchAuth.authorized": "Twitch authorized",
   "panel.twitchAuth.notAuthorized": "Twitch authorization required",
+  "panel.twitchAuth.unverified": "Twitch authorization needs validation",
   "panel.twitchAuth.deviceHint": "Open the activation page, enter the code, then click Check authorization.",
   "panel.twitchAuth.userCode": "Device code",
   "panel.twitchAuth.verificationUri": "Activation page",

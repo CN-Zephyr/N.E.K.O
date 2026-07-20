@@ -785,6 +785,7 @@
   "panel.placeholders.twitchRoom": "channel_login または https://www.twitch.tv/channel_login",
   "panel.twitchAuth.authorized": "Twitch 認証済み",
   "panel.twitchAuth.notAuthorized": "Twitch 認証が必要です",
+  "panel.twitchAuth.unverified": "Twitch 認証の確認が必要です",
   "panel.twitchAuth.deviceHint": "認証ページでコードを入力し、「認証を確認」を押してください。",
   "panel.twitchAuth.userCode": "デバイスコード",
   "panel.twitchAuth.verificationUri": "認証ページ",

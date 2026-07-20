@@ -122,7 +122,7 @@ async def test_external_twitch_http_requests_trust_environment_proxy(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_device_authorization_logs_public_code_and_never_logs_secret_device_code(
+async def test_device_authorization_logs_only_device_authorization_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
@@ -162,12 +162,29 @@ async def test_device_authorization_logs_public_code_and_never_logs_secret_devic
     assert "stage=request_start" in lines
     assert "trust_env=True proxy_env_present=True" in lines
     assert "stage=response status=200" in lines
-    assert "stage=ready user_code=ABCD-EFGH" in lines
-    assert (
-        "verification_uri=https://www.twitch.tv/activate?public=true&device-code=ABCD-EFGH"
-        in lines
-    )
+    assert "stage=ready user_code_present=True verification_uri_present=True expires_in=900 interval=5" in lines
     assert "secret-device-code" not in lines
+    assert "ABCD-EFGH" not in lines
+    assert "device-code=ABCD-EFGH" not in lines
+
+
+@pytest.mark.asyncio
+async def test_local_twitch_credential_is_unverified_until_validated() -> None:
+    runtime = SimpleNamespace(
+        twitch_credential={"access_token": "access", "refresh_token": "refresh", "login": "account_login"},
+        twitch_credential_store=SimpleNamespace(has_credential=lambda: True),
+    )
+
+    status = await runtime_twitch_auth.credential_status(runtime)
+
+    assert status == {
+        "platform": "twitch",
+        "logged_in": False,
+        "authorization_state": "unverified",
+        "login": "",
+        "user_id": "",
+        "scopes": [],
+    }
 
 
 @pytest.mark.asyncio

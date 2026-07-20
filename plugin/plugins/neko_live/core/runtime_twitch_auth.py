@@ -74,15 +74,13 @@ async def credential_status(runtime: Any) -> dict[str, Any]:
     data = runtime.twitch_credential
     if not _credential_present(data):
         return {"platform": "twitch", "logged_in": False, "login": "", "user_id": "", "scopes": []}
-    scopes = data.get("scopes", "").split() if isinstance(data.get("scopes"), str) else []
     return {
         "platform": "twitch",
-        "logged_in": True,
-        "login": _public_text(data.get("login"), 25),
-        "display_name": _public_text(data.get("display_name"), 80),
-        "user_id": _public_text(data.get("user_id"), 64),
-        "scopes": sorted(scope for scope in scopes if scope == "user:read:chat"),
-        "expires_at": _public_text(data.get("expires_at"), 24),
+        "logged_in": False,
+        "authorization_state": "unverified",
+        "login": "",
+        "user_id": "",
+        "scopes": [],
     }
 
 

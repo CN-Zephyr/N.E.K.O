@@ -119,7 +119,7 @@ class TwitchAuthService:
         self._log(
             "info",
             "stage=ready "
-            f"user_code={user_code} verification_uri={verification_uri} "
+            f"user_code_present={bool(user_code)} verification_uri_present={bool(verification_uri)} "
             f"expires_in={expires_in} interval={interval}",
         )
         return {

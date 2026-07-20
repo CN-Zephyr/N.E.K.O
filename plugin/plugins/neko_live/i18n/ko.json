@@ -785,6 +785,7 @@
   "panel.placeholders.twitchRoom": "channel_login 또는 https://www.twitch.tv/channel_login",
   "panel.twitchAuth.authorized": "Twitch 인증됨",
   "panel.twitchAuth.notAuthorized": "Twitch 인증 필요",
+  "panel.twitchAuth.unverified": "Twitch 인증 확인이 필요합니다",
   "panel.twitchAuth.deviceHint": "활성화 페이지에서 코드를 입력한 뒤 인증 확인을 누르세요.",
   "panel.twitchAuth.userCode": "기기 코드",
   "panel.twitchAuth.verificationUri": "활성화 페이지",

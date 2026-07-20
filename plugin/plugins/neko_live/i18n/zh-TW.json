@@ -785,6 +785,7 @@
   "panel.placeholders.twitchRoom": "頻道登入名或 https://www.twitch.tv/頻道登入名",
   "panel.twitchAuth.authorized": "Twitch 已授權",
   "panel.twitchAuth.notAuthorized": "需要 Twitch 授權",
+  "panel.twitchAuth.unverified": "Twitch 授權待驗證",
   "panel.twitchAuth.deviceHint": "開啟啟用頁面並輸入裝置碼，然後按一下「檢查授權」。",
   "panel.twitchAuth.userCode": "裝置碼",
   "panel.twitchAuth.verificationUri": "啟用頁面",

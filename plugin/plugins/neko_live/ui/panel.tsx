@@ -742,7 +742,8 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
     try {
       const result = unwrapActionResult(await props.api.call("twitch_device_authorization_start", { client_id: clientId }))
       setTwitchAuthState(result)
-      toast.info(t("panel.twitchAuth.deviceHint"))
+      if (result.started === true && result.pending === true) toast.info(t("panel.twitchAuth.deviceHint"))
+      else toast.error(String(result.message || t("panel.twitchAuth.notAuthorized")))
       await refreshDashboard(true)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err))
@@ -773,7 +774,7 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
     try {
       const result = unwrapActionResult(await props.api.call("twitch_login_status"))
       setTwitchAuthState(result)
-      toast.info(result.logged_in ? t("panel.twitchAuth.authorized") : t("panel.twitchAuth.notAuthorized"))
+      toast.info(result.logged_in ? t("panel.twitchAuth.authorized") : result.authorization_state === "unverified" ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized"))
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err))
     } finally {
@@ -1059,6 +1060,7 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
   const douyinValidationMessage = String((douyinAuthState && douyinAuthState.message) || "")
   const douyinValidationStatus = String((douyinAuthState && douyinAuthState.live_status) || "")
   const twitchLoggedIn = twitchAuthState?.logged_in === true
+  const twitchAuthorizationUnverified = twitchAuthState?.authorization_state === "unverified"
   const twitchLogin = String(twitchAuthState?.display_name || twitchAuthState?.login || "")
   const twitchUserId = String(twitchAuthState?.user_id || "")
   const connectionPlan = connection && typeof connection.connection_plan === "object" ? connection.connection_plan : null
@@ -1263,7 +1265,7 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
                     : livePlatform === "douyin" && !douyinLoggedIn
                       ? t("panel.douyinAuth.cookieMissing")
                       : livePlatform === "twitch" && !twitchLoggedIn
-                        ? t("panel.twitchAuth.notAuthorized")
+                        ? (twitchAuthorizationUnverified ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized"))
                       : loginRequired
                         ? t("panel.console.loginRequired")
                       : t("panel.console.readyHint")}
@@ -1333,7 +1335,7 @@ export default function NekoLivePanel(props: PluginSurfaceProps<DashboardState>)
             </Stack>
           ) : livePlatform === "twitch" ? (
             <Stack>
-              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : t("panel.twitchAuth.notAuthorized")} />
+              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : twitchAuthorizationUnverified ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized")} />
               <Field label={t("panel.fields.twitchClientId")}>
                 <Input disabled={sessionInProgress || !!authPending} value={configForm.values.twitch_client_id} placeholder={t("panel.placeholders.twitchClientId")} onChange={(value) => { configForm.setField("twitch_client_id", value) }} />
               </Field>
