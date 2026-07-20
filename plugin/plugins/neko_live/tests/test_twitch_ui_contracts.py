@@ -88,6 +88,14 @@ def test_twitch_config_fields_exist_in_modular_and_compat_panel_defaults() -> No
     assert 'twitch_client_id: ""' in compat_source
 
 
+def test_twitch_validation_copy_requires_a_configured_client_id() -> None:
+    for filename in ("panel.tsx", "panel_compat.tsx"):
+        source = (ROOT / "ui" / filename).read_text(encoding="utf-8")
+        assert 'const twitchClientIdConfigured = Boolean(String(configForm.values.twitch_client_id || "").trim())' in source
+        assert "const twitchAuthorizationValidating = twitchAuthorizationUnverified && twitchClientIdConfigured" in source
+        assert 'twitchAuthorizationUnverified ? t("panel.twitchAuth.validating")' not in source
+
+
 def test_all_locales_define_twitch_panel_action_and_entry_copy() -> None:
     required = {
         "panel.platform.twitch",

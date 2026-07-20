@@ -2310,6 +2310,8 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
   const twitchLoggedIn = twitchAuthState?.logged_in === true
   const twitchAuthorizationPending = twitchAuthState?.pending === true
   const twitchAuthorizationUnverified = twitchAuthState?.authorization_state === "unverified"
+  const twitchClientIdConfigured = Boolean(String(configForm.values.twitch_client_id || "").trim())
+  const twitchAuthorizationValidating = twitchAuthorizationUnverified && twitchClientIdConfigured
   const twitchLogin = String(twitchAuthState?.display_name || twitchAuthState?.login || "")
   const twitchUserId = String(twitchAuthState?.user_id || "")
   const connectionPlan = connection && typeof connection.connection_plan === "object" ? connection.connection_plan : null
@@ -2514,7 +2516,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
                     : livePlatform === "douyin" && !douyinLoggedIn
                       ? t("panel.douyinAuth.cookieMissing")
                       : livePlatform === "twitch" && !twitchLoggedIn
-                        ? (twitchAuthorizationUnverified ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized"))
+                        ? (twitchAuthorizationValidating ? t("panel.twitchAuth.unverified") : t("panel.twitchAuth.notAuthorized"))
                       : loginRequired
                         ? t("panel.console.loginRequired")
                       : t("panel.console.readyHint")}
@@ -2584,7 +2586,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
             </Stack>
           ) : livePlatform === "twitch" ? (
             <Stack>
-              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : twitchAuthorizationPending ? t("panel.twitchAuth.waiting") : twitchAuthorizationUnverified ? t("panel.twitchAuth.validating") : t("panel.twitchAuth.notAuthorized")} />
+              <StatusBadge tone={twitchLoggedIn ? "success" : "warning"} label={twitchLoggedIn ? (twitchLogin || t("panel.twitchAuth.authorized")) : twitchAuthorizationPending ? t("panel.twitchAuth.waiting") : twitchAuthorizationValidating ? t("panel.twitchAuth.validating") : t("panel.twitchAuth.notAuthorized")} />
               <Field label={t("panel.fields.twitchClientId")}>
                 <Input disabled={sessionInProgress || !!authPending || twitchAuthorizationPending || twitchLoggedIn} value={configForm.values.twitch_client_id} placeholder={t("panel.placeholders.twitchClientId")} onChange={(value) => { configForm.setField("twitch_client_id", value) }} />
               </Field>
@@ -2595,7 +2597,7 @@ export default function NekoLivePanel(props: CompatPluginSurfaceProps<DashboardS
                 <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={twitchCancelAuthorization}>{t("panel.actions.twitchCancelAuthorization")}</Button>
               ) : twitchLoggedIn ? (
                 <Button tone="danger" disabled={sessionInProgress || !!authPending} onClick={twitchLogout}>{t("panel.actions.twitchLogout")}</Button>
-              ) : twitchAuthorizationUnverified ? (
+              ) : twitchAuthorizationValidating ? (
                 <Text>{t("panel.twitchAuth.validating")}</Text>
               ) : (
                 <Button tone="success" disabled={sessionInProgress || !!authPending} onClick={twitchAuthorize}>{t("panel.actions.twitchAuthorize")}</Button>
