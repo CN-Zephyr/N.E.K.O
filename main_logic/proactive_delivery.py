@@ -57,8 +57,10 @@ loop serialises everything between ``await`` points.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import logging
+import math
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -66,6 +68,78 @@ logger = logging.getLogger("main_logic.proactive_delivery")
 
 DELIVERY_ACK_FUTURE_KEY = "_proactive_delivery_ack_future"
 DELIVERY_RETRACTED_KEY = "_proactive_delivery_retracted"
+DELIVERY_DEADLINE_KEY = "_proactive_delivery_deadline"
+DELIVERY_CLAIM_TOKEN_KEY = "_proactive_delivery_claim_token"
+
+DELIVERY_TTL_METADATA_KEY = "delivery_ttl_seconds"
+DELIVERY_TTL_MAX_S = 90.0
+
+
+def _stable_short_hash(value: Any, *, length: int = 10) -> str:
+    raw = str(value or "").encode("utf-8", errors="replace")
+    return hashlib.sha256(raw).hexdigest()[: max(4, int(length))]
+
+
+def parse_delivery_ttl_seconds(metadata: Any) -> Optional[float]:
+    """Return a positive, finite producer TTL capped at the host maximum."""
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get(DELIVERY_TTL_METADATA_KEY)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    ttl = float(raw)
+    if not math.isfinite(ttl) or ttl <= 0:
+        return None
+    return min(DELIVERY_TTL_MAX_S, ttl)
+
+
+def ensure_callback_delivery_deadline(
+    callback: dict,
+    *,
+    default_ttl_s: Optional[float],
+    now: Optional[float] = None,
+) -> Optional[float]:
+    """Attach one monotonic deadline without restarting it between queues."""
+    existing = callback.get(DELIVERY_DEADLINE_KEY)
+    if isinstance(existing, (int, float)) and not isinstance(existing, bool):
+        existing_f = float(existing)
+        if math.isfinite(existing_f):
+            return existing_f
+
+    ttl = parse_delivery_ttl_seconds(callback.get("metadata"))
+    if ttl is None:
+        if (
+            isinstance(default_ttl_s, bool)
+            or not isinstance(default_ttl_s, (int, float))
+        ):
+            return None
+        ttl = float(default_ttl_s)
+        if not math.isfinite(ttl) or ttl <= 0:
+            return None
+
+    deadline = float(time.monotonic() if now is None else now) + ttl
+    callback[DELIVERY_DEADLINE_KEY] = deadline
+    return deadline
+
+
+def callback_delivery_expired(
+    callback: Any, *, now: Optional[float] = None
+) -> bool:
+    if not isinstance(callback, dict):
+        return False
+    deadline = callback.get(DELIVERY_DEADLINE_KEY)
+    if (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+        or not math.isfinite(float(deadline))
+    ):
+        return False
+    return float(time.monotonic() if now is None else now) >= float(deadline)
+
+
+def expire_callback_delivery(callback: dict) -> None:
+    callback[DELIVERY_RETRACTED_KEY] = True
+    resolve_callback_delivery_ack(callback, False)
 
 
 def resolve_callback_delivery_ack(callback: dict, delivered: bool) -> None:
@@ -95,15 +169,14 @@ def effective_priority(raw: Any) -> int:
 
 
 class _QueuedCue:
-    __slots__ = ("eff_priority", "seq", "coalesce_key", "callback", "submitted_at")
+    __slots__ = ("eff_priority", "seq", "coalesce_key", "callback")
 
     def __init__(self, eff_priority: int, seq: int, coalesce_key: str,
-                 callback: dict, submitted_at: float) -> None:
+                 callback: dict) -> None:
         self.eff_priority = eff_priority
         self.seq = seq
         self.coalesce_key = coalesce_key
         self.callback = callback
-        self.submitted_at = submitted_at
 
     @property
     def sort_key(self) -> tuple[int, int]:
@@ -182,7 +255,7 @@ class ProactiveDeliveryManager:
     def _now(self) -> float:
         return time.monotonic()
 
-    def _resolve_key(self, callback: dict, coalesce_key: Optional[str]) -> str:
+    def _resolve_key(self, coalesce_key: Optional[str]) -> str:
         # Coalescing is OPT-IN: a cue collapses with another only when both
         # set the SAME explicit coalesce_key. An unset key yields a unique
         # sentinel so the cue never coalesces. This is deliberate — defaulting
@@ -200,7 +273,12 @@ class ProactiveDeliveryManager:
     # ── producer ─────────────────────────────────────────────────────────
     def submit(self, callback: dict, *, priority: Any = 0,
                coalesce_key: Optional[str] = None) -> None:
-        key = self._resolve_key(callback, coalesce_key)
+        ensure_callback_delivery_deadline(
+            callback,
+            default_ttl_s=self._ttl_s,
+            now=self._now(),
+        )
+        key = self._resolve_key(coalesce_key)
         eff = effective_priority(priority)
         # Coalesce: newest replaces any queued cue with the same key.
         if self._queue:
@@ -210,15 +288,13 @@ class ProactiveDeliveryManager:
                 for cue in dropped:
                     resolve_callback_delivery_ack(cue.callback, False)
                 logger.debug(
-                    "[proactive%s] coalesced %d queued cue(s) on key=%r",
-                    self._suffix(), len(dropped), key,
+                    "[proactive%s] coalesced %d queued cue(s) key_hash=%s",
+                    self._suffix(), len(dropped), _stable_short_hash(key),
                 )
-        self._queue.append(
-            _QueuedCue(eff, next(self._seq), key, callback, self._now())
-        )
+        self._queue.append(_QueuedCue(eff, next(self._seq), key, callback))
         logger.debug(
-            "[proactive%s] submit key=%r eff_priority=%d queue=%d",
-            self._suffix(), key, eff, len(self._queue),
+            "[proactive%s] submit key_hash=%s eff_priority=%d queue=%d",
+            self._suffix(), _stable_short_hash(key), eff, len(self._queue),
         )
         self._schedule_pump(0.0)
 
@@ -306,16 +382,16 @@ class ProactiveDeliveryManager:
         self._pump_handle = loop.call_later(max(0.0, delay), self._pump)
 
     def _drop_stale(self) -> None:
-        if self._ttl_s <= 0 or not self._queue:
+        if not self._queue:
             return
         now = self._now()
         fresh: list[_QueuedCue] = []
         for c in self._queue:
-            if now - c.submitted_at > self._ttl_s:
-                resolve_callback_delivery_ack(c.callback, False)
+            if callback_delivery_expired(c.callback, now=now):
+                expire_callback_delivery(c.callback)
                 logger.info(
-                    "[proactive%s] dropping stale cue key=%r age=%.1fs (ttl=%.0fs)",
-                    self._suffix(), c.coalesce_key, now - c.submitted_at, self._ttl_s,
+                    "[proactive%s] dropping expired cue key_hash=%s",
+                    self._suffix(), _stable_short_hash(c.coalesce_key),
                 )
             else:
                 fresh.append(c)
@@ -395,8 +471,10 @@ class ProactiveDeliveryManager:
         self._inflight_deadline = now + self._inflight_timeout_s
         callbacks = [c.callback for c in batch]
         logger.info(
-            "[proactive%s] release batch n=%d keys=%s",
-            self._suffix(), len(callbacks), [c.coalesce_key for c in batch],
+            "[proactive%s] release batch n=%d key_hashes=%s",
+            self._suffix(),
+            len(callbacks),
+            [_stable_short_hash(c.coalesce_key) for c in batch[:16]],
         )
         asyncio.create_task(self._run_deliver(callbacks))
         # Arm the inflight-timeout: if no playback signal arrives (deliver

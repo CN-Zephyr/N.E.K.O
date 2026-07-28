@@ -216,8 +216,8 @@ class ProactiveBridge:
         parts = payload.get("parts") if isinstance(payload.get("parts"), list) else []
         # Proactive-delivery hints (priority ordering + coalescing). Carried
         # through to the main_server callback so ProactiveDeliveryManager can
-        # order/coalesce. Lower priority = more urgent; unspecified (0) is
-        # normalised to a neutral band downstream.
+        # order/coalesce. Higher priority = more important; unspecified (0)
+        # remains the least-important default downstream.
         try:
             # OverflowError: plugin payload is boundary input; JSON
             # Infinity/-Infinity → non-finite float → int() raises. Must not

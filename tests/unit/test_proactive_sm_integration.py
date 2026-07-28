@@ -15,9 +15,11 @@
 7. ``trigger_greeting`` 的 voice guard 在 SM claim 后触发：不投递但 fire DONE
 """
 import asyncio
+import logging
 import os
 import re
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -28,7 +30,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 # state/session/lock 结构，然后直接调用 trigger_agent_callbacks 的关键分支。
 import main_logic.core as core_module
 from main_logic.omni_offline_client import OmniOfflineClient
-from main_logic.proactive_delivery import DELIVERY_ACK_FUTURE_KEY, DELIVERY_RETRACTED_KEY
+from main_logic.proactive_delivery import (
+    DELIVERY_ACK_FUTURE_KEY,
+    DELIVERY_CLAIM_TOKEN_KEY,
+    DELIVERY_RETRACTED_KEY,
+)
 from main_logic.session_state import (
     ProactivePhase,
     SessionEvent,
@@ -317,7 +323,7 @@ async def test_voice_mode_drop_uses_id_match_not_length_alignment():
     assert mgr.pending_extra_replies == [stale_extra_a, stale_extra_b]
 
 
-async def test_voice_mode_server_rejection_re_enqueues_cb():
+async def test_voice_mode_server_rejection_re_enqueues_cb(caplog):
     """Voice 模式：``response.create`` 被 server 拒（``response_already_active``
     等 VAD 抢跑场景）通过 error 事件异步回来，``inject_text_and_request_response``
     本身已经 return 了。我们注册的 ``on_rejected`` 回调必须把那条已乐观剔除
@@ -350,7 +356,9 @@ async def test_voice_mode_server_rejection_re_enqueues_cb():
     assert captured_rejection[0] is not None
 
     # 模拟 server 异步抛回 response_already_active
-    captured_rejection[0]("response_already_active")
+    private_error = "response_already_active private-provider-detail"
+    with caplog.at_level(logging.WARNING):
+        captured_rejection[0](private_error)
 
     # cb 被 on_rejected 回到 pending_agent_callbacks，等下次 trigger 重投
     assert len(mgr.pending_agent_callbacks) == 1
@@ -363,6 +371,7 @@ async def test_voice_mode_server_rejection_re_enqueues_cb():
     # re-reject 死循环。retry 交给那个 active response 的 response.done →
     # _finalize_turn_after_emit。所以这里不应有立即调度。
     assert mgr._fired_tasks == []
+    assert private_error not in caplog.text
 
 
 async def test_voice_mode_late_rejection_keeps_delivery_ack_pending():
@@ -397,6 +406,55 @@ async def test_voice_mode_late_rejection_keeps_delivery_ack_pending():
     assert not future.done()
     assert mgr.pending_agent_callbacks == [cb]
     assert mgr.pending_extra_replies == [extra]
+
+
+async def test_voice_mode_user_vad_defers_without_injecting():
+    sess = _make_voice_sess()
+    sess._client_vad_active = True
+    mgr = _make_mgr(session=sess)
+    cb = {"status": "completed", "summary": "wait for user"}
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.injected == []
+    assert mgr.pending_agent_callbacks == [cb]
+
+
+async def test_voice_mode_recent_user_activity_defers_without_injecting():
+    sess = _make_voice_sess()
+    sess._client_vad_active = False
+    sess._user_recent_activity_time = time.time()
+    sess._user_recent_activity_window = 8.0
+    mgr = _make_mgr(session=sess)
+    cb = {"status": "completed", "summary": "wait through user pause"}
+    mgr.pending_agent_callbacks = [cb]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.injected == []
+    assert mgr.pending_agent_callbacks == [cb]
+
+
+async def test_voice_mode_rechecks_user_vad_after_media_await():
+    sess = _make_voice_sess()
+    sess._client_vad_active = False
+    mgr = _make_mgr(session=sess)
+    cb = {"status": "completed", "summary": "wait after media"}
+    mgr.pending_agent_callbacks = [cb]
+
+    async def _stream_then_user_speaks(callbacks, session):
+        session._client_vad_active = True
+        return True
+
+    mgr._stream_cb_media = _stream_then_user_speaks
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.injected == []
+    assert mgr.pending_agent_callbacks == [cb]
 
 
 async def test_voice_mode_success_resolves_delivery_ack_after_rejection_window():
@@ -1102,21 +1160,29 @@ def test_submit_proactive_callback_persists_when_goodbye_silent():
     # onto the callback dict (plus a submission seq) for the enqueue path.
     assert cb["coalesce_key"] == "same-source"
     assert isinstance(cb["_coalesce_submit_seq"], int)
-    assert mgr.pending_extra_replies == [
-        {
-            "_callback_delivery_id": cb["_callback_delivery_id"],
-            "coalesce_key": "same-source",
-            "_coalesce_submit_seq": cb["_coalesce_submit_seq"],
-            "origin": "event",
-            "summary": "queued",
-            "detail": "",
-            "status": "completed",
-            "context_source": "proactive.callback",
-            "source_kind": "unknown",
-            "source_name": "",
-            "error_message": "",
-        }
-    ]
+    assert len(mgr.pending_extra_replies) == 1
+    extra = mgr.pending_extra_replies[0]
+    assert (
+        extra[DELIVERY_CLAIM_TOKEN_KEY]
+        is cb[DELIVERY_CLAIM_TOKEN_KEY]
+    )
+    assert {
+        key: value
+        for key, value in extra.items()
+        if key != DELIVERY_CLAIM_TOKEN_KEY
+    } == {
+        "_callback_delivery_id": cb["_callback_delivery_id"],
+        "coalesce_key": "same-source",
+        "_coalesce_submit_seq": cb["_coalesce_submit_seq"],
+        "origin": "event",
+        "summary": "queued",
+        "detail": "",
+        "status": "completed",
+        "context_source": "proactive.callback",
+        "source_kind": "unknown",
+        "source_name": "",
+        "error_message": "",
+    }
 
 
 def _read_core_package_source() -> str:

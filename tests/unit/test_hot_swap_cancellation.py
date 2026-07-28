@@ -43,7 +43,10 @@ import pytest
 import main_logic.core as core_module
 from main_logic.omni_offline_client import OmniOfflineClient
 from main_logic.omni_realtime_client import OmniRealtimeClient
-from main_logic.proactive_delivery import DELIVERY_RETRACTED_KEY
+from main_logic.proactive_delivery import (
+    DELIVERY_ACK_FUTURE_KEY,
+    DELIVERY_RETRACTED_KEY,
+)
 
 
 class _FakeSession:
@@ -709,6 +712,15 @@ async def test_final_swap_happy_path_consumes_selected_keeps_deferred(monkeypatc
     extra_sel = _extra_entry("id-sel", "goes into this swap")
     extra_def = _extra_entry("id-def", "waits for the next swap")
     mgr.pending_extra_replies = [extra_sel, extra_def]
+    selected_ack = asyncio.get_running_loop().create_future()
+    selected_callback = {
+        "_callback_delivery_id": "id-sel",
+        "origin": "event",
+        "summary": "goes into this swap",
+        "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: selected_ack,
+    }
+    mgr.pending_agent_callbacks = [selected_callback]
 
     monkeypatch.setattr(
         "main_logic.core.lifecycle._select_callbacks_within_token_budget",
@@ -723,7 +735,44 @@ async def test_final_swap_happy_path_consumes_selected_keeps_deferred(monkeypatc
         assert new_session.prime_calls and new_session.prime_calls[0][1] is False
         assert mgr.pending_extra_replies == [extra_def], \
             "successful swap consumes selected extras and keeps only deferred ones"
+        assert mgr.pending_agent_callbacks == []
+        assert selected_ack.result() is True
     finally:
+        await _drain_task(mgr.message_handler_task)
+
+
+@pytest.mark.asyncio
+async def test_final_swap_does_not_announce_extra_owned_by_direct_inject():
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _FakeSession("pending")
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    mgr.is_active = True
+    mgr.message_handler_task = None
+
+    callback = {
+        "_callback_delivery_id": "id-direct-owned",
+        "origin": "event",
+        "summary": "direct owns this cue",
+        "status": "completed",
+    }
+    extra = _extra_entry("id-direct-owned", "direct owns this cue")
+    mgr.pending_agent_callbacks = [callback]
+    mgr.pending_extra_replies = [extra]
+    assert mgr._claim_delivery_entries([callback], "direct") == [callback]
+
+    try:
+        swap_task = await _run_swap_as_final_swap_task(mgr)
+
+        assert not swap_task.cancelled()
+        assert new_session.prime_calls
+        assert new_session.prime_calls[0][1] is True
+        assert mgr.pending_extra_replies == [extra]
+        assert mgr.pending_agent_callbacks == [callback]
+    finally:
+        mgr._release_delivery_claims([callback], "direct")
         await _drain_task(mgr.message_handler_task)
 
 

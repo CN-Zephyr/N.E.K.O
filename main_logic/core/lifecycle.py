@@ -28,7 +28,9 @@ from fastapi import WebSocket
 from main_logic.omni_realtime_client import OmniRealtimeClient
 from main_logic.omni_offline_client import OmniOfflineClient, _is_safety_violation_signal
 from main_logic.proactive_delivery import (
+    DELIVERY_CLAIM_TOKEN_KEY,
     DELIVERY_RETRACTED_KEY,
+    callback_delivery_expired,
     resolve_callback_delivery_ack,
 )
 from utils.gptsovits_config import is_gsv_disabled_voice_id
@@ -1995,6 +1997,8 @@ class LifecycleMixin:
                 self.is_hot_swap_imminent = False
                 return
 
+        _swap_claimed_extras: list = []
+        _swap_claim_committed = False
         try:
             new_session = None  # 提前初始化，确保 except 块安全访问（实际赋值在 PERFORM ACTUAL HOT SWAP 段）
             old_listener_cancel_timed_out = False  # 旧 listener 取消超时标志，供 except 块做 fail-close 决策
@@ -2034,6 +2038,7 @@ class LifecycleMixin:
 
             # 若存在需要植入的额外提示，则指示模型忽略上一条消息，并在下一次响应中统一向用户补充这些提示
             if self.pending_extra_replies and len(self.pending_extra_replies) > 0:
+                self._purge_expired_agent_callbacks()
                 _lang = normalize_language_code(self.user_language, format='short')
                 from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
                 # Budget-aware selection (mirror of the text-mode drain): render
@@ -2054,13 +2059,10 @@ class LifecycleMixin:
                 _selected = [
                     e for e in _selected
                     if not self._coalesce_entry_is_stale(e)
+                    and not callback_delivery_expired(e)
                 ]
-                final_prime_text += _render_pending_extra_replies_by_origin(
-                    _selected,
-                    lang=_lang,
-                    lanlan_name=self.lanlan_name,
-                    master_name=self.master_name,
-                )
+                _selected = self._claim_delivery_entries(_selected, "swap")
+                _swap_claimed_extras = list(_selected)
                 # Passive（read）回调搭车：本分支只记预算参照（extras 先占
                 # 份额），选取推迟到主 prime 之后的统一注入点——收窄"同 key
                 # 更新 cue 在主 prime await 期间入队"的陈旧窗口（Codex P2）。
@@ -2071,24 +2073,56 @@ class LifecycleMixin:
                 # 丢播报、放出 read 响应（Codex P1），留队等下一次无 extras
                 # 的 swap。
                 _extras_for_budget = _selected
-                try:
-                    await self.pending_session.prime_context(final_prime_text, skipped=False)
-                except (web_exceptions.ConnectionClosed, AttributeError) as e:
-                    # pending_session 连接已关闭或websocket为None，放弃整个 swap 操作
-                    logger.error(f"💥 Final Swap Sequence: pending_session不可用，放弃swap操作: {e}")
-                    await self._cleanup_pending_session_resources()
-                    await self._reset_preparation_state(clear_main_cache=True)
-                    self.is_hot_swap_imminent = False
-                    return
-                # 注入成功后队列**原地不动**，只记住已选条目的对象引用；真正的
-                # 移除延迟到 promote 成功那一刻（"被注入的 session 成为活跃会话"）。
-                # 这样 prime→promote 窗口期内的并发移除方——语音主动投递成功清除
-                # （trigger_agent_callbacks 按 delivery_id 清双队列）、retraction
-                # purge、topic 语音封锁清扫、flood cap——都能正常命中队列里的条目，
-                # 不存在"被摘走的条目逃过清除、中止后又被塞回复活"的 TOCTOU 盲区；
-                # 而任何 promote 前的中止出口天然保留整个队列（与 _deferred 对齐），
-                # 无需恢复代码。over-budget 的 _deferred 留到下一轮。
-                _prime_selected_extras = _selected
+                if _selected:
+                    final_prime_text += _render_pending_extra_replies_by_origin(
+                        _selected,
+                        lang=_lang,
+                        lanlan_name=self.lanlan_name,
+                        master_name=self.master_name,
+                    )
+                    try:
+                        await self.pending_session.prime_context(
+                            final_prime_text, skipped=False
+                        )
+                    except (web_exceptions.ConnectionClosed, AttributeError) as e:
+                        # pending_session 连接已关闭或websocket为None，放弃整个 swap 操作
+                        logger.error(f"💥 Final Swap Sequence: pending_session不可用，放弃swap操作: {e}")
+                        await self._cleanup_pending_session_resources()
+                        await self._reset_preparation_state(clear_main_cache=True)
+                        self.is_hot_swap_imminent = False
+                        return
+                    # 注入成功后队列**原地不动**，只记住已选条目的对象引用；真正的
+                    # 移除延迟到 promote 成功那一刻（"被注入的 session 成为活跃会话"）。
+                    _prime_selected_extras = _selected
+                else:
+                    # The only queued extras are expired or already owned by
+                    # direct injection. Keep the normal skipped prime so this
+                    # hot swap cannot create a second proactive response.
+                    final_prime_text += _loc(CONTEXT_SUMMARY_READY, _lang).format(
+                        name=self.lanlan_name,
+                        master=self.master_name,
+                    )
+                    if (
+                        isinstance(self.pending_session, OmniRealtimeClient)
+                        and getattr(self.pending_session, "_is_gemini", False)
+                    ):
+                        _passive_sel, _passive_swap_text = (
+                            self._select_passive_callbacks_for_swap_prime()
+                        )
+                        if _passive_swap_text:
+                            final_prime_text += "\n" + _passive_swap_text
+                    try:
+                        await self.pending_session.prime_context(
+                            final_prime_text, skipped=True
+                        )
+                    except (web_exceptions.ConnectionClosed, AttributeError) as e:
+                        logger.error(f"💥 Final Swap Sequence: pending_session不可用，放弃swap操作: {e}")
+                        await self._cleanup_pending_session_resources()
+                        await self._reset_preparation_state(clear_main_cache=True)
+                        self.is_hot_swap_imminent = False
+                        return
+                    if _passive_swap_text:
+                        _prime_selected_passive_cbs = _passive_sel
             else:
                 _lang = normalize_language_code(self.user_language, format='short')
                 final_prime_text += _loc(CONTEXT_SUMMARY_READY, _lang).format(name=self.lanlan_name, master=self.master_name)
@@ -2147,8 +2181,6 @@ class LifecycleMixin:
                         logger.warning(
                             f"Final Swap Sequence: passive ride-along prime failed (kept queued): {e}"
                         )
-
-            print(final_prime_text) #只在控制台显示，不输出到日志文件
 
             # 2. Start temporary listener for PENDING session's *second* ignored response
             if self.pending_session_final_prime_complete_event:
@@ -2316,6 +2348,28 @@ class LifecycleMixin:
             # 必须在 promote 之后调用：_flush_hot_swap_audio_cache 使用 self.session
             # 发送音频，此时 self.session 已是新 session，音频会正确发往新会话。
             await self._flush_hot_swap_audio_cache()
+            if _swap_claimed_extras:
+                delivered_tokens = {
+                    extra.get(DELIVERY_CLAIM_TOKEN_KEY)
+                    for extra in _swap_claimed_extras
+                    if extra.get(DELIVERY_CLAIM_TOKEN_KEY) is not None
+                }
+                delivered_callbacks = [
+                    cb
+                    for cb in self.pending_agent_callbacks
+                    if cb.get(DELIVERY_CLAIM_TOKEN_KEY) in delivered_tokens
+                ]
+                self.pending_agent_callbacks = [
+                    cb
+                    for cb in self.pending_agent_callbacks
+                    if cb.get(DELIVERY_CLAIM_TOKEN_KEY) not in delivered_tokens
+                ]
+                for callback in delivered_callbacks:
+                    resolve_callback_delivery_ack(callback, True)
+                self._release_delivery_claims(_swap_claimed_extras, "swap")
+                _swap_claim_committed = True
+                _removed_extras = []
+                _removed_cb_backed_ids = set()
             self._consume_next_session_context_messages(consumed_next_context_count)
 
             # Reset all preparation states and clear the *main* cache now that it's fully transferred
@@ -2418,6 +2472,8 @@ class LifecycleMixin:
             if self.is_active and self.session and hasattr(self.session, 'handle_messages') and (not self.message_handler_task or self.message_handler_task.done()):
                 self.message_handler_task = asyncio.create_task(self.session.handle_messages())
         finally:
+            if not _swap_claim_committed:
+                self._release_delivery_claims(_swap_claimed_extras, "swap")
             self.is_hot_swap_imminent = False  # Always reset this flag
             if self.final_swap_task and self.final_swap_task.done():
                 self.final_swap_task = None

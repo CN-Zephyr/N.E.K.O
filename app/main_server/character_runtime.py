@@ -691,8 +691,8 @@ async def _handle_agent_event(event: dict):
                     # {"task_result", "proactive_message"}) gate above.
                     origin = "event"
                 # Proactive-delivery hints from push_message (priority +
-                # coalesce_key). Lower priority = more urgent; unspecified
-                # (0) is normalised to a neutral band by the manager.
+                # coalesce_key). Higher priority = more important;
+                # unspecified (0) is the least-important default.
                 try:
                     # OverflowError: JSON Infinity/-Infinity → float → int() raises;
                     # must not let a malformed priority drop the whole callback.
@@ -741,10 +741,10 @@ async def _handle_agent_event(event: dict):
                         # orders by priority, coalesces by key, and paces
                         # release on the frontend playback gate + min-gap.
                         logger.info(
-                            "[EventBus] %s submitting proactive callback to delivery manager (priority=%s key=%r)",
+                            "[EventBus] %s submitting proactive callback to delivery manager (priority=%s coalesce=%s)",
                             event_type,
                             cb_priority,
-                            cb_coalesce_key or "(source)",
+                            bool(cb_coalesce_key),
                         )
                         mgr.submit_proactive_callback(
                             callback,

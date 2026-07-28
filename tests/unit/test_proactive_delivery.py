@@ -8,15 +8,23 @@ turn), min-gap pacing, and drain-on-teardown (cues are handed back, never
 silently dropped).
 """
 import asyncio
+import logging
+import math
+import time
 
 import pytest
 
 import main_logic.core as core_module
 from main_logic.proactive_delivery import (
     DELIVERY_ACK_FUTURE_KEY,
+    DELIVERY_CLAIM_TOKEN_KEY,
+    DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
     ProactiveDeliveryManager,
+    callback_delivery_expired,
+    ensure_callback_delivery_deadline,
     effective_priority,
+    parse_delivery_ttl_seconds,
 )
 
 pytestmark = pytest.mark.unit
@@ -46,6 +54,81 @@ def test_effective_priority_normalisation():
     assert effective_priority("x") == 0
     # A cue that set any positive priority outranks an unspecified one.
     assert effective_priority(2) > effective_priority(0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (0.25, 0.25),
+        (2, 2.0),
+        (90, 90.0),
+        (120, 90.0),
+        (True, None),
+        (False, None),
+        (0, None),
+        (-1, None),
+        ("2", None),
+        (math.inf, None),
+        (math.nan, None),
+    ],
+)
+def test_parse_delivery_ttl_accepts_any_positive_finite_value(raw, expected):
+    assert parse_delivery_ttl_seconds({"delivery_ttl_seconds": raw}) == expected
+
+
+def test_per_cue_deadline_uses_exact_short_ttl_and_survives_requeue():
+    callback = {"metadata": {"delivery_ttl_seconds": 0.25}}
+    deadline = ensure_callback_delivery_deadline(
+        callback,
+        default_ttl_s=90.0,
+        now=100.0,
+    )
+    assert deadline == 100.25
+
+    # Moving through another host queue must preserve the original deadline,
+    # not restart a fresh TTL window.
+    assert ensure_callback_delivery_deadline(
+        callback,
+        default_ttl_s=90.0,
+        now=100.2,
+    ) == 100.25
+    assert callback_delivery_expired(callback, now=100.249) is False
+    assert callback_delivery_expired(callback, now=100.25) is True
+
+
+def test_invalid_or_missing_per_cue_ttl_keeps_manager_default():
+    callback = {"metadata": {"delivery_ttl_seconds": True}}
+    assert ensure_callback_delivery_deadline(
+        callback,
+        default_ttl_s=12.0,
+        now=10.0,
+    ) == 22.0
+
+
+def test_unknown_delivery_metadata_is_ignored():
+    metadata = {
+        "delivery_ttl_seconds": 2.0,
+        "interrupt_policy": "compensate_once",
+        "delivery_key": "private-producer-key",
+        "brief_text": "not a host contract",
+    }
+    original = dict(metadata)
+
+    assert parse_delivery_ttl_seconds(metadata) == 2.0
+    assert metadata == original
+
+
+def test_trace_does_not_log_raw_coalesce_key(caplog):
+    raw_key = "room-or-player-private-key"
+    delivered = []
+    mgr = _make(delivered)
+
+    with caplog.at_level(logging.DEBUG):
+        mgr.on_playback_start()
+        mgr.submit({"id": "old"}, coalesce_key=raw_key)
+        mgr.submit({"id": "new"}, coalesce_key=raw_key)
+
+    assert raw_key not in caplog.text
 
 
 async def test_batch_released_together_in_priority_order():
@@ -242,6 +325,23 @@ async def test_stale_cue_dropped_by_ttl():
     assert delivered == []          # dropped as stale, never spoken
 
 
+async def test_short_per_cue_ttl_overrides_long_manager_default():
+    delivered = []
+    mgr = _make(delivered, ttl_s=90.0)
+    mgr.on_playback_start()
+    mgr.submit(
+        {
+            "id": "short-lived",
+            "metadata": {"delivery_ttl_seconds": 0.03},
+        },
+        priority=9,
+    )
+    await asyncio.sleep(0.05)
+    mgr.on_playback_end()
+    await _settle()
+    assert delivered == []
+
+
 # ── enqueue_agent_callback path (passive / ai_behavior="read") ────────────────
 # The ProactiveDeliveryManager above only governs proactive ("respond") cues.
 # Passive/read cues bypass it and land directly in pending_agent_callbacks; the
@@ -331,6 +431,58 @@ def test_enqueue_proactive_still_creates_voice_mirror():
     mgr.enqueue_agent_callback(_proactive_cb("respond now", coalesce_key="notice"))
     assert [c["summary"] for c in mgr.pending_agent_callbacks] == ["respond now"]
     assert [r["summary"] for r in mgr.pending_extra_replies] == ["respond now"]
+    callback = mgr.pending_agent_callbacks[0]
+    mirror = mgr.pending_extra_replies[0]
+    assert (
+        callback[DELIVERY_CLAIM_TOKEN_KEY]
+        is mirror[DELIVERY_CLAIM_TOKEN_KEY]
+    )
+
+
+def test_enqueue_passive_ttl_expires_before_natural_user_drain():
+    mgr = _make_session_mgr()
+    callback = _passive_cb(
+        "stale context",
+        metadata={"delivery_ttl_seconds": 1.0},
+    )
+    mgr.enqueue_agent_callback(callback)
+    callback[DELIVERY_DEADLINE_KEY] = time.monotonic() - 1.0
+
+    assert mgr.drain_agent_callbacks_for_llm() == ""
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+
+
+def test_passive_same_key_expired_tombstone_replaces_old_snapshot():
+    mgr = _make_session_mgr()
+    mgr.enqueue_agent_callback(
+        _passive_cb("old room snapshot", coalesce_key="room-snapshot")
+    )
+    mgr.enqueue_agent_callback(
+        _passive_cb(
+            "snapshot expired",
+            coalesce_key="room-snapshot",
+            metadata={"context_expired": True},
+        )
+    )
+
+    rendered = mgr.drain_agent_callbacks_for_llm()
+
+    assert "snapshot expired" in rendered
+    assert "old room snapshot" not in rendered
+    assert mgr.pending_extra_replies == []
+
+
+def test_delivery_claim_is_shared_and_mutually_exclusive_between_paths():
+    mgr = _make_session_mgr()
+    callback = _proactive_cb("one cue")
+    mgr.enqueue_agent_callback(callback)
+    mirror = mgr.pending_extra_replies[0]
+
+    assert mgr._claim_delivery_entries([mirror], "swap") == [mirror]
+    assert mgr._claim_delivery_entries([callback], "direct") == []
+    mgr._release_delivery_claims([mirror], "swap")
+    assert mgr._claim_delivery_entries([callback], "direct") == [callback]
 
 
 def test_enqueue_newer_proactive_replaces_passive_and_creates_mirror():
