@@ -14,6 +14,7 @@ import pytest
 import main_logic.core as core_module
 from main_logic.proactive_delivery import (
     DELIVERY_ACK_FUTURE_KEY,
+    DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
 )
 
@@ -119,6 +120,23 @@ def test_select_retracts_stale_coalesced_and_acks_false():
     assert "new snapshot" in text and "old snapshot" not in text
     assert mgr.pending_agent_callbacks == [fresh]
     assert stale_ack.done() and stale_ack.result is False
+
+
+def test_select_purges_expired_passive_before_swap_prime():
+    mgr = _make_session_mgr()
+    expired_ack = _FakeAckFuture()
+    expired = _passive_cb("expired snapshot")
+    expired[DELIVERY_DEADLINE_KEY] = 0.0
+    expired[DELIVERY_ACK_FUTURE_KEY] = expired_ack
+    fresh = _passive_cb("fresh snapshot")
+    mgr.pending_agent_callbacks = [expired, fresh]
+
+    selected, text = mgr._select_passive_callbacks_for_swap_prime()
+
+    assert selected == [fresh]
+    assert "fresh snapshot" in text and "expired snapshot" not in text
+    assert mgr.pending_agent_callbacks == [fresh]
+    assert expired_ack.done() and expired_ack.result is False
 
 
 def test_select_shares_token_budget_with_extras(monkeypatch):

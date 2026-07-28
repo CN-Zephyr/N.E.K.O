@@ -1855,6 +1855,11 @@ class LifecycleMixin:
         gates that this path must not bypass.
         """
         try:
+            # TTL is a delivery-wide freshness contract.  Passive callbacks
+            # must cross the same expiry boundary here as they do in the
+            # natural text-turn drain, otherwise an old read snapshot can
+            # resurface when the next voice hot swap primes its new session.
+            self._purge_expired_agent_callbacks()
             candidates = [
                 cb for cb in (self.pending_agent_callbacks or [])
                 if isinstance(cb, dict)
