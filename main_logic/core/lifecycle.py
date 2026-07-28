@@ -2061,8 +2061,19 @@ class LifecycleMixin:
                     if not self._coalesce_entry_is_stale(e)
                     and not callback_delivery_expired(e)
                 ]
-                _selected = self._claim_delivery_entries(_selected, "swap")
-                _swap_claimed_extras = list(_selected)
+                # Legacy plain-string extras are still supported by both the
+                # budget selector and renderer, but they have no delivery
+                # identity to claim. Preserve them in the selected batch while
+                # applying direct-vs-swap ownership only to structured entries.
+                _claimed_selected = self._claim_delivery_entries(
+                    [e for e in _selected if isinstance(e, dict)], "swap"
+                )
+                _claimed_obj_ids = {id(e) for e in _claimed_selected}
+                _selected = [
+                    e for e in _selected
+                    if not isinstance(e, dict) or id(e) in _claimed_obj_ids
+                ]
+                _swap_claimed_extras = list(_claimed_selected)
                 # Passive（read）回调搭车：本分支只记预算参照（extras 先占
                 # 份额），选取推迟到主 prime 之后的统一注入点——收窄"同 key
                 # 更新 cue 在主 prime await 期间入队"的陈旧窗口（Codex P2）。

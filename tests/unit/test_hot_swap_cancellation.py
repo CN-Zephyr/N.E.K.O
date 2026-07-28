@@ -742,6 +742,34 @@ async def test_final_swap_happy_path_consumes_selected_keeps_deferred(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_final_swap_preserves_legacy_string_extra_through_claiming():
+    """Legacy string extras have no delivery token, but remain renderable and
+    must still be consumed by a successful hot swap."""
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _FakeSession("pending")
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    mgr.is_active = True
+    mgr.message_handler_task = None
+    mgr.pending_extra_replies = ["legacy event"]
+
+    try:
+        swap_task = await _run_swap_as_final_swap_task(mgr)
+
+        assert not swap_task.cancelled()
+        assert mgr.session is new_session
+        assert new_session.prime_calls
+        prime_text, skipped = new_session.prime_calls[0]
+        assert skipped is False
+        assert "legacy event" in prime_text
+        assert mgr.pending_extra_replies == []
+    finally:
+        await _drain_task(mgr.message_handler_task)
+
+
+@pytest.mark.asyncio
 async def test_final_swap_does_not_announce_extra_owned_by_direct_inject():
     mgr = _make_swap_manager()
     old_session = _FakeSession("old")
