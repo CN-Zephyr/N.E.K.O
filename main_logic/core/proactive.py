@@ -808,6 +808,15 @@ class ProactiveMixin:
                         getattr(self, "is_hot_swap_imminent", False),
                         len(proactive_cbs),
                     )
+                    # The manager has already released these callbacks into the
+                    # inner queue, so its pump no longer owns their retry. Most
+                    # busy states emit a completion signal, but recent-user VAD
+                    # grace and hot-swap transitions do not guarantee one after
+                    # the gate becomes open. Re-arm a paced retry; expiry and
+                    # coalescing are re-checked on every attempt.
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
                     return False
 
                 _lang = normalize_language_code(self.user_language, format='short')
@@ -972,8 +981,16 @@ class ProactiveMixin:
                     self._release_delivery_claims(
                         claimed_voice_snapshot, "direct"
                     )
+                    # Media streaming is the last await before provider send.
+                    # If user activity or a hot swap closes the gate during that
+                    # await, no response was created and therefore no
+                    # response.done / playback-end callback is guaranteed to
+                    # retry this manager-released cue.
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
                     logger.info(
-                        "[%s] trigger_agent_callbacks: final voice gate closed after media await",
+                        "[%s] trigger_agent_callbacks: final voice gate closed after media await; retry armed",
                         self.lanlan_name,
                     )
                     return False

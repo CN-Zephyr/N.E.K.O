@@ -412,6 +412,7 @@ async def test_voice_mode_user_vad_defers_without_injecting():
     sess = _make_voice_sess()
     sess._client_vad_active = True
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     cb = {"status": "completed", "summary": "wait for user"}
     mgr.pending_agent_callbacks = [cb]
 
@@ -420,6 +421,9 @@ async def test_voice_mode_user_vad_defers_without_injecting():
     assert delivered is False
     assert sess.injected == []
     assert mgr.pending_agent_callbacks == [cb]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
 
 
 async def test_voice_mode_recent_user_activity_defers_without_injecting():
@@ -442,6 +446,7 @@ async def test_voice_mode_rechecks_user_vad_after_media_await():
     sess = _make_voice_sess()
     sess._client_vad_active = False
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     cb = {"status": "completed", "summary": "wait after media"}
     mgr.pending_agent_callbacks = [cb]
 
@@ -455,6 +460,19 @@ async def test_voice_mode_rechecks_user_vad_after_media_await():
     assert delivered is False
     assert sess.injected == []
     assert mgr.pending_agent_callbacks == [cb]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+    # The paced retry reaches the same inner queue after the transient gate
+    # opens; it does not depend on an unrelated lifecycle event.
+    sess._client_vad_active = False
+    mgr._stream_cb_media = AsyncMock(return_value=True)
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert sess.inject_calls == 1
+    assert mgr.pending_agent_callbacks == []
 
 
 async def test_voice_mode_success_resolves_delivery_ack_after_rejection_window():
