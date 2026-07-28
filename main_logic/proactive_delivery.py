@@ -230,6 +230,7 @@ class ProactiveDeliveryManager:
 
         self._queue: list[_QueuedCue] = []
         self._seq = itertools.count()
+        self._uniq_seq = itertools.count()
 
         # Gate state. ``_playing`` spans voice_play_start..voice_play_end (or
         # text_start..text_end). ``_inflight`` guards single-flight between a
@@ -268,7 +269,7 @@ class ProactiveDeliveryManager:
         k = (coalesce_key or "").strip()
         if k:
             return k
-        return f"__uniq:{next(self._seq)}"
+        return f"__uniq:{next(self._uniq_seq)}"
 
     # ── producer ─────────────────────────────────────────────────────────
     def submit(self, callback: dict, *, priority: Any = 0,

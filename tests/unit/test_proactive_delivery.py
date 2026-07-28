@@ -131,6 +131,18 @@ def test_trace_does_not_log_raw_coalesce_key(caplog):
     assert raw_key not in caplog.text
 
 
+def test_unkeyed_cues_keep_fifo_sequence_contiguous():
+    delivered = []
+    mgr = _make(delivered)
+    mgr.on_playback_start()
+
+    mgr.submit({"id": "first"})
+    mgr.submit({"id": "second"})
+
+    assert [cue.seq for cue in mgr._queue] == [0, 1]
+    assert len({cue.coalesce_key for cue in mgr._queue}) == 2
+
+
 async def test_batch_released_together_in_priority_order():
     # Cues that pile up while she's speaking are released as ONE batch when
     # the gate opens, sorted by importance DESC (higher first), unspecified last.
