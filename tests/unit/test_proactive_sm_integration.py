@@ -469,6 +469,8 @@ async def test_voice_mode_swap_claim_denial_arms_retry():
     assert delivered is False
     assert sess.injected == []
     assert mgr.pending_agent_callbacks == [cb]
+    assert mgr.pending_extra_replies == [extra]
+    assert mgr._proactive_delivery_claims == {token: "swap"}
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
