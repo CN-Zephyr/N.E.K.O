@@ -2044,6 +2044,16 @@ class LifecycleMixin:
             # 若存在需要植入的额外提示，则指示模型忽略上一条消息，并在下一次响应中统一向用户补充这些提示
             if self.pending_extra_replies and len(self.pending_extra_replies) > 0:
                 self._purge_expired_agent_callbacks()
+                # Pull-model coalescing can make an extras-only mirror stale
+                # while its newer same-key cue is still held by the delivery
+                # manager.  Purge those mirrors before the budget walk so a
+                # large stale head entry cannot defer unrelated live extras.
+                self.pending_extra_replies = [
+                    extra
+                    for extra in self.pending_extra_replies
+                    if not self._coalesce_entry_is_stale(extra)
+                    and not callback_delivery_expired(extra)
+                ]
                 _lang = normalize_language_code(self.user_language, format='short')
                 from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
                 # Budget-aware selection (mirror of the text-mode drain): render
@@ -2364,6 +2374,15 @@ class LifecycleMixin:
             # 必须在 promote 之后调用：_flush_hot_swap_audio_cache 使用 self.session
             # 发送音频，此时 self.session 已是新 session，音频会正确发往新会话。
             await self._flush_hot_swap_audio_cache()
+            self._consume_next_session_context_messages(consumed_next_context_count)
+
+            # Reset all preparation states and clear the *main* cache now that it's fully transferred
+            # pending_session已在swap后立即清除，这里只需要重置其他状态
+            await self._reset_preparation_state(
+                clear_main_cache=True, from_final_swap=True)  # This will clear pending_*, is_preparing_new_session, etc. and self.message_cache_for_new_session
+            # Keep removed extras and their ownership restorable across every
+            # awaited final-cleanup step.  Only after cleanup completes can the
+            # promoted session be treated as durably delivered.
             if _swap_claimed_extras:
                 delivered_tokens = {
                     extra.get(DELIVERY_CLAIM_TOKEN_KEY)
@@ -2386,12 +2405,6 @@ class LifecycleMixin:
                 _swap_claim_committed = True
                 _removed_extras = []
                 _removed_cb_backed_ids = set()
-            self._consume_next_session_context_messages(consumed_next_context_count)
-
-            # Reset all preparation states and clear the *main* cache now that it's fully transferred
-            # pending_session已在swap后立即清除，这里只需要重置其他状态
-            await self._reset_preparation_state(
-                clear_main_cache=True, from_final_swap=True)  # This will clear pending_*, is_preparing_new_session, etc. and self.message_cache_for_new_session
             logger.info("✅ 热切换完成")
             
 

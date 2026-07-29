@@ -742,6 +742,60 @@ async def test_final_swap_happy_path_consumes_selected_keeps_deferred(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_final_swap_filters_stale_extra_before_budget_walk(monkeypatch):
+    """A stale extras-only mirror at the queue head must not consume the
+    selection window and defer an unrelated live cue."""
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _FakeSession("pending")
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    mgr.is_active = True
+    mgr.message_handler_task = None
+
+    stale = _extra_entry("id-stale", "superseded")
+    stale.update({"coalesce_key": "same-key", "_coalesce_submit_seq": 1})
+    live = _extra_entry("id-live", "unrelated live cue")
+    mgr._coalesce_latest = {"same-key": 2}
+    live_ack = asyncio.get_running_loop().create_future()
+    live_callback = {
+        "_callback_delivery_id": "id-live",
+        "origin": "event",
+        "summary": "unrelated live cue",
+        "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: live_ack,
+    }
+    mgr.pending_extra_replies = [stale, live]
+    mgr.pending_agent_callbacks = [live_callback]
+
+    seen_candidates = []
+
+    def _select_first(callbacks, budget):
+        seen_candidates.extend(callbacks)
+        return callbacks[:1], list(callbacks[1:])
+
+    monkeypatch.setattr(
+        "main_logic.core.lifecycle._select_callbacks_within_token_budget",
+        _select_first,
+    )
+
+    try:
+        swap_task = await _run_swap_as_final_swap_task(mgr)
+
+        assert not swap_task.cancelled()
+        assert seen_candidates == [live]
+        assert new_session.prime_calls and new_session.prime_calls[0][1] is False
+        assert "unrelated live cue" in new_session.prime_calls[0][0]
+        assert "superseded" not in new_session.prime_calls[0][0]
+        assert mgr.pending_extra_replies == []
+        assert mgr.pending_agent_callbacks == []
+        assert live_ack.result() is True
+    finally:
+        await _drain_task(mgr.message_handler_task)
+
+
+@pytest.mark.asyncio
 async def test_final_swap_preserves_legacy_string_extra_through_claiming():
     """Legacy string extras have no delivery token, but remain renderable and
     must still be consumed by a successful hot swap."""
@@ -925,6 +979,59 @@ async def test_final_swap_post_promote_cancel_restores_removed_extras():
     # 没有 listener，服务器响应不会被消费播出，塞回的条目才是唯一投递路径。
     assert mgr.message_handler_task is None, \
         "no listener may be restarted on the about-to-close promoted session"
+
+
+@pytest.mark.asyncio
+async def test_final_swap_cancel_during_final_reset_restores_uncommitted_delivery():
+    """The last awaited cleanup boundary still belongs to the abortable swap:
+    cancellation there must restore the removed extra, leave its callback
+    unacked, and release swap ownership."""
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _FakeSession("pending")
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    mgr.is_active = True
+    mgr.message_handler_task = None
+
+    ack = asyncio.get_running_loop().create_future()
+    callback = {
+        "_callback_delivery_id": "id-final-reset",
+        "origin": "event",
+        "summary": "retry after cancelled cleanup",
+        "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: ack,
+    }
+    extra = _extra_entry("id-final-reset", "retry after cancelled cleanup")
+    mgr.pending_agent_callbacks = [callback]
+    mgr.pending_extra_replies = [extra]
+
+    original_reset = mgr._reset_preparation_state
+    reset_calls = 0
+
+    async def _cancel_first_reset(*args, **kwargs):
+        nonlocal reset_calls
+        reset_calls += 1
+        if reset_calls == 1:
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+        await original_reset(*args, **kwargs)
+
+    mgr._reset_preparation_state = _cancel_first_reset
+
+    swap_task = await _run_swap_as_final_swap_task(mgr)
+
+    try:
+        assert not swap_task.cancelled()
+        assert reset_calls == 2, "CancelledError cleanup must perform the second reset"
+        assert mgr.session is new_session
+        assert mgr.pending_extra_replies == [extra]
+        assert mgr.pending_agent_callbacks == [callback]
+        assert not ack.done()
+        assert mgr._proactive_delivery_claims == {}
+    finally:
+        await _drain_task(mgr.message_handler_task)
 
 
 @pytest.mark.asyncio
