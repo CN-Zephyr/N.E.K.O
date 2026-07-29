@@ -2056,11 +2056,20 @@ class LifecycleMixin:
                 ]
                 _lang = normalize_language_code(self.user_language, format='short')
                 from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
+                _delivery_claims = getattr(self, "_proactive_delivery_claims", {})
+                _budget_candidates = [
+                    extra
+                    for extra in self.pending_extra_replies
+                    if not isinstance(extra, dict)
+                    or _delivery_claims.get(
+                        extra.get(DELIVERY_CLAIM_TOKEN_KEY)
+                    ) in (None, "swap")
+                ]
                 # Budget-aware selection (mirror of the text-mode drain): render
                 # only what fits, keep the rest for the next hot-swap rather than
                 # dropping it after clearing the queue.
                 _selected, _deferred = _select_callbacks_within_token_budget(
-                    list(self.pending_extra_replies), AGENT_CALLBACK_TOTAL_MAX_TOKENS
+                    _budget_candidates, AGENT_CALLBACK_TOTAL_MAX_TOKENS
                 )
                 # Pull-model staleness guard (same contract as the voice/text
                 # delivery points): drop extras whose coalesce_key has a newer

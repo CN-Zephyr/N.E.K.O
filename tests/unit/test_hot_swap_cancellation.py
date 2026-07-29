@@ -824,7 +824,7 @@ async def test_final_swap_preserves_legacy_string_extra_through_claiming():
 
 
 @pytest.mark.asyncio
-async def test_final_swap_does_not_announce_extra_owned_by_direct_inject():
+async def test_final_swap_does_not_budget_or_announce_direct_owned_extra(monkeypatch):
     mgr = _make_swap_manager()
     old_session = _FakeSession("old")
     new_session = _FakeSession("pending")
@@ -834,27 +834,54 @@ async def test_final_swap_does_not_announce_extra_owned_by_direct_inject():
     mgr.is_active = True
     mgr.message_handler_task = None
 
-    callback = {
+    direct_callback = {
         "_callback_delivery_id": "id-direct-owned",
         "origin": "event",
         "summary": "direct owns this cue",
         "status": "completed",
     }
-    extra = _extra_entry("id-direct-owned", "direct owns this cue")
-    mgr.pending_agent_callbacks = [callback]
-    mgr.pending_extra_replies = [extra]
-    assert mgr._claim_delivery_entries([callback], "direct") == [callback]
+    direct_extra = _extra_entry("id-direct-owned", "direct owns this cue")
+    live_ack = asyncio.get_running_loop().create_future()
+    live_callback = {
+        "_callback_delivery_id": "id-swap-live",
+        "origin": "event",
+        "summary": "swap can deliver this cue",
+        "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: live_ack,
+    }
+    live_extra = _extra_entry("id-swap-live", "swap can deliver this cue")
+    mgr.pending_agent_callbacks = [direct_callback, live_callback]
+    mgr.pending_extra_replies = [direct_extra, live_extra]
+    assert mgr._claim_delivery_entries(
+        [direct_callback], "direct"
+    ) == [direct_callback]
+
+    seen_candidates = []
+
+    def _select_first(callbacks, budget):
+        seen_candidates.extend(callbacks)
+        return callbacks[:1], list(callbacks[1:])
+
+    monkeypatch.setattr(
+        "main_logic.core.lifecycle._select_callbacks_within_token_budget",
+        _select_first,
+    )
 
     try:
         swap_task = await _run_swap_as_final_swap_task(mgr)
 
         assert not swap_task.cancelled()
+        assert seen_candidates == [live_extra]
         assert new_session.prime_calls
-        assert new_session.prime_calls[0][1] is True
-        assert mgr.pending_extra_replies == [extra]
-        assert mgr.pending_agent_callbacks == [callback]
+        assert new_session.prime_calls[0][1] is False
+        assert "swap can deliver this cue" in new_session.prime_calls[0][0]
+        assert "direct owns this cue" not in new_session.prime_calls[0][0]
+        assert mgr.pending_extra_replies == [direct_extra]
+        assert mgr.pending_agent_callbacks == [direct_callback]
+        assert live_ack.result() is True
+        assert list(mgr._proactive_delivery_claims.values()) == ["direct"]
     finally:
-        mgr._release_delivery_claims([callback], "direct")
+        mgr._release_delivery_claims([direct_callback], "direct")
         await _drain_task(mgr.message_handler_task)
 
 
