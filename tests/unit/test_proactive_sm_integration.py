@@ -1257,7 +1257,11 @@ def test_submit_proactive_callback_persists_when_goodbye_silent():
     """goodbye_silent persists new callbacks outside the manager TTL queue."""
     mgr = _make_mgr(session=_FakeOmniOffline(delivered=True))
     mgr.goodbye_silent = True
-    cb = {"status": "completed", "summary": "queued"}
+    cb = {
+        "status": "completed",
+        "summary": "queued",
+        "metadata": {"delivery_ttl_seconds": 0.01},
+    }
 
     core_module.LLMSessionManager.submit_proactive_callback(
         mgr,
@@ -1268,6 +1272,7 @@ def test_submit_proactive_callback_persists_when_goodbye_silent():
 
     mgr.proactive_manager.submit.assert_not_called()
     assert mgr.pending_agent_callbacks == [cb]
+    assert DELIVERY_DEADLINE_KEY not in cb
     assert cb["_callback_delivery_id"]
     # goodbye_silent bypasses the manager, so the coalesce_key arg is carried
     # onto the callback dict (plus a submission seq) for the enqueue path.
@@ -1275,6 +1280,7 @@ def test_submit_proactive_callback_persists_when_goodbye_silent():
     assert isinstance(cb["_coalesce_submit_seq"], int)
     assert len(mgr.pending_extra_replies) == 1
     extra = mgr.pending_extra_replies[0]
+    assert DELIVERY_DEADLINE_KEY not in extra
     assert (
         extra[DELIVERY_CLAIM_TOKEN_KEY]
         is cb[DELIVERY_CLAIM_TOKEN_KEY]
@@ -1296,6 +1302,28 @@ def test_submit_proactive_callback_persists_when_goodbye_silent():
         "source_name": "",
         "error_message": "",
     }
+
+
+async def test_goodbye_parked_manager_callback_survives_expired_retry():
+    mgr = _make_mgr(session=_FakeOmniOffline(delivered=True))
+    mgr.goodbye_silent = True
+    future = asyncio.get_running_loop().create_future()
+    cb = {
+        "status": "completed",
+        "summary": "parked",
+        DELIVERY_ACK_FUTURE_KEY: future,
+        DELIVERY_DEADLINE_KEY: time.monotonic() - 1.0,
+    }
+    mgr.proactive_manager.drain_pending.return_value = [cb]
+
+    core_module.LLMSessionManager._park_proactive_for_goodbye(mgr)
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert mgr.pending_agent_callbacks == [cb]
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in mgr.pending_extra_replies[0]
+    assert not future.done()
 
 
 def _read_core_package_source() -> str:

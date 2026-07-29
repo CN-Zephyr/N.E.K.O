@@ -2168,6 +2168,13 @@ class ProactiveMixin:
                 callback,
                 default_ttl_s=None,
             )
+            # Cat-mode silence deliberately parks callbacks in the persistent
+            # queue until the user returns.  A manager-originated cue already
+            # carries its original deadline, so retaining it here would let the
+            # next deferred retry expire/ack-false the parked cue.  Direct cues
+            # submitted while silent follow the same durable deferral contract.
+            if self.is_goodbye_silent():
+                callback.pop(DELIVERY_DEADLINE_KEY, None)
             claim_token = self._ensure_delivery_claim_token(callback)
             context_source = "topic.hook" if callback.get("channel") == "topic_hook" else "proactive.callback"
             # Per-item input budget: summary/detail flow into the LLM verbatim.
