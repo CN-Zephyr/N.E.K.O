@@ -852,6 +852,15 @@ class ProactiveMixin:
                     voice_snapshot, "direct"
                 )
                 if not voice_snapshot:
+                    # Another consumer (normally hot-swap prime) currently owns
+                    # every callback.  The manager has already released these
+                    # entries into the host queue, so re-arm the same paced
+                    # retry used by the other transient voice gates.  If the
+                    # competing path aborts and releases its claim, this cue is
+                    # then driven again without waiting for an unrelated event.
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
                     return False
                 claimed_voice_snapshot = list(voice_snapshot)
                 # NOTE: the callback instruction is built AFTER the media-stream
@@ -983,14 +992,15 @@ class ProactiveMixin:
                     )
                     return False
                 # Streaming media is the final await before provider injection.
-                # Re-check expiry and floor ownership here: VAD, playback or a
-                # hot swap may have changed while the media was in flight.
-                self._purge_expired_agent_callbacks()
+                # Floor ownership can change while uploads are in flight, but
+                # TTL was deliberately committed at the pre-stream boundary:
+                # stream_image() persists conversation items that cannot be
+                # undone.  Expiring their callback now would leave stale media
+                # for a later response without the matching explanation.
                 voice_snapshot[:] = [
                     cb
                     for cb in voice_snapshot
                     if not cb.get(DELIVERY_RETRACTED_KEY)
-                    and not callback_delivery_expired(cb)
                 ]
                 self._purge_retracted_agent_callbacks()
                 if (
@@ -1495,6 +1505,7 @@ class ProactiveMixin:
                         extra for extra in self.pending_extra_replies
                         if extra.get("_callback_delivery_id") not in delivered_ids
                     ]
+                self._release_delivery_claims(active_callbacks, "text")
                 return True
             else:
                 _resolve_text_delivery_ack(False)

@@ -445,6 +445,46 @@ async def test_voice_mode_recent_user_activity_defers_without_injecting():
     assert mgr.pending_agent_callbacks == [cb]
 
 
+async def test_voice_mode_swap_claim_denial_arms_retry():
+    sess = _make_voice_sess()
+    mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
+    token = object()
+    cb = {
+        "_callback_delivery_id": "id-swap-claim",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        "status": "completed",
+        "summary": "retry after swap abort",
+    }
+    extra = {
+        "_callback_delivery_id": "id-swap-claim",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [extra]
+    mgr._proactive_delivery_claims = {token: "swap"}
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.injected == []
+    assert mgr.pending_agent_callbacks == [cb]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+    # The paced retry can deliver after the competing swap aborts and releases
+    # ownership; no unrelated lifecycle event is required.
+    mgr._proactive_delivery_claims.pop(token)
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert sess.inject_calls == 1
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
+
+
 async def test_voice_mode_rechecks_user_vad_after_media_await():
     sess = _make_voice_sess()
     sess._client_vad_active = False
@@ -476,6 +516,56 @@ async def test_voice_mode_rechecks_user_vad_after_media_await():
     assert delivered is True
     assert sess.inject_calls == 1
     assert mgr.pending_agent_callbacks == []
+
+
+async def test_voice_mode_finishes_committed_media_when_ttl_crosses_during_upload(
+    monkeypatch,
+):
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
+    sess = _make_voice_sess()
+    streamed_images: list[str] = []
+
+    async def _stream_image(image, *, bypass_rate_limit=False):
+        nonlocal now
+        streamed_images.append(image)
+        assert bypass_rate_limit is True
+        now = 101.0
+
+    sess.stream_image = _stream_image
+    mgr = _make_mgr(session=sess)
+    token = object()
+    cb = {
+        "_callback_delivery_id": "id-media-ttl",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "status": "completed",
+        "summary": "describe committed image",
+        "media_images": ["image-b64"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [
+        {
+            "_callback_delivery_id": "id-media-ttl",
+            DELIVERY_CLAIM_TOKEN_KEY: token,
+            DELIVERY_DEADLINE_KEY: 100.5,
+        }
+    ]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert streamed_images == ["image-b64"]
+    assert len(sess.injected) == 1
+    assert "describe committed image" in sess.injected[0]
+    assert not cb.get(DELIVERY_RETRACTED_KEY)
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
 
 
 async def test_voice_mode_success_resolves_delivery_ack_after_rejection_window():
@@ -1677,7 +1767,7 @@ async def test_text_delivery_filters_only_expired_entries_at_prompt_boundary(
     assert valid_ack.result() is True
     assert mgr.pending_agent_callbacks == []
     assert mgr.pending_extra_replies == []
-    assert expired_token not in mgr._proactive_delivery_claims
+    assert mgr._proactive_delivery_claims == {}
 
 
 async def test_text_mode_successful_delivery_fires_full_event_sequence():
