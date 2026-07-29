@@ -29,10 +29,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 # SM 的契约做黑盒回归 —— 让一个 minimal mgr 模拟真实 LLMSessionManager 的
 # state/session/lock 结构，然后直接调用 trigger_agent_callbacks 的关键分支。
 import main_logic.core as core_module
+import main_logic.core.proactive as proactive_module
 from main_logic.omni_offline_client import OmniOfflineClient
 from main_logic.proactive_delivery import (
     DELIVERY_ACK_FUTURE_KEY,
     DELIVERY_CLAIM_TOKEN_KEY,
+    DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
 )
 from main_logic.session_state import (
@@ -41,6 +43,7 @@ from main_logic.session_state import (
     SessionStateMachine,
     TurnOwner,
 )
+from tests.fake_clock import patch_module_clock
 
 
 class _FakeOmniOffline(OmniOfflineClient):
@@ -1558,6 +1561,123 @@ async def test_deliver_agent_callbacks_text_keeps_topic_hook_in_plain_text_sessi
 
     assert delivered is True
     assert len(sess.called_with) == 1
+
+
+async def test_text_delivery_drops_batch_that_expires_during_phase_await(
+    monkeypatch,
+):
+    sess = _FakeOmniOffline(delivered=True)
+    mgr = _make_mgr(session=sess)
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
+    ack = asyncio.get_running_loop().create_future()
+    token = object()
+    cb = {
+        "_callback_delivery_id": "ttl-expired",
+        DELIVERY_ACK_FUTURE_KEY: ack,
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "status": "completed",
+        "summary": "must not be prompted",
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [
+        {
+            "_callback_delivery_id": "ttl-expired",
+            DELIVERY_CLAIM_TOKEN_KEY: token,
+        }
+    ]
+    mgr._proactive_delivery_claims = {token: "text"}
+    original_fire = mgr.state.fire
+
+    async def _fire_and_expire(event, **payload):
+        nonlocal now
+        await original_fire(event, **payload)
+        if event is SessionEvent.PROACTIVE_PHASE2:
+            now = 101.0
+
+    mgr.state.fire = _fire_and_expire
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.called_with == []
+    assert ack.result() is False
+    assert cb[DELIVERY_RETRACTED_KEY] is True
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
+    mgr.proactive_manager.release_inflight_noop.assert_called_once()
+
+
+async def test_text_delivery_filters_only_expired_entries_at_prompt_boundary(
+    monkeypatch,
+):
+    sess = _FakeOmniOffline(delivered=True)
+    mgr = _make_mgr(session=sess)
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
+    expired_ack = asyncio.get_running_loop().create_future()
+    valid_ack = asyncio.get_running_loop().create_future()
+    expired_token = object()
+    valid_token = object()
+    expired = {
+        "_callback_delivery_id": "ttl-expired-mixed",
+        DELIVERY_ACK_FUTURE_KEY: expired_ack,
+        DELIVERY_CLAIM_TOKEN_KEY: expired_token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "status": "completed",
+        "summary": "expired body",
+    }
+    valid = {
+        "_callback_delivery_id": "ttl-valid-mixed",
+        DELIVERY_ACK_FUTURE_KEY: valid_ack,
+        DELIVERY_CLAIM_TOKEN_KEY: valid_token,
+        DELIVERY_DEADLINE_KEY: 200.0,
+        "status": "completed",
+        "summary": "valid body",
+    }
+    mgr.pending_agent_callbacks = [expired, valid]
+    mgr.pending_extra_replies = [
+        {
+            "_callback_delivery_id": callback["_callback_delivery_id"],
+            DELIVERY_CLAIM_TOKEN_KEY: callback[DELIVERY_CLAIM_TOKEN_KEY],
+        }
+        for callback in (expired, valid)
+    ]
+    mgr._proactive_delivery_claims = {
+        expired_token: "text",
+        valid_token: "text",
+    }
+    original_fire = mgr.state.fire
+
+    async def _fire_and_expire(event, **payload):
+        nonlocal now
+        await original_fire(event, **payload)
+        if event is SessionEvent.PROACTIVE_PHASE2:
+            now = 101.0
+
+    mgr.state.fire = _fire_and_expire
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert len(sess.called_with) == 1
+    assert "valid body" in sess.called_with[0]
+    assert "expired body" not in sess.called_with[0]
+    assert expired_ack.result() is False
+    assert valid_ack.result() is True
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert expired_token not in mgr._proactive_delivery_claims
 
 
 async def test_text_mode_successful_delivery_fires_full_event_sequence():

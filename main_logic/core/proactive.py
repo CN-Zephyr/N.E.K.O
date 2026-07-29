@@ -687,6 +687,30 @@ class ProactiveMixin:
                 if extra.get("_callback_delivery_id") not in retracted_ids
             ]
 
+    def _expire_inflight_callback_snapshots(self, callbacks: list) -> int:
+        """Expire callback snapshots that are temporarily outside host queues."""
+        now = time.monotonic()
+        expired = [
+            cb
+            for cb in callbacks
+            if callback_delivery_expired(cb, now=now)
+        ]
+        if not expired:
+            return 0
+
+        claims = getattr(self, "_proactive_delivery_claims", {})
+        for cb in expired:
+            expire_callback_delivery(cb)
+            token = cb.get(DELIVERY_CLAIM_TOKEN_KEY)
+            if token is not None:
+                claims.pop(token, None)
+        self._purge_retracted_agent_callback_extras(expired)
+        callbacks[:] = [
+            cb for cb in callbacks
+            if not cb.get(DELIVERY_RETRACTED_KEY)
+        ]
+        return len(expired)
+
     async def trigger_agent_callbacks(self) -> bool:
         """Proactively deliver pending agent task results via LLM rephrase.
 
@@ -1332,28 +1356,6 @@ class ProactiveMixin:
                 callbacks_snapshot[:] = []
                 self.proactive_manager.release_inflight_noop()
                 return False
-            _proactive_images: list = []
-            for _cb in active_callbacks:
-                if isinstance(_cb, dict):
-                    _proactive_images.extend(_cb.get("media_images") or [])
-            _lang = normalize_language_code(self.user_language, format='short')
-            instruction = _build_callback_instruction(
-                active_callbacks,
-                lang=_lang,
-                lanlan_name=self.lanlan_name,
-                master_name=self.master_name,
-                passive=False,
-            )
-            ack_resolved = False
-
-            def _resolve_text_delivery_ack(delivered: bool) -> None:
-                nonlocal ack_resolved
-                if ack_resolved:
-                    return
-                ack_resolved = True
-                for cb in active_callbacks:
-                    resolve_callback_delivery_ack(cb, delivered)
-
             # Deep-topic teaser: now committed to opening (passed both re-gates
             # and the preempt check), surface the frontend-only "she has a topic
             # she'd like to bring up" bubble just before the opener streams. One
@@ -1386,6 +1388,58 @@ class ProactiveMixin:
                     callbacks_snapshot[:] = []
                     self.proactive_manager.release_inflight_noop()
                     return False
+
+            # Final delivery-point TTL check.  This snapshot has been outside
+            # pending_agent_callbacks while awaiting the SM claim, session
+            # start/write lock, CLAIM/PHASE2, and (for topic hooks) the hint
+            # write.  Queue purges cannot reach it during that window, so a
+            # short per-cue deadline must be re-checked after the final await
+            # and before prompt_ephemeral commits any output.
+            expired_count = self._expire_inflight_callback_snapshots(
+                active_callbacks
+            )
+            callbacks_snapshot[:] = active_callbacks
+            if expired_count:
+                logger.info(
+                    "[%s] trigger_agent_callbacks: text callbacks expired "
+                    "before prompt n=%d",
+                    self.lanlan_name,
+                    expired_count,
+                )
+            if topic_hint_sent and not any(
+                isinstance(cb, dict) and cb.get("channel") == "topic_hook"
+                for cb in active_callbacks
+            ):
+                await self.send_cancel_topic_hint(turn_id=proactive_sid)
+                topic_hint_sent = False
+                # The cancellation write above is another await boundary.
+                self._expire_inflight_callback_snapshots(active_callbacks)
+                callbacks_snapshot[:] = active_callbacks
+            if not active_callbacks:
+                self.proactive_manager.release_inflight_noop()
+                return False
+
+            _proactive_images: list = []
+            for _cb in active_callbacks:
+                if isinstance(_cb, dict):
+                    _proactive_images.extend(_cb.get("media_images") or [])
+            _lang = normalize_language_code(self.user_language, format='short')
+            instruction = _build_callback_instruction(
+                active_callbacks,
+                lang=_lang,
+                lanlan_name=self.lanlan_name,
+                master_name=self.master_name,
+                passive=False,
+            )
+            ack_resolved = False
+
+            def _resolve_text_delivery_ack(delivered: bool) -> None:
+                nonlocal ack_resolved
+                if ack_resolved:
+                    return
+                ack_resolved = True
+                for cb in active_callbacks:
+                    resolve_callback_delivery_ack(cb, delivered)
 
             _sid_token = _proactive_expected_sid.set(proactive_sid)
             # Text-mode playback boundary for the pacing manager: no frontend
