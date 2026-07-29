@@ -111,12 +111,21 @@ class ProactiveMixin:
         """Remove expired callbacks and paired hot-swap mirrors."""
         now = time.monotonic()
         claims = getattr(self, "_proactive_delivery_claims", {})
+
+        def _actively_claimed(entry) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            token = entry.get(DELIVERY_CLAIM_TOKEN_KEY)
+            return token is not None and token in claims
+
         expired_tokens: set[object] = set()
         kept_callbacks: list = []
         expired_count = 0
         for callback in getattr(self, "pending_agent_callbacks", []):
-            if isinstance(callback, dict) and callback_delivery_expired(
-                callback, now=now
+            if (
+                isinstance(callback, dict)
+                and not _actively_claimed(callback)
+                and callback_delivery_expired(callback, now=now)
             ):
                 expire_callback_delivery(callback)
                 token = callback.get(DELIVERY_CLAIM_TOKEN_KEY)
@@ -133,6 +142,7 @@ class ProactiveMixin:
             for extra in getattr(self, "pending_extra_replies", [])
             if not (
                 isinstance(extra, dict)
+                and not _actively_claimed(extra)
                 and (
                     extra.get(DELIVERY_CLAIM_TOKEN_KEY) in expired_tokens
                     or callback_delivery_expired(extra, now=now)

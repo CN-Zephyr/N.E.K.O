@@ -497,6 +497,38 @@ def test_delivery_claim_is_shared_and_mutually_exclusive_between_paths():
     assert mgr._claim_delivery_entries([callback], "direct") == [callback]
 
 
+def test_expiry_purge_defers_to_active_swap_claim_until_release():
+    mgr = _make_session_mgr()
+    ack = _FakeAckFuture()
+    callback = _proactive_cb(
+        "claimed cue",
+        metadata={"delivery_ttl_seconds": 1.0},
+        **{DELIVERY_ACK_FUTURE_KEY: ack},
+    )
+    mgr.enqueue_agent_callback(callback)
+    callback = mgr.pending_agent_callbacks[0]
+    mirror = mgr.pending_extra_replies[0]
+    token = callback[DELIVERY_CLAIM_TOKEN_KEY]
+    assert mgr._claim_delivery_entries([mirror], "swap") == [mirror]
+
+    callback[DELIVERY_DEADLINE_KEY] = time.monotonic() - 1.0
+    mirror[DELIVERY_DEADLINE_KEY] = callback[DELIVERY_DEADLINE_KEY]
+
+    assert mgr._purge_expired_agent_callbacks() == 0
+    assert mgr.pending_agent_callbacks == [callback]
+    assert mgr.pending_extra_replies == [mirror]
+    assert mgr._proactive_delivery_claims == {token: "swap"}
+    assert ack.done() is False
+
+    mgr._release_delivery_claims([mirror], "swap")
+    assert mgr._purge_expired_agent_callbacks() == 1
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
+    assert ack.done() is True
+    assert ack.result is False
+
+
 def test_enqueue_newer_proactive_replaces_passive_and_creates_mirror():
     mgr = _make_session_mgr()
     mgr.enqueue_agent_callback(_passive_cb("context", coalesce_key="shared"))
