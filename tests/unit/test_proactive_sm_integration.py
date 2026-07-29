@@ -520,7 +520,7 @@ async def test_voice_mode_rechecks_user_vad_after_media_await():
     assert mgr.pending_agent_callbacks == []
 
 
-async def test_voice_mode_finishes_committed_media_when_ttl_crosses_during_upload(
+async def test_voice_mode_preserves_committed_media_when_gate_closes_after_upload(
     monkeypatch,
 ):
     now = 100.0
@@ -537,9 +537,11 @@ async def test_voice_mode_finishes_committed_media_when_ttl_crosses_during_uploa
         streamed_images.append(image)
         assert bypass_rate_limit is True
         now = 101.0
+        sess._client_vad_active = True
 
     sess.stream_image = _stream_image
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     token = object()
     cb = {
         "_callback_delivery_id": "id-media-ttl",
@@ -550,14 +552,28 @@ async def test_voice_mode_finishes_committed_media_when_ttl_crosses_during_uploa
         "media_images": ["image-b64"],
     }
     mgr.pending_agent_callbacks = [cb]
-    mgr.pending_extra_replies = [
-        {
-            "_callback_delivery_id": "id-media-ttl",
-            DELIVERY_CLAIM_TOKEN_KEY: token,
-            DELIVERY_DEADLINE_KEY: 100.5,
-        }
-    ]
+    extra = {
+        "_callback_delivery_id": "id-media-ttl",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+    }
+    mgr.pending_extra_replies = [extra]
 
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert streamed_images == ["image-b64"]
+    assert sess.injected == []
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in extra
+    assert mgr.pending_agent_callbacks == [cb]
+    assert mgr.pending_extra_replies == [extra]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+    sess._client_vad_active = False
+    mgr._stream_cb_media = AsyncMock(return_value=True)
     delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
 
     assert delivered is True

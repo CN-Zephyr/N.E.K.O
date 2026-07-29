@@ -1007,6 +1007,18 @@ class ProactiveMixin:
                 # stream_image() persists conversation items that cannot be
                 # undone.  Expiring their callback now would leave stale media
                 # for a later response without the matching explanation.
+                committed_media_ids = {
+                    cb.get("_callback_delivery_id")
+                    for cb in voice_snapshot
+                    if cb.get("media_images")
+                    and cb.get("_callback_delivery_id")
+                }
+                for cb in voice_snapshot:
+                    if cb.get("media_images"):
+                        cb.pop(DELIVERY_DEADLINE_KEY, None)
+                for extra in voice_extra_snapshot:
+                    if extra.get("_callback_delivery_id") in committed_media_ids:
+                        extra.pop(DELIVERY_DEADLINE_KEY, None)
                 voice_snapshot[:] = [
                     cb
                     for cb in voice_snapshot
