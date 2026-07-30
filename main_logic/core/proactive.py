@@ -219,6 +219,17 @@ class ProactiveMixin:
     def _park_proactive_for_goodbye(self) -> None:
         """While cat-mode silent, move the manager's pending-release callbacks into the persistent queue, so nothing is dropped or released on timeout during the silence."""
         try:
+            # Callbacks may already have left ProactiveDeliveryManager before
+            # cat-mode silence starts.  Suspend their deadlines together with
+            # the paired hot-swap mirrors; otherwise trigger_agent_callbacks()
+            # purges an already-expired cue before reaching its goodbye guard.
+            for queue_name in (
+                "pending_agent_callbacks",
+                "pending_extra_replies",
+            ):
+                for entry in getattr(self, queue_name, []):
+                    if isinstance(entry, dict):
+                        entry.pop(DELIVERY_DEADLINE_KEY, None)
             leftover = self.proactive_manager.drain_pending()
             for callback in leftover:
                 self.enqueue_agent_callback(callback)

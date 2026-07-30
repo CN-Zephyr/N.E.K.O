@@ -2213,6 +2213,30 @@ async def test_goodbye_parked_manager_callback_survives_expired_retry():
     assert not future.done()
 
 
+async def test_goodbye_park_suspends_deadline_for_already_pending_callback():
+    mgr = _make_mgr(session=_FakeOmniOffline(delivered=True))
+    future = asyncio.get_running_loop().create_future()
+    cb = {
+        "status": "completed",
+        "summary": "already released",
+        DELIVERY_ACK_FUTURE_KEY: future,
+        DELIVERY_DEADLINE_KEY: time.monotonic() - 1.0,
+    }
+    core_module.LLMSessionManager.enqueue_agent_callback(mgr, cb)
+    assert DELIVERY_DEADLINE_KEY in cb
+    assert DELIVERY_DEADLINE_KEY in mgr.pending_extra_replies[0]
+
+    mgr.goodbye_silent = True
+    core_module.LLMSessionManager._park_proactive_for_goodbye(mgr)
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert mgr.pending_agent_callbacks == [cb]
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in mgr.pending_extra_replies[0]
+    assert not future.done()
+
+
 def _read_core_package_source() -> str:
     """Concatenated source of the ``main_logic.core`` package (the equivalent
     of reading the former single-file ``main_logic/core.py``)."""
