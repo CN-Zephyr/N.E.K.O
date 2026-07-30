@@ -888,11 +888,13 @@ async def test_final_swap_does_not_budget_or_announce_direct_owned_extra(monkeyp
     mgr.is_active = True
     mgr.message_handler_task = None
 
+    direct_ack = asyncio.get_running_loop().create_future()
     direct_callback = {
         "_callback_delivery_id": "id-direct-owned",
         "origin": "event",
         "summary": "direct owns this cue",
         "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: direct_ack,
     }
     direct_extra = _extra_entry("id-direct-owned", "direct owns this cue")
     live_ack = asyncio.get_running_loop().create_future()
@@ -909,6 +911,10 @@ async def test_final_swap_does_not_budget_or_announce_direct_owned_extra(monkeyp
     assert mgr._claim_delivery_entries(
         [direct_callback], "direct"
     ) == [direct_callback]
+    # The deadline crosses while direct owns the shared callback/mirror token.
+    # Swap cleanup must preserve both halves until that transaction resolves.
+    direct_callback[DELIVERY_DEADLINE_KEY] = 0.0
+    direct_extra[DELIVERY_DEADLINE_KEY] = 0.0
 
     seen_candidates = []
 
@@ -932,11 +938,19 @@ async def test_final_swap_does_not_budget_or_announce_direct_owned_extra(monkeyp
         assert "direct owns this cue" not in new_session.prime_calls[0][0]
         assert mgr.pending_extra_replies == [direct_extra]
         assert mgr.pending_agent_callbacks == [direct_callback]
+        assert not direct_ack.done()
         assert live_ack.result() is True
         assert list(mgr._proactive_delivery_claims.values()) == ["direct"]
     finally:
         mgr._release_delivery_claims([direct_callback], "direct")
         await _drain_task(mgr.message_handler_task)
+
+    # Releasing an unsuccessful claim does not revive a stale cue. The next
+    # normal purge removes callback and mirror together and resolves ack false.
+    assert mgr._purge_expired_agent_callbacks() == 1
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert direct_ack.result() is False
 
 
 @pytest.mark.asyncio

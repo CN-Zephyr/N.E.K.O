@@ -2169,7 +2169,10 @@ class LifecycleMixin:
                     extra
                     for extra in self.pending_extra_replies
                     if not self._coalesce_entry_is_stale(extra)
-                    and not callback_delivery_expired(extra)
+                    and (
+                        self._delivery_entry_is_claimed(extra)
+                        or not callback_delivery_expired(extra)
+                    )
                 ]
                 _lang = normalize_language_code(self.user_language, format='short')
                 from config import AGENT_CALLBACK_TOTAL_MAX_TOKENS
@@ -2200,7 +2203,10 @@ class LifecycleMixin:
                 _selected = [
                     e for e in _selected
                     if not self._coalesce_entry_is_stale(e)
-                    and not callback_delivery_expired(e)
+                    and (
+                        self._delivery_entry_is_claimed(e)
+                        or not callback_delivery_expired(e)
+                    )
                 ]
                 # Legacy plain-string extras are still supported by both the
                 # budget selector and renderer, but they have no delivery
