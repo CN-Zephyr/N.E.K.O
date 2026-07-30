@@ -522,7 +522,8 @@ async def test_final_swap_post_promote_ws_invalid_restores_injected_extras():
 async def test_final_swap_post_promote_failure_with_live_session_does_not_restore():
     """Double-delivery guard: when a post-promote step fails but the promoted
     session survives as self.session, the primed extras are already in its
-    context and will be spoken next turn — they must NOT be restored."""
+    context and will be spoken next turn — they must NOT be restored, while
+    their paired callback/ACK must still be committed."""
     mgr = _make_swap_manager()
     old_session = _FakeSession("old")
     new_session = _FakeSession("pending")
@@ -537,7 +538,16 @@ async def test_final_swap_post_promote_failure_with_live_session_does_not_restor
     mgr._prime_late_next_session_context_after_swap = _boom
 
     extra = _extra_entry("id-live", "task L finished")
+    ack = asyncio.get_running_loop().create_future()
+    callback = {
+        "_callback_delivery_id": "id-live",
+        "origin": "event",
+        "summary": "task L finished",
+        "status": "completed",
+        DELIVERY_ACK_FUTURE_KEY: ack,
+    }
     mgr.pending_extra_replies = [extra]
+    mgr.pending_agent_callbacks = [callback]
 
     swap_task = await _run_swap_as_final_swap_task(mgr)
 
@@ -546,6 +556,10 @@ async def test_final_swap_post_promote_failure_with_live_session_does_not_restor
     assert not new_session.closed
     assert mgr.pending_extra_replies == [], \
         "extras already primed into the live session must not be re-queued"
+    assert mgr.pending_agent_callbacks == [], \
+        "the paired callback must be consumed with its promoted extra"
+    assert ack.result() is True
+    assert mgr._proactive_delivery_claims == {}
 
 
 @pytest.mark.asyncio

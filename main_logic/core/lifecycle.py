@@ -1915,6 +1915,29 @@ class LifecycleMixin:
             # 塞回是尽力而为：绝不能让队列簿记反过来打断中止清理流程。
             logger.warning(f"Final Swap Sequence: failed to restore undelivered extras: {e}")
 
+    def _commit_swap_delivered_extras(self, claimed_extras: list) -> None:
+        """Finalize callback state for extras retained by a promoted session."""
+        if not claimed_extras:
+            return
+        delivered_tokens = {
+            extra.get(DELIVERY_CLAIM_TOKEN_KEY)
+            for extra in claimed_extras
+            if extra.get(DELIVERY_CLAIM_TOKEN_KEY) is not None
+        }
+        delivered_callbacks = [
+            cb
+            for cb in self.pending_agent_callbacks
+            if cb.get(DELIVERY_CLAIM_TOKEN_KEY) in delivered_tokens
+        ]
+        self.pending_agent_callbacks = [
+            cb
+            for cb in self.pending_agent_callbacks
+            if cb.get(DELIVERY_CLAIM_TOKEN_KEY) not in delivered_tokens
+        ]
+        for callback in delivered_callbacks:
+            resolve_callback_delivery_ack(callback, True)
+        self._release_delivery_claims(claimed_extras, "swap")
+
     def _select_passive_callbacks_for_swap_prime(
         self,
         extras_selected: list = None,
@@ -2535,24 +2558,7 @@ class LifecycleMixin:
             # awaited final-cleanup step.  Only after cleanup completes can the
             # promoted session be treated as durably delivered.
             if _swap_claimed_extras:
-                delivered_tokens = {
-                    extra.get(DELIVERY_CLAIM_TOKEN_KEY)
-                    for extra in _swap_claimed_extras
-                    if extra.get(DELIVERY_CLAIM_TOKEN_KEY) is not None
-                }
-                delivered_callbacks = [
-                    cb
-                    for cb in self.pending_agent_callbacks
-                    if cb.get(DELIVERY_CLAIM_TOKEN_KEY) in delivered_tokens
-                ]
-                self.pending_agent_callbacks = [
-                    cb
-                    for cb in self.pending_agent_callbacks
-                    if cb.get(DELIVERY_CLAIM_TOKEN_KEY) not in delivered_tokens
-                ]
-                for callback in delivered_callbacks:
-                    resolve_callback_delivery_ack(callback, True)
-                self._release_delivery_claims(_swap_claimed_extras, "swap")
+                self._commit_swap_delivered_extras(_swap_claimed_extras)
                 _swap_claim_committed = True
                 _removed_extras = []
                 _removed_cb_backed_ids = set()
@@ -2653,13 +2659,21 @@ class LifecycleMixin:
                 self.is_active = False
                 self._restore_undelivered_swap_extras(_removed_extras, _removed_cb_backed_ids)
                 self._restore_undelivered_swap_passive_cbs(_removed_passive_cbs)
-            elif _removed_passive_cbs:
-                # The promoted session survived and retains the primed passive
-                # context, so this path cannot restore without double delivery.
-                # Commit its ACK now rather than leaving the producer hanging.
-                for callback in _removed_passive_cbs:
-                    resolve_callback_delivery_ack(callback, True)
-                _removed_passive_cbs = []
+            else:
+                # The promoted session survived and retains every primed
+                # delivery, so restoring would double-deliver. Commit both
+                # transaction halves exactly as the normal cleanup boundary
+                # does: remove paired callbacks, resolve ACKs, and release
+                # ownership rather than leaving only the queue mirror consumed.
+                if _removed_extras:
+                    self._commit_swap_delivered_extras(_swap_claimed_extras)
+                    _swap_claim_committed = True
+                    _removed_extras = []
+                    _removed_cb_backed_ids = set()
+                if _removed_passive_cbs:
+                    for callback in _removed_passive_cbs:
+                        resolve_callback_delivery_ack(callback, True)
+                    _removed_passive_cbs = []
             if self.is_active and self.session and hasattr(self.session, 'handle_messages') and (not self.message_handler_task or self.message_handler_task.done()):
                 self.message_handler_task = asyncio.create_task(self.session.handle_messages())
         finally:
