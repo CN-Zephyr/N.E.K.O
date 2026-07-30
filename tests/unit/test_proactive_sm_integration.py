@@ -2048,6 +2048,12 @@ async def test_voice_mode_build_failure_preserves_durable_media_contract(
     import pytest
     import main_logic.core.proactive as proactive_module
 
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
     sess = _make_voice_sess()
 
     async def _stream_image(
@@ -2070,7 +2076,7 @@ async def test_voice_mode_build_failure_preserves_durable_media_contract(
         "media_images": ["old-weather-image"],
         "coalesce_key": "weather",
         "_coalesce_submit_seq": 1,
-        DELIVERY_DEADLINE_KEY: time.monotonic() + 0.01,
+        DELIVERY_DEADLINE_KEY: now + 0.01,
     }
     mgr.pending_agent_callbacks = [old_cb]
     mgr.pending_extra_replies = [{
