@@ -696,7 +696,8 @@ class ProactiveMixin:
         if retracted_ids:
             self.pending_extra_replies = [
                 extra for extra in self.pending_extra_replies
-                if extra.get("_callback_delivery_id") not in retracted_ids
+                if not isinstance(extra, dict)
+                or extra.get("_callback_delivery_id") not in retracted_ids
             ]
 
     def _purge_retracted_agent_callback_extras(self, callbacks: list) -> None:
@@ -708,25 +709,36 @@ class ProactiveMixin:
         if retracted_ids:
             self.pending_extra_replies = [
                 extra for extra in self.pending_extra_replies
-                if extra.get("_callback_delivery_id") not in retracted_ids
+                if not isinstance(extra, dict)
+                or extra.get("_callback_delivery_id") not in retracted_ids
             ]
 
-    def _expire_inflight_callback_snapshots(self, callbacks: list) -> int:
+    def _expire_inflight_callback_snapshots(
+        self,
+        callbacks: list,
+        *,
+        path: str,
+    ) -> int:
         """Expire callback snapshots that are temporarily outside host queues."""
         now = time.monotonic()
+        claims = getattr(self, "_proactive_delivery_claims", {})
         expired = [
             cb
             for cb in callbacks
             if callback_delivery_expired(cb, now=now)
+            and (
+                cb.get(DELIVERY_CLAIM_TOKEN_KEY) is None
+                or claims.get(cb.get(DELIVERY_CLAIM_TOKEN_KEY))
+                in (None, path)
+            )
         ]
         if not expired:
             return 0
 
-        claims = getattr(self, "_proactive_delivery_claims", {})
         for cb in expired:
             expire_callback_delivery(cb)
             token = cb.get(DELIVERY_CLAIM_TOKEN_KEY)
-            if token is not None:
+            if token is not None and claims.get(token) == path:
                 claims.pop(token, None)
         self._purge_retracted_agent_callback_extras(expired)
         callbacks[:] = [
@@ -902,7 +914,8 @@ class ProactiveMixin:
                 }
                 voice_extra_snapshot = [
                     extra for extra in self.pending_extra_replies
-                    if extra.get("_callback_delivery_id") in delivered_ids
+                    if isinstance(extra, dict)
+                    and extra.get("_callback_delivery_id") in delivered_ids
                 ]
                 voice_commit_snapshot: tuple[dict, ...] = ()
 
@@ -982,7 +995,8 @@ class ProactiveMixin:
                     existing_extra_ids = {
                         extra.get("_callback_delivery_id")
                         for extra in self.pending_extra_replies
-                        if extra.get("_callback_delivery_id")
+                        if isinstance(extra, dict)
+                        and extra.get("_callback_delivery_id")
                     }
                     retry_ids = {
                         cb.get("_callback_delivery_id")
@@ -1172,6 +1186,17 @@ class ProactiveMixin:
                 for extra in voice_extra_snapshot:
                     if extra.get("_callback_delivery_id") in committed_media_ids:
                         extra.pop(DELIVERY_DEADLINE_KEY, None)
+                expired_count = self._expire_inflight_callback_snapshots(
+                    voice_snapshot,
+                    path="direct",
+                )
+                if expired_count:
+                    logger.info(
+                        "[%s] trigger_agent_callbacks: non-media voice "
+                        "callbacks expired before inject n=%d",
+                        self.lanlan_name,
+                        expired_count,
+                    )
                 voice_snapshot[:] = [
                     cb
                     for cb in voice_snapshot
@@ -1382,8 +1407,12 @@ class ProactiveMixin:
                 ]
                 self.pending_extra_replies = [
                     extra for extra in self.pending_extra_replies
-                    if extra.get("_callback_delivery_id") not in delivered_ids
-                    and extra.get(DELIVERY_CLAIM_TOKEN_KEY) not in delivered_tokens
+                    if not isinstance(extra, dict)
+                    or (
+                        extra.get("_callback_delivery_id") not in delivered_ids
+                        and extra.get(DELIVERY_CLAIM_TOKEN_KEY)
+                        not in delivered_tokens
+                    )
                 ]
                 self._release_delivery_claims(
                     claimed_voice_snapshot, "direct"
@@ -1431,9 +1460,14 @@ class ProactiveMixin:
             if not cb.get(DELIVERY_RETRACTED_KEY)
         ]
         self._purge_retracted_agent_callbacks()
+        callbacks_snapshot = self._claim_delivery_entries(
+            callbacks_snapshot,
+            "text",
+        )
         if not callbacks_snapshot:
             await self.state.fire(SessionEvent.PROACTIVE_DONE)
             return False
+        claimed_text_snapshot = tuple(callbacks_snapshot)
 
         # Drop only the snapshot cbs from the queue once we have the SM
         # claim — keep both pre-existing passive cbs and any callbacks
@@ -1472,6 +1506,7 @@ class ProactiveMixin:
             logger.warning("[%s] trigger_agent_callbacks error: %s", self.lanlan_name, e)
             self.pending_agent_callbacks.extend(callbacks_snapshot)
         finally:
+            self._release_delivery_claims(claimed_text_snapshot, "text")
             await self.state.fire(SessionEvent.PROACTIVE_DONE)
         if delivered:
             for cb in callbacks_snapshot:
@@ -1631,7 +1666,8 @@ class ProactiveMixin:
             # short per-cue deadline must be re-checked after the final await
             # and before prompt_ephemeral commits any output.
             expired_count = self._expire_inflight_callback_snapshots(
-                active_callbacks
+                active_callbacks,
+                path="text",
             )
             callbacks_snapshot[:] = active_callbacks
             if expired_count:
@@ -1648,7 +1684,10 @@ class ProactiveMixin:
                 await self.send_cancel_topic_hint(turn_id=proactive_sid)
                 topic_hint_sent = False
                 # The cancellation write above is another await boundary.
-                self._expire_inflight_callback_snapshots(active_callbacks)
+                self._expire_inflight_callback_snapshots(
+                    active_callbacks,
+                    path="text",
+                )
                 callbacks_snapshot[:] = active_callbacks
             if not active_callbacks:
                 self.proactive_manager.release_inflight_noop()
@@ -1728,7 +1767,9 @@ class ProactiveMixin:
                 if delivered_ids:
                     self.pending_extra_replies = [
                         extra for extra in self.pending_extra_replies
-                        if extra.get("_callback_delivery_id") not in delivered_ids
+                        if not isinstance(extra, dict)
+                        or extra.get("_callback_delivery_id")
+                        not in delivered_ids
                     ]
                 self._release_delivery_claims(active_callbacks, "text")
                 return True

@@ -268,6 +268,32 @@ async def test_voice_mode_idle_injects_and_drops_paired_cbs_and_extras():
     assert events == []
 
 
+async def test_voice_mode_success_preserves_legacy_string_extra():
+    sess = _make_voice_sess()
+    mgr = _make_mgr(session=sess)
+    cb = {
+        "_callback_delivery_id": "id-structured-extra",
+        "status": "completed",
+        "summary": "deliver structured callback",
+    }
+    paired_extra = {
+        "_callback_delivery_id": "id-structured-extra",
+        "origin": "task_result",
+        "summary": "deliver structured callback",
+    }
+    legacy_extra = "legacy queued context"
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [legacy_extra, paired_extra]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert sess.inject_calls == 1
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == [legacy_extra]
+    assert mgr._proactive_delivery_claims == {}
+
+
 async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     sess = _make_voice_sess()
 
@@ -793,6 +819,52 @@ async def test_voice_mode_preserves_committed_media_when_gate_closes_after_uploa
     assert len(sess.injected) == 1
     assert "describe committed image" in sess.injected[0]
     assert not cb.get(DELIVERY_RETRACTED_KEY)
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
+
+
+async def test_voice_mode_drops_non_media_callback_expired_during_rotation(
+    monkeypatch,
+):
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
+    sess = _make_voice_sess()
+
+    async def _rotate_past_deadline():
+        nonlocal now
+        now = 101.0
+
+    sess.on_sid_rotate = AsyncMock(side_effect=_rotate_past_deadline)
+    mgr = _make_mgr(session=sess)
+    ack = asyncio.get_running_loop().create_future()
+    token = object()
+    cb = {
+        "_callback_delivery_id": "id-text-only-ttl",
+        DELIVERY_ACK_FUTURE_KEY: ack,
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "status": "completed",
+        "summary": "stale text-only callback",
+    }
+    extra = {
+        "_callback_delivery_id": "id-text-only-ttl",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [extra]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.inject_calls == 0
+    assert ack.result() is False
+    assert cb[DELIVERY_RETRACTED_KEY] is True
     assert mgr.pending_agent_callbacks == []
     assert mgr.pending_extra_replies == []
     assert mgr._proactive_delivery_claims == {}
@@ -2432,6 +2504,60 @@ async def test_text_delivery_filters_only_expired_entries_at_prompt_boundary(
     assert mgr.pending_agent_callbacks == []
     assert mgr.pending_extra_replies == []
     assert mgr._proactive_delivery_claims == {}
+
+
+def test_inflight_expiry_does_not_release_foreign_delivery_claim(monkeypatch):
+    mgr = _make_mgr(session=_FakeOmniOffline(delivered=True))
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: 101.0,
+    )
+    token = object()
+    cb = {
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+    }
+    callbacks = [cb]
+    mgr._proactive_delivery_claims = {token: "swap"}
+
+    expired = mgr._expire_inflight_callback_snapshots(
+        callbacks,
+        path="text",
+    )
+
+    assert expired == 0
+    assert callbacks == [cb]
+    assert cb.get(DELIVERY_RETRACTED_KEY) is None
+    assert mgr._proactive_delivery_claims == {token: "swap"}
+
+
+async def test_text_delivery_does_not_steal_swap_owned_callback():
+    sess = _FakeOmniOffline(delivered=True)
+    mgr = _make_mgr(session=sess)
+    token = object()
+    cb = {
+        "_callback_delivery_id": "swap-owned",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        "status": "completed",
+        "summary": "owned by swap",
+    }
+    extra = {
+        "_callback_delivery_id": "swap-owned",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [extra]
+    mgr._proactive_delivery_claims = {token: "swap"}
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert sess.called_with == []
+    assert mgr.pending_agent_callbacks == [cb]
+    assert mgr.pending_extra_replies == [extra]
+    assert mgr._proactive_delivery_claims == {token: "swap"}
+    assert mgr.state.phase is ProactivePhase.IDLE
 
 
 async def test_text_mode_successful_delivery_fires_full_event_sequence():
