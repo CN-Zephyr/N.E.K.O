@@ -574,6 +574,35 @@ def test_passive_flood_guard_bounds_callback_queue_without_extras(monkeypatch):
     assert dropped_ack.done() and dropped_ack.result is False
 
 
+def test_flood_guard_preserves_legacy_extra_while_evicting_dropped_mirror(
+    monkeypatch,
+):
+    import config
+
+    monkeypatch.setattr(config, "AGENT_CALLBACK_QUEUE_MAX_ITEMS", 3)
+    mgr = _make_session_mgr()
+    oldest = _proactive_cb("oldest")
+    mgr.enqueue_agent_callback(oldest)
+    oldest_id = oldest["_callback_delivery_id"]
+    mgr.pending_extra_replies.append("legacy plain string")
+
+    mgr.enqueue_agent_callback(_passive_cb("middle"))
+    mgr.enqueue_agent_callback(_passive_cb("newer"))
+    mgr.enqueue_agent_callback(_passive_cb("newest"))
+
+    assert [c["summary"] for c in mgr.pending_agent_callbacks] == [
+        "middle",
+        "newer",
+        "newest",
+    ]
+    assert mgr.pending_extra_replies == ["legacy plain string"]
+    assert not any(
+        isinstance(extra, dict)
+        and extra.get("_callback_delivery_id") == oldest_id
+        for extra in mgr.pending_extra_replies
+    )
+
+
 def test_enqueue_coalesce_resolves_superseded_ack_false():
     # A superseded cue's delivery-ack future resolves False immediately so a
     # waiter unblocks instead of stalling until timeout (parity with the

@@ -2746,7 +2746,10 @@ class ProactiveMixin:
                 if dropped_ids:
                     self.pending_extra_replies = [
                         _extra for _extra in self.pending_extra_replies
-                        if _extra.get("_callback_delivery_id") not in dropped_ids
+                        if (
+                            not isinstance(_extra, dict)
+                            or _extra.get("_callback_delivery_id") not in dropped_ids
+                        )
                     ]
             if len(self.pending_extra_replies) > AGENT_CALLBACK_QUEUE_MAX_ITEMS:
                 self.pending_extra_replies = self.pending_extra_replies[-AGENT_CALLBACK_QUEUE_MAX_ITEMS:]
