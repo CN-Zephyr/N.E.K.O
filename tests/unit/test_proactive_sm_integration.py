@@ -36,6 +36,7 @@ from main_logic.proactive_delivery import (
     DELIVERY_CLAIM_TOKEN_KEY,
     DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
+    VOICE_DELIVERY_COMMITTED_KEY,
 )
 from main_logic.session_state import (
     ProactivePhase,
@@ -917,7 +918,7 @@ async def test_voice_mode_restreams_committed_media_after_session_swap():
     assert delivered is False
     assert streamed_images == [("old", "image-b64")]
     assert old_session.injected == []
-    assert cb["_voice_delivery_committed"] is True
+    assert cb[VOICE_DELIVERY_COMMITTED_KEY] is True
     assert mgr.pending_agent_callbacks == [cb]
     assert mgr.pending_extra_replies == [extra]
     mgr._schedule_proactive_retry.assert_called_once_with(
