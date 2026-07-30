@@ -298,6 +298,7 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     assert sess.inject_calls == 0
     assert mgr.pending_agent_callbacks == [cb]
     assert cb.get("_voice_delivery_committed") is None
+    assert mgr._proactive_delivery_claims == {}
 
 
 async def test_voice_mode_sid_rotation_failure_arms_callback_retry():
@@ -323,8 +324,58 @@ async def test_voice_mode_sid_rotation_failure_arms_callback_retry():
     sess.stream_image.assert_not_awaited()
     assert sess.inject_calls == 0
     assert mgr.pending_agent_callbacks == [cb]
+    assert mgr._proactive_delivery_claims == {}
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
+    )
+
+
+async def _assert_voice_mode_retraction_before_media_releases_direct_claim(
+    retract_during_rotation,
+):
+    sess = _make_voice_sess()
+    mgr = _make_mgr(session=sess)
+    cb = {
+        "_callback_delivery_id": "id-stale-before-media",
+        "status": "completed",
+        "summary": "stale callback",
+        "coalesce_key": "weather",
+        "_coalesce_submit_seq": 1,
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr._coalesce_latest = {
+        "weather": 1 if retract_during_rotation else 2
+    }
+
+    async def _rotate_then_supersede():
+        mgr._coalesce_latest["weather"] = 2
+
+    if retract_during_rotation:
+        sess.on_sid_rotate = AsyncMock(side_effect=_rotate_then_supersede)
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(
+        mgr
+    )
+
+    assert delivered is False
+    assert sess.inject_calls == 0
+    assert mgr.pending_agent_callbacks == []
+    assert mgr._proactive_delivery_claims == {}
+    if retract_during_rotation:
+        sess.on_sid_rotate.assert_awaited_once_with()
+    else:
+        sess.on_sid_rotate.assert_not_awaited()
+
+
+async def test_voice_mode_retraction_before_rotation_releases_direct_claim():
+    await _assert_voice_mode_retraction_before_media_releases_direct_claim(
+        False
+    )
+
+
+async def test_voice_mode_retraction_during_rotation_releases_direct_claim():
+    await _assert_voice_mode_retraction_before_media_releases_direct_claim(
+        True
     )
 
 

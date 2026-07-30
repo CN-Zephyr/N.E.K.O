@@ -1050,6 +1050,9 @@ class ProactiveMixin:
                 ]
                 self._purge_retracted_agent_callbacks()
                 if not voice_snapshot:
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
                     return False
                 # Callback delivery bypasses prompt_ephemeral(), so it owns the
                 # same external-TTS turn boundary. Rotate before persisting any
@@ -1070,6 +1073,9 @@ class ProactiveMixin:
                         )
                         # No response.create fired, so no response lifecycle
                         # hook can re-drive this retained callback.
+                        self._release_delivery_claims(
+                            claimed_voice_snapshot, "direct"
+                        )
                         self._schedule_proactive_retry(
                             self.proactive_manager.min_gap_s
                         )
@@ -1086,6 +1092,9 @@ class ProactiveMixin:
                         "[%s] trigger_agent_callbacks: activity started during SID rotation; deferring callback delivery",
                         self.lanlan_name,
                     )
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
                     return False
                 # Rotation awaited outside the media-commit boundary. A newer
                 # same-key callback may have retracted this snapshot while the
@@ -1098,6 +1107,9 @@ class ProactiveMixin:
                 ]
                 self._purge_retracted_agent_callbacks()
                 if not voice_snapshot:
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
                     return False
                 self._mark_voice_delivery_committed(voice_snapshot)
                 voice_commit_snapshot = tuple(voice_snapshot)
