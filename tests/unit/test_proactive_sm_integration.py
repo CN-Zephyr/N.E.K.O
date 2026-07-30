@@ -194,7 +194,9 @@ def _make_voice_sess(*, is_responding=False, inject=None):
     sess.inject_calls = 0
     sess.is_active_response = lambda: sess._is_responding
     sess.on_sid_rotate = AsyncMock()
+    sess._audio_in_buffer = False
     sess._client_vad_active = False
+    sess._client_vad_last_speech_time = 0.0
     sess._user_recent_activity_time = 0.0
     sess._ai_recent_activity_time = 0.0
 
@@ -408,7 +410,7 @@ async def test_voice_mode_inject_cancellation_releases_direct_claim():
     await _assert_voice_mode_cancellation_releases_direct_claim("inject")
 
 
-async def _assert_voice_mode_retraction_before_media_releases_direct_claim(
+async def _assert_voice_mode_claim_stabilizes_coalescing(
     retract_during_rotation,
 ):
     sess = _make_voice_sess()
@@ -435,10 +437,10 @@ async def _assert_voice_mode_retraction_before_media_releases_direct_claim(
         mgr
     )
 
-    assert delivered is False
-    assert sess.inject_calls == 0
+    assert delivered is retract_during_rotation
+    assert sess.inject_calls == int(retract_during_rotation)
     assert mgr.pending_agent_callbacks == []
-    assert mgr._proactive_delivery_claims == {}
+    assert getattr(mgr, "_proactive_delivery_claims", {}) == {}
     if retract_during_rotation:
         sess.on_sid_rotate.assert_awaited_once_with()
     else:
@@ -446,13 +448,13 @@ async def _assert_voice_mode_retraction_before_media_releases_direct_claim(
 
 
 async def test_voice_mode_retraction_before_rotation_releases_direct_claim():
-    await _assert_voice_mode_retraction_before_media_releases_direct_claim(
+    await _assert_voice_mode_claim_stabilizes_coalescing(
         False
     )
 
 
-async def test_voice_mode_retraction_during_rotation_releases_direct_claim():
-    await _assert_voice_mode_retraction_before_media_releases_direct_claim(
+async def test_voice_mode_claim_prevents_retraction_during_rotation():
+    await _assert_voice_mode_claim_stabilizes_coalescing(
         True
     )
 
@@ -651,7 +653,7 @@ async def test_voice_mode_user_vad_defers_without_injecting():
     )
 
 
-async def test_voice_mode_recent_user_activity_defers_without_injecting():
+async def test_voice_mode_current_audio_activity_defers_without_injecting():
     sess = _make_voice_sess()
     sess._client_vad_active = False
     sess._user_recent_activity_time = time.time()
@@ -665,6 +667,40 @@ async def test_voice_mode_recent_user_activity_defers_without_injecting():
     assert delivered is False
     assert sess.injected == []
     assert mgr.pending_agent_callbacks == [cb]
+
+
+async def test_voice_mode_old_recent_activity_does_not_create_quiet_window():
+    sess = _make_voice_sess()
+    sess._client_vad_active = False
+    sess._user_recent_activity_time = time.time() - 1.0
+    sess._user_recent_activity_window = 8.0
+    mgr = _make_mgr(session=sess)
+    mgr.pending_agent_callbacks = [{
+        "status": "completed",
+        "summary": "natural interjection after the floor opens",
+    }]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert sess.inject_calls == 1
+
+
+async def test_voice_mode_stale_vad_grace_does_not_create_quiet_window():
+    sess = _make_voice_sess()
+    sess._client_vad_active = True
+    sess._client_vad_last_speech_time = time.time() - 1.0
+    sess._client_vad_grace_period = 6.0
+    mgr = _make_mgr(session=sess)
+    mgr.pending_agent_callbacks = [{
+        "status": "completed",
+        "summary": "do not inherit the realtime quiet window",
+    }]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert sess.inject_calls == 1
 
 
 async def test_voice_mode_swap_claim_denial_arms_retry():
@@ -723,6 +759,7 @@ async def test_voice_mode_rechecks_user_vad_after_media_await():
         *,
         on_rejected=None,
         events_before_text=None,
+        on_native_media_committed=None,
     ):
         assert on_rejected is not None
         assert events_before_text == []
@@ -824,6 +861,118 @@ async def test_voice_mode_preserves_committed_media_when_gate_closes_after_uploa
     assert mgr._proactive_delivery_claims == {}
 
 
+async def _assert_partial_native_media_commit_is_durable(
+    monkeypatch,
+    *,
+    cancel_second_image,
+):
+    now = 100.0
+    patch_module_clock(
+        monkeypatch,
+        proactive_module,
+        monotonic=lambda: now,
+    )
+    sess = _make_voice_sess()
+    streamed = []
+
+    async def _stream_image(
+        image,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        on_rejected=None,
+    ):
+        nonlocal now
+        streamed.append(image)
+        assert bypass_rate_limit is True
+        assert cache_latest is False
+        assert on_rejected is not None
+        if len(streamed) == 1:
+            return None
+        now = 101.0
+        if cancel_second_image:
+            raise asyncio.CancelledError
+        raise RuntimeError("second image failed")
+
+    sess.stream_image = _stream_image
+    mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
+    token = object()
+    cb = {
+        "_callback_delivery_id": "id-partial-native-media",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "status": "completed",
+        "summary": "describe the committed first image",
+        "media_images": ["image-one", "image-two"],
+        "coalesce_key": "weather",
+        "_coalesce_submit_seq": 1,
+    }
+    extra = {
+        "_callback_delivery_id": "id-partial-native-media",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: 100.5,
+        "coalesce_key": "weather",
+        "_coalesce_submit_seq": 1,
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [extra]
+    mgr._coalesce_latest = {"weather": 1}
+
+    try:
+        delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(
+            mgr
+        )
+    except asyncio.CancelledError:
+        assert cancel_second_image is True
+    else:
+        assert cancel_second_image is False
+        assert delivered is False
+
+    assert streamed == ["image-one", "image-two"]
+    assert mgr.pending_agent_callbacks == [cb]
+    assert mgr.pending_extra_replies == [extra]
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in extra
+    assert cb["_voice_delivery_committed"] is True
+    assert extra["_voice_delivery_committed"] is True
+    assert mgr._proactive_delivery_claims == {}
+    assert mgr._purge_expired_agent_callbacks() == 0
+    if cancel_second_image:
+        mgr._schedule_proactive_retry.assert_not_called()
+    else:
+        mgr._schedule_proactive_retry.assert_called_once_with(
+            mgr.proactive_manager.min_gap_s
+        )
+
+    core_module.LLMSessionManager.enqueue_agent_callback(
+        mgr,
+        {
+            "status": "completed",
+            "summary": "new weather",
+            "coalesce_key": "weather",
+            "_coalesce_submit_seq": 2,
+        },
+    )
+    assert cb.get(DELIVERY_RETRACTED_KEY) is not True
+
+
+async def test_partial_native_media_failure_keeps_callback_durable(monkeypatch):
+    await _assert_partial_native_media_commit_is_durable(
+        monkeypatch,
+        cancel_second_image=False,
+    )
+
+
+async def test_partial_native_media_cancellation_keeps_callback_durable(
+    monkeypatch,
+):
+    await _assert_partial_native_media_commit_is_durable(
+        monkeypatch,
+        cancel_second_image=True,
+    )
+
+
 async def test_voice_mode_drops_non_media_callback_expired_during_rotation(
     monkeypatch,
 ):
@@ -908,6 +1057,7 @@ async def test_voice_mode_rechecks_retracted_callbacks_before_inject():
         *,
         on_rejected=None,
         events_before_text=None,
+        on_native_media_committed=None,
     ):
         assert on_rejected is not None
         assert events_before_text == []
@@ -1436,6 +1586,7 @@ async def test_voice_mode_inject_exception_keeps_cbs_for_retry():
     sess.inject_text_and_request_response = _inject
 
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     original = [{"status": "completed", "summary": "retry on ws err"}]
     mgr.pending_agent_callbacks = list(original)
 
@@ -1445,6 +1596,9 @@ async def test_voice_mode_inject_exception_keeps_cbs_for_retry():
     # inject 确实被调用过一次（证明走的是 inject-异常分支，而非更早的 guard 早退）
     assert sess.inject_calls == 1
     assert mgr.pending_agent_callbacks == original
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
 
 
 async def test_voice_mode_callback_image_rejection_before_inject_keeps_cb():
@@ -1601,12 +1755,14 @@ async def test_voice_mode_callback_image_rejection_after_inject_rearms_retry():
     mgr = _make_mgr(session=sess)
     cb = {
         "_callback_delivery_id": "id-image-late-rejected",
+        DELIVERY_DEADLINE_KEY: time.monotonic() + 0.01,
         "status": "completed",
         "summary": "inspect this image",
         "media_images": ["image-b64-1", "image-b64-2"],
     }
     extra = {
         "_callback_delivery_id": "id-image-late-rejected",
+        DELIVERY_DEADLINE_KEY: cb[DELIVERY_DEADLINE_KEY],
         "summary": "inspect this image",
     }
     mgr.pending_agent_callbacks = [cb]
@@ -1621,10 +1777,20 @@ async def test_voice_mode_callback_image_rejection_after_inject_rearms_retry():
     assert len(image_rejections) == 2
 
     image_rejections[0]("callback image rejected")
-    image_rejections[1]("second callback image rejected")
 
     assert mgr.pending_agent_callbacks == [cb]
     assert mgr.pending_extra_replies == [extra]
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in extra
+    assert cb["_voice_delivery_committed"] is True
+    assert extra["_voice_delivery_committed"] is True
+
+    image_rejections[1]("second callback image rejected")
+
+    assert cb["_voice_delivery_committed"] is True
+    assert extra["_voice_delivery_committed"] is True
+    assert DELIVERY_DEADLINE_KEY not in cb
+    assert DELIVERY_DEADLINE_KEY not in extra
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
@@ -1676,7 +1842,7 @@ async def test_voice_mode_callback_image_rejection_after_ack_is_ignored():
     mgr._schedule_proactive_retry.assert_not_called()
 
 
-async def test_voice_mode_rejected_media_does_not_restore_superseded_callback():
+async def test_voice_mode_rejected_committed_media_preserves_paired_callback():
     sess = _make_voice_sess()
     image_rejections = []
 
@@ -1717,11 +1883,15 @@ async def test_voice_mode_rejected_media_does_not_restore_superseded_callback():
     mgr._coalesce_latest = {"weather": 2}
     image_rejections[0]("superseded callback image rejected")
 
-    assert old_cb[DELIVERY_RETRACTED_KEY] is True
-    assert future.result() is False
-    assert mgr.pending_agent_callbacks == []
-    assert mgr.pending_extra_replies == []
-    mgr._schedule_proactive_retry.assert_not_called()
+    assert old_cb.get(DELIVERY_RETRACTED_KEY) is not True
+    assert future.done() is False
+    assert mgr.pending_agent_callbacks == [old_cb]
+    assert mgr.pending_extra_replies == [old_extra]
+    assert old_cb["_voice_delivery_committed"] is True
+    assert old_extra["_voice_delivery_committed"] is True
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
 
 
 async def test_voice_mode_coalescing_queues_newer_cue_after_media_commit():
@@ -1785,12 +1955,16 @@ async def test_voice_mode_coalescing_queues_newer_cue_after_media_commit():
     assert len(sess.injected) == 1
     assert "old weather" in sess.injected[0]
     assert "new weather" not in sess.injected[0]
+    assert old_cb["_voice_delivery_committed"] is True
+    await asyncio.sleep(core_module._VOICE_PROACTIVE_ACK_GRACE_S + 0.02)
     assert old_cb.get("_voice_delivery_committed") is None
     assert mgr.pending_agent_callbacks == [newer_cb]
     assert mgr.pending_extra_replies[0]["summary"] == "new weather"
 
 
-async def test_voice_mode_build_failure_clears_media_commit_marker(monkeypatch):
+async def test_voice_mode_build_failure_preserves_durable_media_contract(
+    monkeypatch,
+):
     import pytest
     import main_logic.core.proactive as proactive_module
 
@@ -1816,6 +1990,7 @@ async def test_voice_mode_build_failure_clears_media_commit_marker(monkeypatch):
         "media_images": ["old-weather-image"],
         "coalesce_key": "weather",
         "_coalesce_submit_seq": 1,
+        DELIVERY_DEADLINE_KEY: time.monotonic() + 0.01,
     }
     mgr.pending_agent_callbacks = [old_cb]
     mgr.pending_extra_replies = [{
@@ -1823,6 +1998,7 @@ async def test_voice_mode_build_failure_clears_media_commit_marker(monkeypatch):
         "summary": "old weather",
         "coalesce_key": "weather",
         "_coalesce_submit_seq": 1,
+        DELIVERY_DEADLINE_KEY: old_cb[DELIVERY_DEADLINE_KEY],
     }]
     mgr._coalesce_latest = {"weather": 1}
     monkeypatch.setattr(
@@ -1834,7 +2010,11 @@ async def test_voice_mode_build_failure_clears_media_commit_marker(monkeypatch):
     with pytest.raises(RuntimeError, match="instruction build failed"):
         await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
 
-    assert old_cb.get("_voice_delivery_committed") is None
+    assert old_cb["_voice_delivery_committed"] is True
+    assert mgr.pending_extra_replies[0]["_voice_delivery_committed"] is True
+    assert DELIVERY_DEADLINE_KEY not in old_cb
+    assert DELIVERY_DEADLINE_KEY not in mgr.pending_extra_replies[0]
+    assert mgr._proactive_delivery_claims == {}
     core_module.LLMSessionManager.enqueue_agent_callback(
         mgr,
         {
@@ -1844,8 +2024,9 @@ async def test_voice_mode_build_failure_clears_media_commit_marker(monkeypatch):
             "_coalesce_submit_seq": 2,
         },
     )
-    assert old_cb[DELIVERY_RETRACTED_KEY] is True
+    assert old_cb.get(DELIVERY_RETRACTED_KEY) is not True
     assert [cb["summary"] for cb in mgr.pending_agent_callbacks] == [
+        "old weather",
         "new weather"
     ]
 
