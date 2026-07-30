@@ -187,7 +187,7 @@ def test_select_render_failure_releases_swap_claim(monkeypatch):
 # _remove_swap_delivered_passive_cbs
 # ---------------------------------------------------------------------------
 
-def test_remove_at_promote_dequeues_by_identity_and_acks_true():
+def test_remove_at_promote_dequeues_by_identity_without_early_ack():
     mgr = _make_session_mgr()
     ack = _FakeAckFuture()
     delivered = _passive_cb("delivered")
@@ -199,7 +199,7 @@ def test_remove_at_promote_dequeues_by_identity_and_acks_true():
 
     assert removed == [delivered]
     assert mgr.pending_agent_callbacks == [other]
-    assert ack.done() and ack.result is True
+    assert not ack.done()
 
 
 def test_remove_noops_for_entries_consumed_in_window():

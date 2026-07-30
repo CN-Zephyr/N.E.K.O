@@ -2019,12 +2019,14 @@ class LifecycleMixin:
 
     def _remove_swap_delivered_passive_cbs(self, selected: list) -> list:
         """[Hot-swap related] Dequeue prime-injected passive callbacks at
-        promote success; returns the actually-removed subset (ack'd True).
+        promote success; returns the actually-removed subset.
 
         Identity-based removal, same as the extras counterpart. Swap claims
         normally prevent another delivery path or expiry purge from consuming
         the entry inside the prime→promote window; identity matching remains a
-        defensive guard for flood pruning and direct helper callers.
+        defensive guard for flood pruning and direct helper callers. Delivery
+        ACK stays pending until final cleanup commits; restore exits must be
+        able to put the callback back without an already-completed ACK future.
         """
         if not selected:
             return []
@@ -2040,8 +2042,6 @@ class LifecycleMixin:
                 cb for cb in self.pending_agent_callbacks
                 if id(cb) not in selected_obj_ids
             ]
-            for cb in removed:
-                resolve_callback_delivery_ack(cb, True)
             return removed
         except Exception as e:
             logger.warning(f"Final Swap Sequence: passive callback dequeue failed: {e}")
@@ -2556,6 +2556,10 @@ class LifecycleMixin:
                 _swap_claim_committed = True
                 _removed_extras = []
                 _removed_cb_backed_ids = set()
+            if _removed_passive_cbs:
+                for callback in _removed_passive_cbs:
+                    resolve_callback_delivery_ack(callback, True)
+                _removed_passive_cbs = []
             logger.info("✅ 热切换完成")
             
 
@@ -2649,6 +2653,13 @@ class LifecycleMixin:
                 self.is_active = False
                 self._restore_undelivered_swap_extras(_removed_extras, _removed_cb_backed_ids)
                 self._restore_undelivered_swap_passive_cbs(_removed_passive_cbs)
+            elif _removed_passive_cbs:
+                # The promoted session survived and retains the primed passive
+                # context, so this path cannot restore without double delivery.
+                # Commit its ACK now rather than leaving the producer hanging.
+                for callback in _removed_passive_cbs:
+                    resolve_callback_delivery_ack(callback, True)
+                _removed_passive_cbs = []
             if self.is_active and self.session and hasattr(self.session, 'handle_messages') and (not self.message_handler_task or self.message_handler_task.done()):
                 self.message_handler_task = asyncio.create_task(self.session.handle_messages())
         finally:

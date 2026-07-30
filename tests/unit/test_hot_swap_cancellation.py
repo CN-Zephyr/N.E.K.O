@@ -693,6 +693,17 @@ async def test_final_swap_ws_invalid_restore_excludes_concurrently_delivered_ext
 
     mgr._apply_pending_tts_route_after_swap = _kill_new_session_ws
     mgr.pending_extra_replies = [extra_spoken, extra_other]
+    passive_ack = asyncio.get_running_loop().create_future()
+    passive = {
+        "_callback_delivery_id": "id-passive-ws-invalid",
+        "origin": "event",
+        "summary": "passive context must restore",
+        "detail": "passive context must restore",
+        "status": "completed",
+        "delivery_mode": "passive",
+        DELIVERY_ACK_FUTURE_KEY: passive_ack,
+    }
+    mgr.pending_agent_callbacks = [passive]
 
     swap_task = await _run_swap_as_final_swap_task(mgr)
 
@@ -700,6 +711,8 @@ async def test_final_swap_ws_invalid_restore_excludes_concurrently_delivered_ext
     assert mgr.session is None
     assert mgr.pending_extra_replies == [extra_other], \
         "ws-invalid restore must re-queue only the promote-removed entries"
+    assert mgr.pending_agent_callbacks == [passive]
+    assert not passive_ack.done()
 
 
 @pytest.mark.asyncio
@@ -1043,7 +1056,7 @@ async def test_final_swap_post_promote_cancel_restores_removed_extras():
     to the queue (coderabbit Major on this PR)."""
     mgr = _make_swap_manager()
     old_session = _FakeSession("old")
-    new_session = _FakeSession("pending")
+    new_session = _make_fake_realtime_session("pending")
     mgr.session = old_session
     mgr.pending_session = new_session
     mgr.is_hot_swap_imminent = True
@@ -1061,6 +1074,17 @@ async def test_final_swap_post_promote_cancel_restores_removed_extras():
 
     extra = _extra_entry("id-post-promote", "task P finished")
     mgr.pending_extra_replies = [extra]
+    passive_ack = asyncio.get_running_loop().create_future()
+    passive = {
+        "_callback_delivery_id": "id-passive-post-promote-cancel",
+        "origin": "event",
+        "summary": "passive context must survive cancel",
+        "detail": "passive context must survive cancel",
+        "status": "completed",
+        "delivery_mode": "passive",
+        DELIVERY_ACK_FUTURE_KEY: passive_ack,
+    }
+    mgr.pending_agent_callbacks = [passive]
 
     swap_task = await _run_swap_as_final_swap_task(mgr)
 
@@ -1070,6 +1094,10 @@ async def test_final_swap_post_promote_cancel_restores_removed_extras():
         "the handler leaves the promoted session for the canceller to close"
     assert mgr.pending_extra_replies == [extra], \
         "post-promote cancel must restore the promote-removed extras"
+    assert mgr.pending_agent_callbacks == [passive], \
+        "post-promote cancel must restore the promote-removed passive callback"
+    assert not passive_ack.done(), \
+        "a restored passive callback must keep its ACK pending"
     # 双投守卫：restore 之后不得给将死的 promoted 会话重启 listener——
     # 没有 listener，服务器响应不会被消费播出，塞回的条目才是唯一投递路径。
     assert mgr.message_handler_task is None, \
