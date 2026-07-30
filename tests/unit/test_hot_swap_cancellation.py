@@ -45,6 +45,7 @@ from main_logic.omni_offline_client import OmniOfflineClient
 from main_logic.omni_realtime_client import OmniRealtimeClient
 from main_logic.proactive_delivery import (
     DELIVERY_ACK_FUTURE_KEY,
+    DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
 )
 
@@ -742,6 +743,54 @@ async def test_final_swap_happy_path_consumes_selected_keeps_deferred(monkeypatc
             "successful swap consumes selected extras and keeps only deferred ones"
         assert mgr.pending_agent_callbacks == []
         assert selected_ack.result() is True
+    finally:
+        await _drain_task(mgr.message_handler_task)
+
+
+@pytest.mark.asyncio
+async def test_passive_swap_claim_survives_ttl_purge_during_prime():
+    mgr = _make_swap_manager()
+    old_session = _FakeSession("old")
+    new_session = _make_fake_realtime_session("pending")
+    mgr.session = old_session
+    mgr.pending_session = new_session
+    mgr.is_hot_swap_imminent = True
+    mgr.is_active = True
+    mgr.message_handler_task = None
+
+    ack = asyncio.get_running_loop().create_future()
+    passive = {
+        "_callback_delivery_id": "id-passive-prime-window",
+        "origin": "event",
+        "summary": "passive context during swap",
+        "detail": "passive context during swap",
+        "status": "completed",
+        "delivery_mode": "passive",
+        DELIVERY_ACK_FUTURE_KEY: ack,
+        DELIVERY_DEADLINE_KEY: 9999999999.0,
+    }
+    mgr.pending_agent_callbacks = [passive]
+
+    async def _prime_and_expire(text, *, skipped=False):
+        new_session.prime_calls.append((text, skipped))
+        if "passive context during swap" not in text:
+            return
+        passive[DELIVERY_DEADLINE_KEY] = 0.0
+        assert mgr._purge_expired_agent_callbacks() == 0
+        assert mgr.pending_agent_callbacks == [passive]
+        assert not ack.done()
+        assert list(mgr._proactive_delivery_claims.values()) == ["swap"]
+
+    new_session.prime_context = _prime_and_expire
+
+    try:
+        swap_task = await _run_swap_as_final_swap_task(mgr)
+
+        assert not swap_task.cancelled()
+        assert mgr.session is new_session
+        assert mgr.pending_agent_callbacks == []
+        assert ack.result() is True
+        assert mgr._proactive_delivery_claims == {}
     finally:
         await _drain_task(mgr.message_handler_task)
 

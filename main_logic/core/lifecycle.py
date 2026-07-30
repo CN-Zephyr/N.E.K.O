@@ -1915,7 +1915,12 @@ class LifecycleMixin:
             # 塞回是尽力而为：绝不能让队列簿记反过来打断中止清理流程。
             logger.warning(f"Final Swap Sequence: failed to restore undelivered extras: {e}")
 
-    def _select_passive_callbacks_for_swap_prime(self, extras_selected: list = None) -> tuple:
+    def _select_passive_callbacks_for_swap_prime(
+        self,
+        extras_selected: list = None,
+        *,
+        claim_path: str = "",
+    ) -> tuple:
         """[Hot-swap related] Pick queued passive callbacks to ride the swap prime.
 
         Passive (``delivery_mode="passive"`` / ai_behavior="read") callbacks
@@ -1948,10 +1953,14 @@ class LifecycleMixin:
         The queue is NOT drained here — removal is deferred to promote
         success via :meth:`_remove_swap_delivered_passive_cbs`, mirroring the
         ``_prime_selected_extras`` bookkeeping, so every pre-promote abort
-        keeps the queue intact with zero restore code. Topic-hook snapshots
-        are excluded: they have their own ack/retry lifecycle and delivery
-        gates that this path must not bypass.
+        keeps the queue intact with zero restore code. When ``claim_path`` is
+        provided, only entries atomically claimed for that path are rendered;
+        the claim protects their TTL and ownership through prime/promote, and
+        a render failure releases it here. Topic-hook snapshots are excluded:
+        they have their own ack/retry lifecycle and delivery gates that this
+        path must not bypass.
         """
+        claimed_selected: list = []
         try:
             # TTL is a delivery-wide freshness contract.  Passive callbacks
             # must cross the same expiry boundary here as they do in the
@@ -1985,6 +1994,13 @@ class LifecycleMixin:
             selected = selected_all[len(_extras):]
             if not selected:
                 return [], ""
+            if claim_path:
+                claimed_selected = self._claim_delivery_entries(
+                    selected, claim_path
+                )
+                selected = claimed_selected
+                if not selected:
+                    return [], ""
             _lang = normalize_language_code(self.user_language, format='short')
             rendered = _build_callback_instruction(
                 selected,
@@ -1995,6 +2011,8 @@ class LifecycleMixin:
             )
             return selected, rendered
         except Exception as e:
+            if claimed_selected:
+                self._release_delivery_claims(claimed_selected, claim_path)
             # 选取/渲染失败绝不能打断 swap：这批 passive 留在队列等下一轮。
             logger.warning(f"Final Swap Sequence: passive callback selection failed: {e}")
             return [], ""
@@ -2003,10 +2021,10 @@ class LifecycleMixin:
         """[Hot-swap related] Dequeue prime-injected passive callbacks at
         promote success; returns the actually-removed subset (ack'd True).
 
-        Identity-based removal, same as the extras counterpart: entries a
-        concurrent path consumed inside the prime→promote window (text-turn
-        drain, retraction purge, flood cap) no-op here instead of deleting a
-        re-queued same-id newcomer.
+        Identity-based removal, same as the extras counterpart. Swap claims
+        normally prevent another delivery path or expiry purge from consuming
+        the entry inside the prime→promote window; identity matching remains a
+        defensive guard for flood pruning and direct helper callers.
         """
         if not selected:
             return []
@@ -2101,6 +2119,7 @@ class LifecycleMixin:
                 return
 
         _swap_claimed_extras: list = []
+        _swap_claimed_passive_cbs: list = []
         _swap_claim_committed = False
         try:
             new_session = None  # 提前初始化，确保 except 块安全访问（实际赋值在 PERFORM ACTUAL HOT SWAP 段）
@@ -2243,8 +2262,11 @@ class LifecycleMixin:
                         and getattr(self.pending_session, "_is_gemini", False)
                     ):
                         _passive_sel, _passive_swap_text = (
-                            self._select_passive_callbacks_for_swap_prime()
+                            self._select_passive_callbacks_for_swap_prime(
+                                claim_path="swap",
+                            )
                         )
+                        _swap_claimed_passive_cbs = list(_passive_sel)
                         if _passive_swap_text:
                             final_prime_text += "\n" + _passive_swap_text
                     try:
@@ -2276,8 +2298,11 @@ class LifecycleMixin:
                 if (isinstance(self.pending_session, OmniRealtimeClient)
                         and getattr(self.pending_session, "_is_gemini", False)):
                     _passive_sel, _passive_swap_text = (
-                        self._select_passive_callbacks_for_swap_prime()
+                        self._select_passive_callbacks_for_swap_prime(
+                            claim_path="swap",
+                        )
                     )
+                    _swap_claimed_passive_cbs = list(_passive_sel)
                     if _passive_swap_text:
                         final_prime_text += "\n" + _passive_swap_text
                 try:
@@ -2311,8 +2336,10 @@ class LifecycleMixin:
                 _passive_sel, _passive_swap_text = (
                     self._select_passive_callbacks_for_swap_prime(
                         extras_selected=_extras_for_budget,
+                        claim_path="swap",
                     )
                 )
+                _swap_claimed_passive_cbs = list(_passive_sel)
                 if _passive_swap_text:
                     try:
                         await self.pending_session.prime_context(_passive_swap_text, skipped=True)
@@ -2621,6 +2648,9 @@ class LifecycleMixin:
         finally:
             if not _swap_claim_committed:
                 self._release_delivery_claims(_swap_claimed_extras, "swap")
+            self._release_delivery_claims(
+                _swap_claimed_passive_cbs, "swap"
+            )
             self.is_hot_swap_imminent = False  # Always reset this flag
             if self.final_swap_task and self.final_swap_task.done():
                 self.final_swap_task = None

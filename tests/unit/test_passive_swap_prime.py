@@ -161,6 +161,28 @@ def test_select_shares_token_budget_with_extras(monkeypatch):
     assert "context cue" in text
 
 
+def test_select_render_failure_releases_swap_claim(monkeypatch):
+    mgr = _make_session_mgr()
+    passive = _passive_cb("context cue")
+    mgr.pending_agent_callbacks = [passive]
+
+    def _raise_render(*args, **kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(
+        "main_logic.core.lifecycle._build_callback_instruction",
+        _raise_render,
+    )
+
+    selected, text = mgr._select_passive_callbacks_for_swap_prime(
+        claim_path="swap",
+    )
+
+    assert selected == [] and text == ""
+    assert mgr.pending_agent_callbacks == [passive]
+    assert mgr._proactive_delivery_claims == {}
+
+
 # ---------------------------------------------------------------------------
 # _remove_swap_delivered_passive_cbs
 # ---------------------------------------------------------------------------
