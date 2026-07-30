@@ -34,6 +34,7 @@ from main_logic.proactive_delivery import (
     DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
     VOICE_DELIVERY_COMMITTED_KEY,
+    VOICE_DELIVERY_COMMITTED_SESSION_KEY,
     callback_delivery_expired,
     ensure_callback_delivery_deadline,
     expire_callback_delivery,
@@ -977,8 +978,12 @@ class ProactiveMixin:
 
                 def _commit_native_media(callback: dict) -> None:
                     """Make paired text durable after the first provider write."""
-                    for entry in _entries_for_voice_callback(callback):
-                        entry[VOICE_DELIVERY_COMMITTED_KEY] = True
+                    committed_entries = _entries_for_voice_callback(callback)
+                    self._mark_voice_delivery_committed(
+                        committed_entries,
+                        voice_sess,
+                    )
+                    for entry in committed_entries:
                         entry.pop(DELIVERY_DEADLINE_KEY, None)
 
                 # Server-side rejection of ``response.create`` (e.g.
@@ -1937,16 +1942,33 @@ class ProactiveMixin:
         return isinstance(latest, int) and latest > seq
 
     @staticmethod
-    def _mark_voice_delivery_committed(callbacks: list) -> None:
+    def _voice_delivery_session_token(session) -> object:
+        token = getattr(session, "_proactive_media_session_token", None)
+        if token is None:
+            token = object()
+            session._proactive_media_session_token = token
+        return token
+
+    def _mark_voice_delivery_committed(
+        self,
+        callbacks: list,
+        session,
+    ) -> None:
+        session_token = self._voice_delivery_session_token(session)
         for callback in callbacks:
             if isinstance(callback, dict):
                 callback[VOICE_DELIVERY_COMMITTED_KEY] = True
+                callback[VOICE_DELIVERY_COMMITTED_SESSION_KEY] = session_token
 
     @staticmethod
     def _clear_voice_delivery_committed(callbacks: list) -> None:
         for callback in callbacks:
             if isinstance(callback, dict):
                 callback.pop(VOICE_DELIVERY_COMMITTED_KEY, None)
+                callback.pop(
+                    VOICE_DELIVERY_COMMITTED_SESSION_KEY,
+                    None,
+                )
 
     def _retract_stale_coalesced(self, callbacks: list) -> bool:
         """Pull-model staleness sweep for a delivery-point snapshot.
@@ -2097,7 +2119,9 @@ class ProactiveMixin:
         from the ambient latest-frame cache. ``on_native_media_committed`` is
         invoked after the first irreversible native item so the caller can make
         its paired callback text durable even if a later image fails. A durable
-        callback skips media on retry and completes only its paired text.
+        callback skips media only when retrying on that same session and
+        completes only its paired text. A different promoted session has no
+        access to the old conversation item, so it re-streams the media.
         Standard StepFun instead returns a callback-owned VISION_MODEL
         description; this method queues that
         description in ``events_before_text`` so it shares the callback text's
@@ -2120,12 +2144,17 @@ class ProactiveMixin:
         si = getattr(session, "stream_image", None)
         if si is None:
             return True
+        session_token = self._voice_delivery_session_token(session)
         all_ok = True
         registered_description_event_ids: list[str] = []
         for cb in callbacks:
             if not isinstance(cb, dict):
                 continue
-            if cb.get(VOICE_DELIVERY_COMMITTED_KEY):
+            if (
+                cb.get(VOICE_DELIVERY_COMMITTED_KEY)
+                and cb.get(VOICE_DELIVERY_COMMITTED_SESSION_KEY)
+                is session_token
+            ):
                 continue
             images = cb.get("media_images")
             if not images:
@@ -2211,7 +2240,8 @@ class ProactiveMixin:
                 except Exception as e:
                     # Before the first native commit, retain the full set for a
                     # later session. After a native commit, the durable marker
-                    # makes the retry skip media and finish only paired text.
+                    # makes retries on this session skip media and finish only
+                    # paired text; another session re-streams the full set.
                     logger.warning(
                         "[%s] proactive media stream_image failed "
                         "(streamed %d/%d, committed=%s, type=%s); "
@@ -2225,8 +2255,9 @@ class ProactiveMixin:
                     all_ok = False
                     break
             # media_images remains attached until successful delivery removes
-            # the callback. The committed marker determines whether a retry
-            # re-streams (waiting) or completes text only (committed).
+            # the callback. The committed session token determines whether a
+            # retry re-streams (different session) or completes text only
+            # (same session).
         if not all_ok:
             for event_id in registered_description_event_ids:
                 session._inject_rejection_handlers.pop(event_id, None)

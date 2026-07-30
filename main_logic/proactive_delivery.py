@@ -69,6 +69,9 @@ logger = logging.getLogger("main_logic.proactive_delivery")
 DELIVERY_ACK_FUTURE_KEY = "_proactive_delivery_ack_future"
 DELIVERY_RETRACTED_KEY = "_proactive_delivery_retracted"
 VOICE_DELIVERY_COMMITTED_KEY = "_voice_delivery_committed"
+VOICE_DELIVERY_COMMITTED_SESSION_KEY = (
+    "_voice_delivery_committed_session_token"
+)
 DELIVERY_DEADLINE_KEY = "_proactive_delivery_deadline"
 DELIVERY_CLAIM_TOKEN_KEY = "_proactive_delivery_claim_token"
 

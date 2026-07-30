@@ -861,6 +861,85 @@ async def test_voice_mode_preserves_committed_media_when_gate_closes_after_uploa
     assert mgr._proactive_delivery_claims == {}
 
 
+async def test_voice_mode_restreams_committed_media_after_session_swap():
+    old_session = _make_voice_sess()
+    new_session = _make_voice_sess()
+    streamed_images: list[tuple[str, str]] = []
+    mgr = _make_mgr(session=old_session)
+    mgr._schedule_proactive_retry = MagicMock()
+
+    async def _stream_old(
+        image,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        on_rejected=None,
+    ):
+        streamed_images.append(("old", image))
+        assert bypass_rate_limit is True
+        assert cache_latest is False
+        assert on_rejected is not None
+        mgr.session = new_session
+
+    async def _stream_new(
+        image,
+        *,
+        bypass_rate_limit=False,
+        cache_latest=True,
+        on_rejected=None,
+    ):
+        streamed_images.append(("new", image))
+        assert bypass_rate_limit is True
+        assert cache_latest is False
+        assert on_rejected is not None
+
+    old_session.stream_image = _stream_old
+    new_session.stream_image = _stream_new
+    token = object()
+    cb = {
+        "_callback_delivery_id": "id-media-session-swap",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: time.monotonic() + 1.0,
+        "status": "completed",
+        "summary": "describe image after session swap",
+        "media_images": ["image-b64"],
+    }
+    extra = {
+        "_callback_delivery_id": "id-media-session-swap",
+        DELIVERY_CLAIM_TOKEN_KEY: token,
+        DELIVERY_DEADLINE_KEY: cb[DELIVERY_DEADLINE_KEY],
+    }
+    mgr.pending_agent_callbacks = [cb]
+    mgr.pending_extra_replies = [extra]
+
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is False
+    assert streamed_images == [("old", "image-b64")]
+    assert old_session.injected == []
+    assert cb["_voice_delivery_committed"] is True
+    assert mgr.pending_agent_callbacks == [cb]
+    assert mgr.pending_extra_replies == [extra]
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
+
+    mgr._schedule_proactive_retry.reset_mock()
+    delivered = await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+
+    assert delivered is True
+    assert streamed_images == [
+        ("old", "image-b64"),
+        ("new", "image-b64"),
+    ]
+    assert len(new_session.injected) == 1
+    assert "describe image after session swap" in new_session.injected[0]
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
+    assert mgr._proactive_delivery_claims == {}
+    mgr._schedule_proactive_retry.assert_not_called()
+
+
 async def _assert_partial_native_media_commit_is_durable(
     monkeypatch,
     *,
