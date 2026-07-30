@@ -280,6 +280,7 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     )
     sess.stream_image = AsyncMock()
     mgr = _make_mgr(session=sess)
+    mgr._schedule_proactive_retry = MagicMock()
     cb = {
         "_callback_delivery_id": "id-vad-during-rotation",
         "status": "completed",
@@ -299,6 +300,9 @@ async def test_voice_mode_sid_rotation_rechecks_user_activity_before_media():
     assert mgr.pending_agent_callbacks == [cb]
     assert cb.get("_voice_delivery_committed") is None
     assert mgr._proactive_delivery_claims == {}
+    mgr._schedule_proactive_retry.assert_called_once_with(
+        mgr.proactive_manager.min_gap_s
+    )
 
 
 async def test_voice_mode_sid_rotation_failure_arms_callback_retry():
@@ -328,6 +332,54 @@ async def test_voice_mode_sid_rotation_failure_arms_callback_retry():
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
+
+
+async def _assert_voice_mode_cancellation_releases_direct_claim(cancel_at):
+    sess = _make_voice_sess()
+    mgr = _make_mgr(session=sess)
+    cb = {
+        "_callback_delivery_id": f"id-cancel-{cancel_at}",
+        "status": "completed",
+        "summary": "retry after cancellation",
+        "media_images": ["callback-image"],
+    }
+    mgr.pending_agent_callbacks = [cb]
+
+    if cancel_at == "rotation":
+        sess.on_sid_rotate = AsyncMock(side_effect=asyncio.CancelledError())
+    elif cancel_at == "media":
+        mgr._stream_cb_media = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+    else:
+        async def _cancel_inject(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        mgr._stream_cb_media = AsyncMock(return_value=True)
+        sess.inject_text_and_request_response = _cancel_inject
+
+    try:
+        await core_module.LLMSessionManager.trigger_agent_callbacks(mgr)
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("cancellation must propagate")
+
+    assert mgr.pending_agent_callbacks == [cb]
+    assert mgr._proactive_delivery_claims == {}
+    assert cb.get("_voice_delivery_committed") is None
+
+
+async def test_voice_mode_sid_rotation_cancellation_releases_direct_claim():
+    await _assert_voice_mode_cancellation_releases_direct_claim("rotation")
+
+
+async def test_voice_mode_media_cancellation_releases_direct_claim():
+    await _assert_voice_mode_cancellation_releases_direct_claim("media")
+
+
+async def test_voice_mode_inject_cancellation_releases_direct_claim():
+    await _assert_voice_mode_cancellation_releases_direct_claim("inject")
 
 
 async def _assert_voice_mode_retraction_before_media_releases_direct_claim(

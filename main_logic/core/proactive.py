@@ -1064,6 +1064,9 @@ class ProactiveMixin:
                     try:
                         await voice_sess.on_sid_rotate()
                     except asyncio.CancelledError:
+                        self._release_delivery_claims(
+                            claimed_voice_snapshot, "direct"
+                        )
                         raise
                     except Exception as exc:
                         logger.warning(
@@ -1095,6 +1098,9 @@ class ProactiveMixin:
                     self._release_delivery_claims(
                         claimed_voice_snapshot, "direct"
                     )
+                    self._schedule_proactive_retry(
+                        self.proactive_manager.min_gap_s
+                    )
                     return False
                 # Rotation awaited outside the media-commit boundary. A newer
                 # same-key callback may have retracted this snapshot while the
@@ -1123,6 +1129,9 @@ class ProactiveMixin:
                     )
                 except BaseException:
                     self._clear_voice_delivery_committed(voice_commit_snapshot)
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
                     raise
                 if not media_ok:
                     self._clear_voice_delivery_committed(voice_commit_snapshot)
@@ -1262,6 +1271,9 @@ class ProactiveMixin:
                     self._clear_voice_delivery_committed(
                         voice_commit_snapshot
                     )
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
                     raise
                 try:
                     inject_kwargs = {
@@ -1273,6 +1285,11 @@ class ProactiveMixin:
                         instruction,
                         **inject_kwargs,
                     )
+                except asyncio.CancelledError:
+                    self._release_delivery_claims(
+                        claimed_voice_snapshot, "direct"
+                    )
+                    raise
                 except NotImplementedError:
                     # Defensive fallback. As of now every realtime provider
                     # (OpenAI / GLM / Step / free / GPT / Qwen / Grok via
