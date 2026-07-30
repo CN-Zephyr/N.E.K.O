@@ -37,6 +37,7 @@ from main_logic.proactive_delivery import (
     DELIVERY_DEADLINE_KEY,
     DELIVERY_RETRACTED_KEY,
     VOICE_DELIVERY_COMMITTED_KEY,
+    VOICE_DELIVERY_COMMITTED_SESSION_KEY,
 )
 from main_logic.session_state import (
     ProactivePhase,
@@ -1720,6 +1721,8 @@ async def test_voice_mode_callback_image_rejection_before_inject_keeps_cb():
     assert sess.inject_calls == 0
     assert mgr.pending_agent_callbacks == [cb]
     assert mgr.pending_extra_replies == [extra]
+    assert VOICE_DELIVERY_COMMITTED_KEY not in cb
+    assert VOICE_DELIVERY_COMMITTED_SESSION_KEY not in cb
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
@@ -1925,6 +1928,7 @@ async def test_voice_mode_callback_image_rejection_after_ack_is_ignored():
 async def test_voice_mode_rejected_committed_media_preserves_paired_callback():
     sess = _make_voice_sess()
     image_rejections = []
+    streamed_images = []
 
     async def _stream_image(
         _image_b64,
@@ -1935,6 +1939,7 @@ async def test_voice_mode_rejected_committed_media_preserves_paired_callback():
     ):
         assert bypass_rate_limit is True
         assert cache_latest is False
+        streamed_images.append(_image_b64)
         image_rejections.append(on_rejected)
 
     sess.stream_image = _stream_image
@@ -1967,11 +1972,19 @@ async def test_voice_mode_rejected_committed_media_preserves_paired_callback():
     assert future.done() is False
     assert mgr.pending_agent_callbacks == [old_cb]
     assert mgr.pending_extra_replies == [old_extra]
-    assert old_cb["_voice_delivery_committed"] is True
-    assert old_extra["_voice_delivery_committed"] is True
+    assert old_cb[VOICE_DELIVERY_COMMITTED_KEY] is True
+    assert old_extra[VOICE_DELIVERY_COMMITTED_KEY] is True
+    assert VOICE_DELIVERY_COMMITTED_SESSION_KEY not in old_cb
+    assert VOICE_DELIVERY_COMMITTED_SESSION_KEY not in old_extra
     mgr._schedule_proactive_retry.assert_called_once_with(
         mgr.proactive_manager.min_gap_s
     )
+
+    assert await core_module.LLMSessionManager.trigger_agent_callbacks(mgr) is True
+    assert streamed_images == ["old-weather-image", "old-weather-image"]
+    assert len(sess.injected) == 2
+    assert mgr.pending_agent_callbacks == []
+    assert mgr.pending_extra_replies == []
 
 
 async def test_voice_mode_coalescing_queues_newer_cue_after_media_commit():

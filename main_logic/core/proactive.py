@@ -1102,9 +1102,20 @@ class ProactiveMixin:
                     # the loop-free turn-end hook.
                     return True
 
-                def _on_voice_media_rejected(error_msg: str) -> None:
+                def _on_voice_media_rejected(
+                    error_msg: str,
+                    callback: dict,
+                ) -> None:
                     if not _on_voice_inject_rejected(error_msg):
                         return
+                    # The durable transaction boundary still protects this
+                    # callback from TTL/coalescing, but the rejected native
+                    # item is not present in this session. Forget only the
+                    # session association so the queued retry re-streams this
+                    # callback's media without reviving expiry semantics.
+                    self._clear_voice_delivery_committed_session(
+                        _entries_for_voice_callback(callback)
+                    )
                     # Unlike response_already_active, a rejected image may
                     # arrive after the following text response has already
                     # completed. Its response.done hook may also run before
@@ -1961,6 +1972,12 @@ class ProactiveMixin:
                 callback[VOICE_DELIVERY_COMMITTED_SESSION_KEY] = session_token
 
     @staticmethod
+    def _clear_voice_delivery_committed_session(callbacks: list) -> None:
+        for callback in callbacks:
+            if isinstance(callback, dict):
+                callback.pop(VOICE_DELIVERY_COMMITTED_SESSION_KEY, None)
+
+    @staticmethod
     def _clear_voice_delivery_committed(callbacks: list) -> None:
         for callback in callbacks:
             if isinstance(callback, dict):
@@ -2122,6 +2139,9 @@ class ProactiveMixin:
         callback skips media only when retrying on that same session and
         completes only its paired text. A different promoted session has no
         access to the old conversation item, so it re-streams the media.
+        ``on_rejected`` receives the provider error plus the owning callback;
+        a rejection observed before ``stream_image`` returns prevents that item
+        from being marked committed.
         Standard StepFun instead returns a callback-owned VISION_MODEL
         description; this method queues that
         description in ``events_before_text`` so it shares the callback text's
@@ -2166,6 +2186,18 @@ class ProactiveMixin:
                 True,
             )
             for b64 in list(images):
+                image_rejection_state = {"rejected": False}
+                image_rejection_handler = None
+                if on_rejected is not None:
+                    def _on_image_rejected(
+                        error_msg: str,
+                        _callback=cb,
+                        _state=image_rejection_state,
+                    ) -> None:
+                        _state["rejected"] = True
+                        on_rejected(error_msg, _callback)
+
+                    image_rejection_handler = _on_image_rejected
                 try:
                     # Deliberate cue image: bypass the native-vision frame-rate
                     # throttle so it isn't silently dropped behind a recent
@@ -2174,10 +2206,13 @@ class ProactiveMixin:
                         b64,
                         bypass_rate_limit=True,
                         cache_latest=False,
-                        on_rejected=on_rejected,
+                        on_rejected=image_rejection_handler,
                     )
                     if supports_native:
-                        if on_native_media_committed is not None:
+                        if (
+                            not image_rejection_state["rejected"]
+                            and on_native_media_committed is not None
+                        ):
                             on_native_media_committed(cb)
                     else:
                         if not isinstance(description, str) or not description.strip():
