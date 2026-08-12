@@ -270,7 +270,7 @@ class AsrRuntimeMixin:
             str,
             int,
             int,
-            int,
+            object,
         ] | None = None
         # Identity of the independent-ASR turn that owns the frontend's
         # singleton preview bubble, plus its last rendered text. Both are
@@ -1229,11 +1229,11 @@ class AsrRuntimeMixin:
         tests, and narrow manager doubles do not carry the notify mixin at all.
         """
 
+        display_delivered = bool(await self.send_status(message))
         voice_owner_resolver = getattr(self, "_voice_owner_socket", None)
         voice_owner_socket = (
             voice_owner_resolver() if callable(voice_owner_resolver) else None
         )
-        display_delivered = bool(await self.send_status(message))
         send_to_voice_owner = getattr(self, "_send_to_voice_owner", None)
         if voice_owner_socket is None or not callable(send_to_voice_owner):
             return display_delivered
@@ -1336,7 +1336,7 @@ class AsrRuntimeMixin:
 
     def _blocked_text_mode_microphone_episode(
         self,
-    ) -> tuple[int, str, int, int, int] | None:
+    ) -> tuple[int, str, int, int, object] | None:
         if (
             str(getattr(self, "input_mode", "audio") or "audio") != "text"
             or self._asr_route_mode != "blocked"
@@ -1347,7 +1347,7 @@ class AsrRuntimeMixin:
             self._voice_lease_connection_id,
             self._voice_lease_generation,
             self._microphone_route_generation,
-            id(getattr(self, "session", None)),
+            getattr(self, "session", None),
         )
 
     async def _enqueue_audio_stream_data(self, message: dict) -> None:

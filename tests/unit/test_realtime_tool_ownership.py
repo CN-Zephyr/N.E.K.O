@@ -1468,8 +1468,12 @@ async def test_gemini_cancellation_suppresses_a_completed_unsent_call(monkeypatc
         provider_session=session,
         connection_generation=client._connection_generation,
     )
+    first_retired = asyncio.Event()
+    first_task = next(iter(client._tool_tasks_by_call_id["call-a"]))
+    first_task.add_done_callback(lambda _task: first_retired.set())
     await asyncio.wait_for(first_finished.wait(), timeout=1)
     await asyncio.wait_for(second_started.wait(), timeout=1)
+    await asyncio.wait_for(first_retired.wait(), timeout=1)
     assert "call-a" not in client._tool_tasks_by_call_id
 
     await client._process_gemini_response(

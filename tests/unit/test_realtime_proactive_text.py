@@ -872,6 +872,25 @@ async def test_gemini_cancelled_wait_observes_boundary_completion(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_cancel_response_honors_send_guard():
+    client = _make_client(api_type="gemini", model="gemini-live")
+    client._gemini_session = AsyncMock()
+
+    await client.cancel_response(send_guard=lambda: False)
+
+    client._gemini_session.send_client_content.assert_not_awaited()
+
+    await client.cancel_response(send_guard=lambda: True)
+
+    client._gemini_session.send_client_content.assert_awaited_once_with(
+        turns=None,
+        turn_complete=False,
+    )
+    await client.close()
+
+
+@pytest.mark.unit
 async def test_gemini_cancelled_send_quarantines_until_terminal():
     client = _make_client(api_type="gemini", model="gemini-live")
     client._gemini_session = AsyncMock()

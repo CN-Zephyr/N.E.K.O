@@ -1382,6 +1382,8 @@ class _ResponseMixin:
         if self._is_gemini:
             if self._gemini_session is None:
                 return
+            if send_guard is not None and not send_guard():
+                return
             # Gemini Live has no response.cancel event. Any client_content
             # interrupts current generation; leaving turn_complete false avoids
             # immediately starting a replacement model turn.

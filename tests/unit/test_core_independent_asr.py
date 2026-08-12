@@ -7932,6 +7932,39 @@ async def test_blocked_text_notice_commits_only_for_current_connection() -> None
     assert runtime._blocked_text_mode_microphone_signal_state is not None
 
 
+async def test_voice_control_status_resolves_owner_after_display_delivery() -> None:
+    runtime = _Runtime()
+    voice_owner = None
+
+    async def deliver_display(_message: str) -> bool:
+        nonlocal voice_owner
+        voice_owner = object()
+        return True
+
+    runtime.send_status = AsyncMock(side_effect=deliver_display)
+    runtime._voice_owner_socket = MagicMock(side_effect=lambda: voice_owner)
+    runtime._send_to_voice_owner = AsyncMock(side_effect=lambda _payload: voice_owner)
+
+    delivered = await runtime._send_voice_control_status("lease changed")
+
+    assert delivered is True
+    runtime._send_to_voice_owner.assert_awaited_once_with(
+        {"type": "status", "message": "lease changed"}
+    )
+
+
+async def test_blocked_text_episode_keeps_session_identity_reference() -> None:
+    runtime = _Runtime()
+    runtime.input_mode = "text"
+    runtime._set_microphone_route("blocked")
+    session = runtime.session
+
+    episode = runtime._blocked_text_mode_microphone_episode()
+
+    assert episode is not None
+    assert episode[-1] is session
+
+
 async def test_cancelled_blocked_text_notice_retries_same_episode() -> None:
     runtime = _Runtime()
     runtime.input_mode = "text"
