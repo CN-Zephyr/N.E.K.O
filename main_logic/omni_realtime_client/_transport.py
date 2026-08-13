@@ -2340,6 +2340,10 @@ class _TransportMixin:
         # transcript/audio state is fresh too; its image branch deliberately
         # preserves a completed annotation for an unconsumed cached frame.
         self._clear_turn_response_state()
+        # Keep this separate from the ordinary response.done reset: no-VAD
+        # tool results still need their provider-turn snapshot after done, but
+        # a replacement connection must never inherit the retired snapshot.
+        self._current_turn_host_id = None
         self._reset_per_turn_output_state()
         self._current_response_transcript = ""
         self._is_first_text_chunk = True

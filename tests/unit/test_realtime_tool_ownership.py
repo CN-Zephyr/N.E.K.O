@@ -384,6 +384,51 @@ async def test_raw_tool_result_for_the_current_owner_still_sends() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_replacement_without_response_created_drops_retired_turn_guard() -> None:
+    host_turn = ["retired-turn"]
+    handler_called = asyncio.Event()
+
+    async def handler(call):
+        handler_called.set()
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        get_host_turn_id=lambda: host_turn[0],
+        on_tool_call=handler,
+    )
+    retired = _QueueSocket()
+    client.ws = retired
+    client._on_connection_attached()
+    client._current_turn_host_id = host_turn[0]
+
+    host_turn[0] = "replacement-turn"
+    replacement = _QueueSocket()
+    client.ws = replacement
+    client._on_connection_attached()
+    assert client._current_turn_host_id is None
+
+    receive_loop = asyncio.create_task(client.handle_messages())
+    replacement.feed(_raw_tool_event())
+    await asyncio.wait_for(handler_called.wait(), timeout=1)
+    await _wait_for_tool_tasks(client)
+
+    assert [event["type"] for event in replacement.sent] == [
+        "conversation.item.create",
+        "response.create",
+    ]
+    replacement.feed({"type": "response.created", "response": {"id": "tool-response"}})
+    replacement.feed({"type": "response.done", "response": {"id": "tool-response"}})
+    await client._response_arbiter.wait_until_idle(timeout=1)
+    replacement.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_raw_tool_result_cannot_cross_connection() -> None:
     started = asyncio.Event()
     cancelled = asyncio.Event()
