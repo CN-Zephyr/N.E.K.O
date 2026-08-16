@@ -340,6 +340,7 @@ def _resolve_plugin_id_conflict(
         logger: 日志记录器
         config_path: 当前插件的配置文件路径（可选，用于哈希计算）
         entry_point: 当前插件的入口点（可选，用于哈希计算）
+        enable_rename: 是否允许为冲突 ID 生成数字后缀；None 保留旧全局策略
         plugin_data: 当前插件的配置数据（可选，用于哈希计算）
     
     Returns:
@@ -447,7 +448,9 @@ def register_plugin(
     plugin: PluginMeta,
     logger: Optional[Any] = None,  # loguru.Logger or logging.Logger
     config_path: Optional[Path] = None,
-    entry_point: Optional[str] = None
+    entry_point: Optional[str] = None,
+    *,
+    enable_rename: Optional[bool] = None,
 ) -> Optional[str]:
     """
     注册插件到注册表
@@ -485,7 +488,11 @@ def register_plugin(
         entry_point=entry_point,
         plugin_data=plugin_data,
         purpose="register",
-        enable_rename=bool(PLUGIN_ENABLE_ID_CONFLICT_CHECK),
+        enable_rename=(
+            bool(PLUGIN_ENABLE_ID_CONFLICT_CHECK)
+            if enable_rename is None
+            else bool(enable_rename)
+        ),
     )
     
     # 如果返回 None，说明是重复加载，不应该注册

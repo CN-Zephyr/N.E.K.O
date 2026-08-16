@@ -80,6 +80,7 @@ class PluginCliInstallPlanResponse(BaseModel):
     confirmation_token: str = ""
     reason: str = ""
     legacy_plugin_ids: list[str] = Field(default_factory=list)
+    target_ownership: str = Field(pattern="^(new|managed|unmanaged)$")
 
 
 class PluginCliAnalyzeRequest(BaseModel):
@@ -142,6 +143,7 @@ class PluginCliInspectedPluginResponse(BaseModel):
     plugin_id: str
     archive_path: str
     has_plugin_toml: bool
+    version: str = ""
 
 
 class PluginCliDependencyPluginResponse(BaseModel):
@@ -189,6 +191,12 @@ class PluginCliInstalledPluginResponse(BaseModel):
     renamed: bool
 
 
+class PluginCliActivationResponse(BaseModel):
+    status: str
+    plugin_ids: list[str]
+    reason: str
+
+
 class PluginCliInstallResponse(BaseModel):
     package_path: str
     package_type: str
@@ -206,6 +214,7 @@ class PluginCliInstallResponse(BaseModel):
     restarted: bool = False
     rollback_status: str = "not_needed"
     install_source_warning: str | None = None
+    activation: PluginCliActivationResponse | None = None
 
 
 class PluginCliSharedDependencyResponse(BaseModel):

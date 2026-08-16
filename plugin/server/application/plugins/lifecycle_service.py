@@ -6,6 +6,7 @@ import math
 import re
 import shutil
 import time as time_module
+import uuid
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
@@ -39,6 +40,16 @@ from plugin.logging_config import get_logger
 from plugin.server.domain import IO_RUNTIME_ERRORS, RUNTIME_ERRORS
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.application.plugins.registry_service import PluginRegistryService
+from plugin.server.application.install_source import get_install_source_manager
+from plugin.server.application.plugins.inventory_store import (
+    capture_inventory_snapshot,
+    get_inventory_resolution,
+    mark_plugin_deleted,
+    remove_user_installation,
+    restore_inventory_snapshot,
+)
+from plugin.server.application.plugins.mutation_guard import plugin_mutation_guard
+from plugin.server.application.plugins.upgrade_support import await_cancellation_safe
 from plugin.server.infrastructure.config_resolver import resolve_plugin_config_from_path
 from plugin.server.infrastructure.runtime_overrides import (
     RuntimeOverridePersistenceError,
@@ -309,6 +320,18 @@ def _get_plugin_config_path(plugin_id: str) -> Path | None:
     normalized_plugin_id = plugin_id.strip()
     if not _PLUGIN_ID_PATTERN.fullmatch(normalized_plugin_id):
         return None
+    canonical_plugin_id = normalized_plugin_id.casefold()
+    inventory = get_inventory_resolution()
+    if canonical_plugin_id in inventory.deleted_plugin_ids:
+        return None
+
+    active_user_directory = inventory.active_user_directories.get(canonical_plugin_id)
+    if active_user_directory is not None and len(PLUGIN_CONFIG_ROOTS) > 1:
+        for root in PLUGIN_CONFIG_ROOTS[1:]:
+            resolved_root = root.resolve()
+            config_file = (resolved_root / active_user_directory / "plugin.toml").resolve()
+            if resolved_root in config_file.parents and config_file.exists():
+                return config_file
 
     for root in PLUGIN_CONFIG_ROOTS:
         resolved_root = root.resolve()
@@ -348,6 +371,30 @@ def _path_within_plugin_roots_sync(path: Path) -> bool:
     return False
 
 
+def _plugin_root_kind_sync(path: Path) -> str | None:
+    """Return ``builtin`` or ``user`` for a plugin directory.
+
+    Production always has the built-in root first and the writable user root
+    second.  A single-root test/legacy configuration is treated as writable.
+    """
+
+    try:
+        resolved_path = path.resolve()
+    except Exception:
+        resolved_path = path
+    roots = tuple(PLUGIN_CONFIG_ROOTS)
+    for index, root in enumerate(roots):
+        try:
+            resolved_root = root.resolve()
+        except Exception:
+            resolved_root = root
+        if resolved_root in resolved_path.parents:
+            if len(roots) > 1 and index == 0:
+                return "builtin"
+            return "user"
+    return None
+
+
 def _remove_plugin_metadata_sync(plugin_id: str) -> bool:
     removed = False
     with state.acquire_plugins_write_lock():
@@ -362,8 +409,107 @@ def _remove_plugin_metadata_sync(plugin_id: str) -> bool:
 def _delete_plugin_directory_sync(plugin_dir: Path) -> bool:
     if not plugin_dir.exists():
         return False
-    shutil.rmtree(plugin_dir)
+    backup_root = plugin_dir.parent / ".delete-backups"
+    backup_dir = backup_root / plugin_dir.name
+    backup_root.mkdir(parents=True, exist_ok=True)
+    if backup_dir.exists():
+        raise FileExistsError(backup_dir)
+    plugin_dir.rename(backup_dir)
+    preserved_state_names = {"config", "data", "cache"}
+    try:
+        state_children = tuple(
+            child
+            for child in backup_dir.iterdir()
+            if child.name.casefold() in preserved_state_names
+            and child.is_dir()
+            and not child.is_symlink()
+        )
+        if state_children:
+            plugin_dir.mkdir(parents=True)
+            for child in state_children:
+                child.rename(plugin_dir / child.name)
+    except BaseException:
+        if plugin_dir.exists():
+            for child in tuple(plugin_dir.iterdir()):
+                child.rename(backup_dir / child.name)
+            plugin_dir.rmdir()
+        backup_dir.rename(plugin_dir)
+        try:
+            backup_root.rmdir()
+        except OSError:
+            pass
+        raise
     return True
+
+
+def _capture_delete_rollback_snapshot_sync(plugin_dir: Path) -> Path:
+    backup_root = plugin_dir.parent / ".delete-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    snapshot = backup_root / f"{plugin_dir.name}.rollback.{uuid.uuid4().hex}"
+    try:
+        shutil.copytree(plugin_dir, snapshot, symlinks=True)
+        return snapshot
+    except BaseException:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def _restore_delete_rollback_snapshot_sync(
+    plugin_dir: Path,
+    rollback_snapshot: Path | None,
+) -> None:
+    if rollback_snapshot is None or not rollback_snapshot.is_dir():
+        raise FileNotFoundError("plugin delete rollback snapshot is missing")
+    transaction_backup = plugin_dir.parent / ".delete-backups" / plugin_dir.name
+    for path in (plugin_dir, transaction_backup):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    rollback_snapshot.rename(plugin_dir)
+    try:
+        transaction_backup.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _finalize_delete_transaction_sync(
+    plugin_dir: Path,
+    rollback_snapshot: Path | None,
+) -> None:
+    backup_root = plugin_dir.parent / ".delete-backups"
+    for path in (backup_root / plugin_dir.name, rollback_snapshot):
+        if path is None:
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    try:
+        backup_root.rmdir()
+    except OSError:
+        pass
+
+
+def _builtin_plugin_exists_sync(plugin_id: str) -> bool:
+    roots = tuple(PLUGIN_CONFIG_ROOTS)
+    if len(roots) < 2:
+        return False
+    builtin_root = roots[0]
+    if not builtin_root.is_dir():
+        return False
+    canonical_id = plugin_id.casefold()
+    for manifest_path in builtin_root.glob("*/plugin.toml"):
+        try:
+            with manifest_path.open("rb") as handle:
+                raw = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        plugin_table = raw.get("plugin")
+        manifest_id = plugin_table.get("id") if isinstance(plugin_table, dict) else None
+        if isinstance(manifest_id, str) and manifest_id.strip().casefold() == canonical_id:
+            return True
+    return False
 
 
 def _register_or_replace_host_sync(plugin_id: str, host: PluginHostContract) -> int:
@@ -1223,7 +1369,19 @@ class PluginLifecycleService:
             "message": message,
         }
 
-    async def delete_plugin(self, plugin_id: str) -> dict[str, object]:
+    async def delete_plugin(
+        self,
+        plugin_id: str,
+        *,
+        _mutation_guarded: bool = False,
+    ) -> dict[str, object]:
+        if not _mutation_guarded:
+            async with plugin_mutation_guard():
+                return await self.delete_plugin(
+                    plugin_id,
+                    _mutation_guarded=True,
+                )
+
         plugin_meta = await asyncio.to_thread(_get_plugin_meta_sync, plugin_id)
         if plugin_meta is None:
             raise _to_domain_error(
@@ -1253,34 +1411,227 @@ class PluginLifecycleService:
                 plugin_id=plugin_id,
                 error_type="ForbiddenDeletePath",
             )
+        root_kind = await asyncio.to_thread(_plugin_root_kind_sync, plugin_dir)
+        if root_kind is None:
+            raise _to_domain_error(
+                code="PLUGIN_DELETE_FORBIDDEN_PATH",
+                message=f"Plugin '{plugin_id}' path is outside managed plugin roots",
+                status_code=403,
+                plugin_id=plugin_id,
+                error_type="ForbiddenDeletePath",
+            )
 
+        fallback_to_builtin = (
+            root_kind == "user"
+            and await asyncio.to_thread(_builtin_plugin_exists_sync, plugin_id)
+        )
+        source_manager = get_install_source_manager()
+        source_snapshot = source_manager.snapshot() if source_manager is not None else None
+        inventory_snapshot = await asyncio.to_thread(capture_inventory_snapshot)
         is_running = await asyncio.to_thread(_plugin_is_running_sync, plugin_id)
-        if is_running:
-            await self.stop_plugin(plugin_id)
+        runtime_override = await asyncio.to_thread(get_runtime_override, plugin_id)
+        runtime_auto_start = await asyncio.to_thread(
+            get_runtime_auto_start_override,
+            plugin_id,
+        )
+        deleted_from_disk = False
+        rollback_snapshot: Path | None = None
+        committed = False
+        fallback_runtime_started = False
+        fallback_runtime_error: str | None = None
+
+        async def run_sync_mutation(function, /, *args, **kwargs):
+            operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                try:
+                    await await_cancellation_safe(operation)
+                except Exception as operation_exc:
+                    logger.error(
+                        "plugin delete mutation failed while cancellation was pending "
+                        "plugin_id={} err_type={}",
+                        plugin_id,
+                        type(operation_exc).__name__,
+                    )
+                raise
+
+        async def recover_delete() -> tuple[bool, bool, list[str]]:
+            inventory_restored = False
+            runtime_restarted = False
+            recovery_errors: list[str] = []
+            if root_kind == "user":
+                try:
+                    await run_sync_mutation(
+                        _restore_delete_rollback_snapshot_sync,
+                        plugin_dir,
+                        rollback_snapshot,
+                    )
+                except BaseException as recovery_exc:
+                    recovery_errors.append(
+                        f"filesystem_restore:{type(recovery_exc).__name__}"
+                    )
+            if source_manager is not None and source_snapshot is not None:
+                try:
+                    await run_sync_mutation(
+                        source_manager.restore_snapshot_for_rollback,
+                        source_snapshot,
+                    )
+                except BaseException as recovery_exc:
+                    recovery_errors.append(
+                        f"source_restore:{type(recovery_exc).__name__}"
+                    )
+            try:
+                await run_sync_mutation(
+                    restore_inventory_snapshot,
+                    inventory_snapshot,
+                )
+                inventory_restored = True
+            except BaseException as recovery_exc:
+                recovery_errors.append(
+                    f"inventory_restore:{type(recovery_exc).__name__}"
+                )
+            try:
+                if runtime_override is None:
+                    await run_sync_mutation(clear_runtime_override, plugin_id)
+                else:
+                    await run_sync_mutation(
+                        set_runtime_override,
+                        plugin_id,
+                        runtime_override,
+                        auto_start=runtime_auto_start,
+                    )
+            except BaseException as recovery_exc:
+                recovery_errors.append(
+                    f"runtime_override_restore:{type(recovery_exc).__name__}"
+                )
+            try:
+                await plugin_registry_service.refresh_registry()
+            except BaseException as recovery_exc:
+                recovery_errors.append(
+                    f"registry_restore:{type(recovery_exc).__name__}"
+                )
+            if is_running and plugin_dir.exists():
+                try:
+                    await self.start_plugin(plugin_id, refresh_registry=False)
+                    runtime_restarted = True
+                except BaseException as recovery_exc:
+                    recovery_errors.append(
+                        f"runtime_restart:{type(recovery_exc).__name__}"
+                    )
+            return inventory_restored, runtime_restarted, recovery_errors
 
         try:
-            deleted_from_disk = await asyncio.to_thread(_delete_plugin_directory_sync, plugin_dir)
-            await asyncio.to_thread(_pop_plugin_host_sync, plugin_id)
-            await asyncio.to_thread(_remove_event_handlers_sync, plugin_id)
-            await asyncio.to_thread(_remove_plugin_metadata_sync, plugin_id)
-            await asyncio.to_thread(clear_runtime_override, plugin_id)
+            if is_running:
+                await self.stop_plugin(plugin_id)
+            if root_kind == "user":
+                snapshot_operation = asyncio.create_task(
+                    asyncio.to_thread(
+                        _capture_delete_rollback_snapshot_sync,
+                        plugin_dir,
+                    )
+                )
+                try:
+                    rollback_snapshot = await asyncio.shield(snapshot_operation)
+                except asyncio.CancelledError:
+                    rollback_snapshot = await await_cancellation_safe(snapshot_operation)
+                    raise
+                delete_operation = asyncio.create_task(
+                    asyncio.to_thread(_delete_plugin_directory_sync, plugin_dir)
+                )
+                try:
+                    deleted_from_disk = await asyncio.shield(delete_operation)
+                except asyncio.CancelledError:
+                    try:
+                        deleted_from_disk = await await_cancellation_safe(delete_operation)
+                    except Exception as operation_exc:
+                        logger.error(
+                            "plugin delete worker failed while cancellation was pending "
+                            "plugin_id={} err_type={}",
+                            plugin_id,
+                            type(operation_exc).__name__,
+                        )
+                    raise
+                await run_sync_mutation(remove_user_installation, plugin_id)
+                if source_manager is not None:
+                    await run_sync_mutation(
+                        source_manager.mark_removed,
+                        directory_path=plugin_dir,
+                        reason="user_overlay_removed",
+                    )
+            else:
+                await run_sync_mutation(mark_plugin_deleted, plugin_id)
+            await run_sync_mutation(_pop_plugin_host_sync, plugin_id)
+            await run_sync_mutation(_remove_event_handlers_sync, plugin_id)
+            await run_sync_mutation(_remove_plugin_metadata_sync, plugin_id)
+            await run_sync_mutation(clear_runtime_override, plugin_id)
             await plugin_registry_service.refresh_registry()
-        except ServerDomainError:
-            raise
-        except IO_RUNTIME_ERRORS as exc:
-            logger.error(
-                "delete_plugin failed: plugin_id={}, plugin_dir={}, err_type={}, err={}",
-                plugin_id,
-                str(plugin_dir),
-                type(exc).__name__,
-                str(exc),
+            if is_running and fallback_to_builtin:
+                try:
+                    await self.start_plugin(plugin_id, refresh_registry=False)
+                    fallback_runtime_started = True
+                except Exception as fallback_exc:
+                    fallback_runtime_error = type(fallback_exc).__name__
+                    raise
+            committed = True
+            if root_kind == "user":
+                cleanup_operation = asyncio.create_task(
+                    asyncio.to_thread(
+                        _finalize_delete_transaction_sync,
+                        plugin_dir,
+                        rollback_snapshot,
+                    )
+                )
+                try:
+                    await asyncio.shield(cleanup_operation)
+                except asyncio.CancelledError:
+                    await await_cancellation_safe(cleanup_operation)
+                    raise
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "plugin delete backup cleanup failed plugin_id={} err_type={}",
+                        plugin_id,
+                        type(cleanup_exc).__name__,
+                    )
+        except asyncio.CancelledError:
+            if committed:
+                raise
+            inventory_restored, runtime_restarted, recovery_errors = (
+                await await_cancellation_safe(recover_delete())
             )
-            raise _to_domain_error(
+            logger.warning(
+                "delete_plugin canceled after cleanup: plugin_id={}, "
+                "inventory_restored={}, runtime_restarted={}, recovery_errors={}",
+                plugin_id,
+                inventory_restored,
+                runtime_restarted,
+                recovery_errors,
+            )
+            raise
+        except Exception as exc:
+            inventory_restored, runtime_restarted, recovery_errors = await recover_delete()
+            logger.error(
+                "delete_plugin failed: plugin_id={}, root_kind={}, err_type={}, "
+                "inventory_restored={}, runtime_restarted={}, recovery_errors={}",
+                plugin_id,
+                root_kind,
+                type(exc).__name__,
+                inventory_restored,
+                runtime_restarted,
+                recovery_errors,
+            )
+            raise ServerDomainError(
                 code="PLUGIN_DELETE_FAILED",
                 message=f"Failed to delete plugin '{plugin_id}'",
                 status_code=500,
-                plugin_id=plugin_id,
-                error_type=type(exc).__name__,
+                details={
+                    "plugin_id": plugin_id,
+                    "error_type": type(exc).__name__,
+                    "inventory_restored": inventory_restored,
+                    "runtime_restarted": runtime_restarted,
+                    "deletion_marker_retained": root_kind == "builtin",
+                    "recovery_errors": recovery_errors,
+                },
             ) from exc
 
         _emit_lifecycle_event(
@@ -1289,6 +1640,14 @@ class PluginLifecycleService:
             data={
                 "plugin_dir": str(plugin_dir),
                 "deleted_from_disk": deleted_from_disk,
+                "builtin_preserved": root_kind == "builtin",
+                "user_data_preserved": True,
+                "deletion_scope": (
+                    "user_overlay" if root_kind == "user" else "logical_plugin"
+                ),
+                "fallback_to_builtin": fallback_to_builtin,
+                "fallback_runtime_started": fallback_runtime_started,
+                "fallback_runtime_error": fallback_runtime_error,
             },
         )
         response: dict[str, object] = {
@@ -1296,6 +1655,14 @@ class PluginLifecycleService:
             "plugin_id": plugin_id,
             "plugin_dir": str(plugin_dir),
             "deleted_from_disk": deleted_from_disk,
+            "builtin_preserved": root_kind == "builtin",
+            "user_data_preserved": True,
+            "deletion_scope": (
+                "user_overlay" if root_kind == "user" else "logical_plugin"
+            ),
+            "fallback_to_builtin": fallback_to_builtin,
+            "fallback_runtime_started": fallback_runtime_started,
+            "fallback_runtime_error": fallback_runtime_error,
             "message": "Plugin deleted successfully",
         }
         return response
