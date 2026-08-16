@@ -31,6 +31,7 @@ export function refreshPluginsRegistry(): Promise<{
   removed_running: string[]
   unchanged: string[]
   failed: Array<{ plugin_id: string; config_path: string; error: string }>
+  resolution_warnings?: Array<{ plugin_id: string; reason: string }>
   scanned_count: number
 }> {
   return post('/plugins/refresh')
@@ -97,6 +98,12 @@ export function deletePlugin(pluginId: string): Promise<{
   plugin_id: string
   plugin_dir: string
   deleted_from_disk: boolean
+  builtin_preserved: boolean
+  user_data_preserved: boolean
+  deletion_scope: 'user_overlay' | 'logical_plugin'
+  fallback_to_builtin: boolean
+  fallback_runtime_started: boolean
+  fallback_runtime_error: string | null
   message: string
 }> {
   const safeId = encodeURIComponent(pluginId)

@@ -177,8 +177,10 @@
             <MarketPluginCard
               :plugin="item"
               :installed="isInstalled(item)"
+              :market-managed="isMarketManaged(item)"
               :installing="installingId === item.id"
               :local-version="getLocalInstalledVersion(item)"
+              :local-source="getLocalInstallSource(item)"
               :yanked="isYanked(item)"
               :upgrading="upgradingId === item.id"
               @click="handlePluginClick(item)"
@@ -310,6 +312,11 @@ import { usePluginStore } from '@/stores/plugin'
 import { useUserPreferenceStore } from '@/stores/userPreference'
 import { narrowMarketChannel } from '@/utils/narrowChannel'
 import { openExternalUrl } from '@/utils/openExternal'
+import {
+  extractRepoPluginId,
+  findLocalPluginForMarket,
+  resolveExpectedMarketPluginId,
+} from '@/utils/marketInstallation'
 
 interface Props {
   embedded?: boolean
@@ -507,6 +514,9 @@ function resolveInstallTaskErrorMessage(task: MarketInstallTask): string {
   if (code === 'version_already_at_target') return t('market.upgradeAlreadyAtTarget')
   if (code === 'upgrade_target_not_greater') return t('market.upgradeTargetNotGreater')
   if (code === 'plugin_not_installed_for_upgrade') return t('market.pluginNotInstalled')
+  if (code === 'PLUGIN_PACKAGE_STATE_CONFLICT') {
+    return t('package.install.error.packageStateConflict')
+  }
   if (code === 'upgrade_rollback_completed') return t('market.upgradeRollback')
   if (code === 'lock_write_failed') return t('market.lockWriteFailed')
   return task.message || task.error || t('market.installFailed')
@@ -534,11 +544,6 @@ const yankCache = new Map<
 >()
 const YANK_TTL_MS = 5 * 60 * 1000
 
-function extractRepoPluginId(githubRepo?: string): string | undefined {
-  const match = githubRepo?.match(/n\.e\.k\.o_plugin_([a-z_][a-z0-9_]*)/i)
-  return match?.[1]
-}
-
 function marketIdentityKeys(plugin: {
   slug?: string
   name?: string
@@ -561,26 +566,20 @@ function marketIdentityKeys(plugin: {
 }
 
 function resolveExpectedTomlId(plugin: Pick<MarketPlugin, 'slug' | 'github_repo'>): string | null {
-  return extractRepoPluginId(plugin.github_repo) || plugin.slug || null
+  return resolveExpectedMarketPluginId(plugin) || null
 }
 
 // ─── 本地插件对比：slug / repo plugin_id / lock 三路配对 ───────────
-const localPluginKeys = computed(() => {
-  const keys = new Set<string>()
-  for (const p of pluginStore.pluginsWithStatus) {
-    const id = String(p.id || '').toLowerCase()
-    const name = String(p.name || '').toLowerCase()
-    if (id) keys.add(id)
-    if (name) keys.add(name)
-  }
-  return keys
-})
+function resolveLocalPlugin(plugin: Pick<MarketPlugin, 'slug' | 'github_repo'>) {
+  return findLocalPluginForMarket(plugin, pluginStore.pluginsWithStatus)
+}
+
+function isMarketManaged(plugin: MarketPlugin): boolean {
+  return marketIdentityKeys(plugin).some((key) => installedByPid.value.has(key))
+}
 
 function isInstalled(plugin: MarketPlugin): boolean {
-  for (const key of marketIdentityKeys(plugin)) {
-    if (installedByPid.value.has(key)) return true
-  }
-  return marketIdentityKeys(plugin).some((key) => localPluginKeys.value.has(key))
+  return isMarketManaged(plugin) || Boolean(resolveLocalPlugin(plugin))
 }
 
 // ─── 工作台：过滤 + 分组 + 布局 ───────────────────────────────────
@@ -1219,11 +1218,17 @@ async function handleUpgrade(plugin: MarketWorkbenchItem) {
  * 用作 MarketPluginCard 的 :local-version prop，让 card 内部走 semver 比较。
  */
 function getLocalInstalledVersion(plugin: MarketWorkbenchItem): string | undefined {
+  const localPlugin = resolveLocalPlugin(plugin)
+  if (localPlugin?.version) return localPlugin.version
   for (const key of marketIdentityKeys(plugin)) {
     const entry = installedByPid.value.get(key)
     if (entry?.installed_version) return entry.installed_version
   }
   return undefined
+}
+
+function getLocalInstallSource(plugin: MarketWorkbenchItem) {
+  return resolveLocalPlugin(plugin)?.install_source?.source || 'unknown'
 }
 
 function isYanked(plugin: MarketWorkbenchItem): boolean {
