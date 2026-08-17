@@ -1263,36 +1263,14 @@ def _collect_plugin_contexts_from_roots(
 
 
 def _prepare_plugin_import_roots(plugin_config_roots: Iterable[Path], logger: Any) -> None:
-    """为用户插件根注入 import 根目录，内置插件保持包内导入。"""
-    try:
-        builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT.resolve()
-    except Exception:
-        builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT
+    """Compatibility hook that intentionally does not mutate ``sys.path``.
 
-    def _is_same_or_within(path: Path, base: Path) -> bool:
-        try:
-            if path == base:
-                return True
-            if hasattr(path, "is_relative_to"):
-                return path.is_relative_to(base)  # type: ignore[attr-defined]
-            return str(path).startswith(str(base))
-        except Exception:
-            return False
+    External plugins are loaded below the isolated ``plugins`` namespace from
+    their selected installation directory. Adding a shared managed or legacy
+    root here would expose every unselected sibling as a top-level module.
+    """
 
-    for plugin_config_root in plugin_config_roots:
-        try:
-            root = plugin_config_root.resolve()
-        except Exception:
-            root = plugin_config_root
-
-        project_root = root.parent
-        if _is_same_or_within(root, builtin_root) or _is_same_or_within(project_root, builtin_root):
-            logger.debug("Skipping built-in plugin import root: {}", root)
-            continue
-        if str(project_root) in sys.path:
-            continue
-        sys.path.insert(0, str(project_root))
-        logger.info("Added plugin import root to sys.path: {}", project_root)
+    del plugin_config_roots, logger
 
 
 def _shutdown_host_safely(host: Any, logger: Any, plugin_id: str) -> None:
@@ -1825,8 +1803,8 @@ def load_plugins_from_roots(
 
     logger.info("Loading plugins from roots: {}", [str(root) for root in roots])
 
-    # plugin.toml 使用 ``plugin.plugins.xxx`` 作为规范入口；用户安装插件运行时会
-    # 通过 normalize_plugin_entry_point 映射到顶层 ``plugins.xxx`` 导入命名空间。
+    # plugin.toml 使用 ``plugin.plugins.xxx`` 作为规范入口；外部插件运行时会
+    # 通过 normalize_plugin_entry_point 映射到其安装根下的顶层包。
     _prepare_plugin_import_roots(roots, logger)
     logger.info("Current working directory: {}", os.getcwd())
     logger.info("Python path (first 3): {}", sys.path[:3])

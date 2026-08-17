@@ -57,6 +57,21 @@ FIXTURE_PLUGINS_ROOT = (
 )
 
 
+async def _confirm_market_task(
+    client: AsyncClient,
+    token: str,
+    task_id: str,
+) -> None:
+    response = await client.post(
+        f"/market/tasks/{task_id}/confirm?token={token}",
+        headers={
+            "host": "127.0.0.1:48911",
+            "origin": "http://127.0.0.1:48911",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
 # ─── Fixture: build a minimal valid .neko-plugin package ──────────────
 
 
@@ -312,30 +327,44 @@ def bridge_e2e_env(
 # ─── Tests ────────────────────────────────────────────────────────────
 
 
-def test_market_task_cleanup_prunes_overflow_workers(
+def test_market_task_cleanup_prunes_only_terminal_workers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Capacity pruning releases both task states and their worker handles."""
+    """Capacity pruning never loses the handle of an active writer."""
     from plugin.server.routes import market_bridge as market_bridge_module
+
+    class _Worker:
+        def __init__(self, *, finished: bool) -> None:
+            self._finished = finished
+
+        def done(self) -> bool:
+            return self._finished
 
     monkeypatch.setattr(market_bridge_module, "_TASK_MAX_ENTRIES", 1)
     monkeypatch.setattr(
         market_bridge_module,
         "_tasks",
         {
-            "old": {"created_at": 1.0, "completed_at": None},
-            "new": {"created_at": 2.0, "completed_at": None},
+            "active": {"created_at": 1.0, "completed_at": None, "status": "installing"},
+            "terminal": {
+                "created_at": 2.0,
+                "completed_at": time.time(),
+                "status": "completed",
+            },
         },
     )
-    workers = {"old": object(), "new": object()}
+    workers = {
+        "active": _Worker(finished=False),
+        "terminal": _Worker(finished=True),
+    }
     monkeypatch.setattr(market_bridge_module, "_task_workers", workers)
 
     market_bridge_module._cleanup_tasks()
 
-    assert "old" not in market_bridge_module._tasks
-    assert "old" not in workers
-    assert "new" in market_bridge_module._tasks
-    assert "new" in workers
+    assert "active" in market_bridge_module._tasks
+    assert "active" in workers
+    assert "terminal" not in market_bridge_module._tasks
+    assert "terminal" not in workers
 
 
 @pytest.mark.asyncio
@@ -369,6 +398,11 @@ async def test_duplicate_market_install_request_reuses_active_task(
     token = str(bridge_e2e_env["token"])
 
     first = await market_bridge_module.market_install(payload, token)
+    await _confirm_market_task(
+        bridge_e2e_env["client"],
+        token,
+        first.task_id,
+    )
     await asyncio.wait_for(started.wait(), timeout=1)
     second = await market_bridge_module.market_install(payload, token)
     conflicting = payload.model_copy(update={"version": "2.0.0"})
@@ -619,6 +653,7 @@ async def test_install_happy_path_writes_v2_lock_entry(
                 "package_sha256": expected_sha256,
                 "payload_hash": expected_payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": version,
                 "channel": "stable",
                 "published_at": "2026-05-16T08:00:00.000000Z",
@@ -628,6 +663,7 @@ async def test_install_happy_path_writes_v2_lock_entry(
         )
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         # Poll until terminal state (≤ 30s; the actual download is local).
         deadline = time.monotonic() + 30
@@ -740,6 +776,7 @@ async def test_market_install_selects_newer_same_id_over_builtin_without_duplica
         )
         assert response.status_code == 200, response.text
         task_id = response.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -838,6 +875,7 @@ async def test_market_install_replaces_same_id_local_import_without_duplicate(
         )
         assert response.status_code == 200, response.text
         task_id = response.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -895,6 +933,7 @@ async def test_installed_endpoint_projects_latest_install_source(
                 "package_sha256": expected_sha256,
                 "payload_hash": payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": version,
                 "channel": "beta",
                 "published_at": "2026-05-16T09:00:00.000000Z",
@@ -903,6 +942,7 @@ async def test_installed_endpoint_projects_latest_install_source(
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -968,6 +1008,7 @@ async def test_built_market_package_install_surfaces_in_plugin_list(
                 "package_sha256": expected_sha256,
                 "payload_hash": build_result.payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": version,
                 "channel": "stable",
                 "published_at": "2026-05-21T08:00:00.000000Z",
@@ -977,6 +1018,7 @@ async def test_built_market_package_install_surfaces_in_plugin_list(
         )
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -1136,6 +1178,7 @@ async def test_authenticated_market_install_reports_usage(
         )
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -3812,12 +3855,14 @@ async def test_install_rejects_sha256_mismatch(
                 "package_url": package_url,
                 "package_sha256": fake_sha,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": version,
                 "channel": "stable",
                 "mode": "install",
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -3861,6 +3906,7 @@ async def test_install_requires_valid_sha256_before_creating_task(
     body: dict[str, Any] = {
         "package_url": "https://example.invalid/plugin.neko-plugin",
         "plugin_id": "missing_hash_plugin",
+        "expected_plugin_toml_id": "missing_hash_plugin",
         "version": "0.0.1",
         "channel": "stable",
         "mode": "install",
@@ -3909,6 +3955,7 @@ async def test_install_identity_match_no_warning(
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -3968,6 +4015,7 @@ async def test_install_identity_mismatch_fails_before_installation(
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -4043,6 +4091,7 @@ async def test_install_conflict_fails_without_renaming_executable_directory(
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -4109,6 +4158,7 @@ async def test_upgrade_happy_path_replaces_lock_entry(
                     "package_sha256": sha,
                     "payload_hash": payload_hash,
                     "plugin_id": plugin_id,
+                    "expected_plugin_toml_id": plugin_id,
                     "version": version,
                     "channel": "stable",
                     "mode": mode,
@@ -4117,6 +4167,7 @@ async def test_upgrade_happy_path_replaces_lock_entry(
             )
             assert resp.status_code == 200, resp.text
             task_id = resp.json()["task_id"]
+            await _confirm_market_task(client, token, task_id)
 
             deadline = time.monotonic() + 30
             final_status: dict[str, Any] | None = None
@@ -4329,6 +4380,7 @@ async def test_upgrade_lifecycle_uses_installed_plugin_id_not_market_id(
     calls: list[tuple[str, str]] = []
 
     async def _wait_task(task_id: str) -> dict[str, Any]:
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4421,6 +4473,7 @@ async def test_install_conflict_defaults_to_failure_without_lock_entry(
     )
 
     async def _wait_task(task_id: str) -> dict[str, Any]:
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4478,6 +4531,7 @@ async def test_upgrade_rejects_plugin_identity_mismatch_before_replacement(
     mgr: InstallSourceManager = bridge_e2e_env["manager"]
 
     async def _wait_task(task_id: str) -> dict[str, Any]:
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4596,6 +4650,7 @@ async def test_failed_market_install_cleans_promoted_profile_dir(
         )
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4623,6 +4678,7 @@ async def test_failed_market_install_cleans_promoted_profile_dir(
         )
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
 
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
@@ -4659,6 +4715,7 @@ async def test_upgrade_rejects_when_not_installed(
             "package_url": "http://127.0.0.1:1/never_used.neko-plugin",
             "package_sha256": "f" * 64,
             "plugin_id": "e2e_never_installed",
+            "expected_plugin_toml_id": "e2e_never_installed",
             "version": "1.0.0",
             "channel": "stable",
             "mode": "upgrade",
@@ -4701,12 +4758,14 @@ async def test_upgrade_accepts_same_and_older_version_replacements(
                 "package_sha256": current_sha,
                 "payload_hash": current_payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": "2.0.0",
                 "channel": "stable",
                 "mode": "install",
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4725,12 +4784,14 @@ async def test_upgrade_accepts_same_and_older_version_replacements(
                 "package_sha256": current_sha,
                 "payload_hash": current_payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": "2.0.0",
                 "channel": "stable",
                 "mode": "upgrade",
             },
         )
         same_task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, same_task_id)
         deadline = time.monotonic() + 30
         same_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -4757,12 +4818,14 @@ async def test_upgrade_accepts_same_and_older_version_replacements(
                 "package_sha256": target_sha,
                 "payload_hash": target_payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": "1.0.0",
                 "channel": "stable",
                 "mode": "upgrade",
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -4820,12 +4883,14 @@ async def test_upgrade_rollback_on_download_failure(
                 "package_sha256": v1_sha,
                 "payload_hash": v1_payload_hash,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": "1.0.0",
                 "channel": "stable",
                 "mode": "install",
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             poll = await client.get(f"/market/tasks/{task_id}?token={token}")
@@ -4854,6 +4919,7 @@ async def test_upgrade_rollback_on_download_failure(
                 "package_url": broken_url,
                 "package_sha256": "f" * 64,
                 "plugin_id": plugin_id,
+                "expected_plugin_toml_id": plugin_id,
                 "version": "2.0.0",
                 "channel": "stable",
                 "mode": "upgrade",
@@ -4861,6 +4927,7 @@ async def test_upgrade_rollback_on_download_failure(
             },
         )
         task_id = resp.json()["task_id"]
+        await _confirm_market_task(client, token, task_id)
         deadline = time.monotonic() + 30
         final_status: dict[str, Any] | None = None
         while time.monotonic() < deadline:

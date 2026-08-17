@@ -172,6 +172,32 @@ describe('usePackageManager safe installation flow', () => {
     )
   })
 
+  it('never reports success when the installed payload was not activated', async () => {
+    const manager = usePackageManager()
+    manager.installForm.value.package = 'demo.neko-plugin'
+    vi.mocked(planPluginInstall).mockResolvedValue({
+      ...upgradePlan,
+      action: 'install',
+      current_version: '',
+      confirmation_token: '',
+    })
+    vi.mocked(installPluginPackage).mockResolvedValue({
+      ...installResponse,
+      activation: {
+        status: 'blocked',
+        plugin_ids: ['demo_plugin'],
+        reason: 'selected_installation_not_projected',
+      },
+    })
+
+    await manager.handleInstall()
+
+    expect(ElMessage.error).toHaveBeenCalledWith(
+      'package.install.activationBlocked{"reason":"selected_installation_not_projected"}',
+    )
+    expect(ElMessage.success).not.toHaveBeenCalled()
+  })
+
   it('does not install when the user cancels an upgrade', async () => {
     const manager = usePackageManager()
     manager.installForm.value.package = 'demo.neko-plugin'

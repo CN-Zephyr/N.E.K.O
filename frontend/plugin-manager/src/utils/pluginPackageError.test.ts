@@ -2,7 +2,10 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { resolvePluginPackageErrorMessage } from './pluginPackageError'
+import {
+  resolvePluginPackageErrorCodeMessage,
+  resolvePluginPackageErrorMessage,
+} from './pluginPackageError'
 
 const t = (key: string) => key
 
@@ -18,6 +21,13 @@ function responseError(code: string, details?: Record<string, unknown>) {
 }
 
 describe('resolvePluginPackageErrorMessage', () => {
+  it('exposes the same stable code mapping to Market task errors', () => {
+    expect(resolvePluginPackageErrorCodeMessage(
+      'PLUGIN_PACKAGE_IDENTITY_MISMATCH',
+      t,
+    )).toBe('package.install.error.identityMismatch')
+    expect(resolvePluginPackageErrorCodeMessage('UNKNOWN', t)).toBeNull()
+  })
   it.each([
     ['PLUGIN_PACKAGE_INVALID_ARCHIVE', 'package.install.error.invalidArchive'],
     ['PLUGIN_PACKAGE_MANIFEST_MISSING', 'package.install.error.manifestMissing'],

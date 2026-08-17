@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import errno
 import threading
 from contextvars import ContextVar, Token
+import os
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -106,6 +110,10 @@ class _AsyncMutationLock:
 
 
 _MUTATION_LOCK = _AsyncMutationLock()
+_FILE_LOCK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="plugin-mutation-file-lock",
+)
 _MUTATION_DEPTH: ContextVar[int] = ContextVar(
     "plugin_mutation_depth",
     default=0,
@@ -114,6 +122,108 @@ _MUTATION_OWNER: ContextVar[asyncio.Task[Any] | None] = ContextVar(
     "plugin_mutation_owner",
     default=None,
 )
+_FILE_LOCK_RETRY_INTERVAL_SECONDS = 0.05
+
+
+class _FileLockAcquireCancelled(Exception):
+    pass
+
+
+def _mutation_file_lock_path() -> Path:
+    configured = os.environ.get("NEKO_PLUGIN_MUTATION_LOCK_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    from plugin.server.application.plugins.inventory_store import resolve_inventory_path
+
+    return (resolve_inventory_path().parent / ".plugin-mutation.lock").resolve()
+
+
+def _is_file_lock_contention(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or getattr(
+        exc,
+        "winerror",
+        None,
+    ) in {33, 36}
+
+
+def _acquire_file_lock_sync(cancel_event: threading.Event | None = None) -> Any:
+    path = _mutation_file_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _FileLockAcquireCancelled
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover - exercised by Linux CI
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if not _is_file_lock_contention(exc):
+                    raise
+                if cancel_event is not None:
+                    if cancel_event.wait(_FILE_LOCK_RETRY_INTERVAL_SECONDS):
+                        raise _FileLockAcquireCancelled from exc
+                else:
+                    threading.Event().wait(_FILE_LOCK_RETRY_INTERVAL_SECONDS)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _release_file_lock_sync(handle: Any) -> None:
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - exercised by Linux CI
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+async def _acquire_file_lock_cancellation_safe() -> Any:
+    loop = asyncio.get_running_loop()
+    cancel_event = threading.Event()
+    operation = asyncio.ensure_future(
+        loop.run_in_executor(_FILE_LOCK_EXECUTOR, _acquire_file_lock_sync, cancel_event)
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            handle = await asyncio.shield(operation)
+            break
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+            cancel_event.set()
+        except _FileLockAcquireCancelled:
+            if cancellation is None:  # pragma: no cover - internal invariant
+                raise RuntimeError("plugin mutation file lock wait was canceled internally")
+            raise cancellation
+
+    if cancellation is not None:
+        _release_file_lock_sync(handle)
+        raise cancellation
+    return handle
 
 
 class _PluginMutationGuard:
@@ -121,6 +231,7 @@ class _PluginMutationGuard:
         self._token: Token[int] | None = None
         self._owner_token: Token[asyncio.Task[Any] | None] | None = None
         self._acquired = False
+        self._file_lock_handle: Any | None = None
 
     async def __aenter__(self) -> None:
         current_task = asyncio.current_task()
@@ -133,6 +244,12 @@ class _PluginMutationGuard:
 
         await _MUTATION_LOCK.acquire()
         self._acquired = True
+        try:
+            self._file_lock_handle = await _acquire_file_lock_cancellation_safe()
+        except BaseException:
+            self._acquired = False
+            _MUTATION_LOCK.release()
+            raise
         self._owner_token = _MUTATION_OWNER.set(current_task)
         self._token = _MUTATION_DEPTH.set(1)
 
@@ -147,11 +264,24 @@ class _PluginMutationGuard:
         if self._acquired:
             assert self._owner_token is not None
             _MUTATION_OWNER.reset(self._owner_token)
-            _MUTATION_LOCK.release()
+            try:
+                assert self._file_lock_handle is not None
+                _release_file_lock_sync(self._file_lock_handle)
+            finally:
+                _MUTATION_LOCK.release()
         return False
 
 
 def plugin_mutation_guard() -> _PluginMutationGuard:
-    """Serialize plugin filesystem and metadata mutations in this process."""
+    """Serialize plugin filesystem and metadata mutations across processes."""
 
     return _PluginMutationGuard()
+
+
+def plugin_mutation_guard_is_held_by_current_task() -> bool:
+    current_task = asyncio.current_task()
+    return (
+        current_task is not None
+        and _MUTATION_DEPTH.get() > 0
+        and _MUTATION_OWNER.get() is current_task
+    )

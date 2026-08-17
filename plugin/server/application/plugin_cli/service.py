@@ -42,6 +42,7 @@ from plugin.server.application.plugins.inventory_store import (
     capture_inventory_snapshot,
     get_inventory_resolution,
     get_user_installation_package_state_files,
+    record_managed_installation,
     record_user_installation,
     restore_inventory_snapshot,
 )
@@ -58,6 +59,10 @@ from plugin.server.application.plugin_cli.source_resolver import (
     ResolvedPluginSource,
 )
 from plugin.server.domain.errors import ServerDomainError
+from plugin.server.infrastructure.path_safety import (
+    is_link_or_reparse_point,
+    require_resolved_within,
+)
 from plugin.settings import (
     BUILTIN_PLUGIN_CONFIG_ROOT,
     USER_PACKAGE_PROFILES_ROOT,
@@ -129,13 +134,17 @@ def _merge_staged_payload(
     """
 
     moved: list[tuple[Path, Path]] = []
+    source_root = source_dir.resolve(strict=False)
+    target_root = target_dir.resolve(strict=False)
 
     def merge_path(source: Path, target: Path) -> None:
-        if source.is_symlink() or target.is_symlink():
+        if is_link_or_reparse_point(source) or is_link_or_reparse_point(target):
             relative = target.relative_to(target_dir).as_posix()
             raise FileExistsError(
-                f"plugin payload conflicts with preserved state path: {relative}"
+                f"plugin payload contains an unsupported linked path: {relative}"
             )
+        require_resolved_within(source, source_root, field="staged plugin payload")
+        require_resolved_within(target, target_root, field="plugin install target")
         if target.exists():
             if source.is_dir() and target.is_dir():
                 for child in tuple(source.iterdir()):
@@ -153,7 +162,9 @@ def _merge_staged_payload(
             merge_path(child, target_dir / child.name)
     except Exception:
         for source, target in reversed(moved):
-            if target.exists() or target.is_symlink():
+            if target.exists() or is_link_or_reparse_point(target):
+                if is_link_or_reparse_point(target):
+                    raise OSError("plugin rollback target became a linked path")
                 source.parent.mkdir(parents=True, exist_ok=True)
                 target.rename(source)
         raise
@@ -174,13 +185,17 @@ def _merge_staged_profile_preserving_existing(
     """
 
     moved: list[tuple[Path, Path]] = []
+    source_root = source_dir.resolve(strict=False)
+    target_root = target_dir.resolve(strict=False)
 
     def merge_path(source: Path, target: Path) -> None:
-        if source.is_symlink() or target.is_symlink():
+        if is_link_or_reparse_point(source) or is_link_or_reparse_point(target):
             relative = target.relative_to(target_dir).as_posix()
             raise FileExistsError(
                 f"plugin profile contains an unsupported linked path: {relative}"
             )
+        require_resolved_within(source, source_root, field="staged plugin profile")
+        require_resolved_within(target, target_root, field="plugin profile target")
         if target.exists():
             if source.is_dir() and target.is_dir():
                 for child in tuple(source.iterdir()):
@@ -202,7 +217,9 @@ def _merge_staged_profile_preserving_existing(
             merge_path(child, target_dir / child.name)
     except Exception:
         for source, target in reversed(moved):
-            if target.exists() or target.is_symlink():
+            if target.exists() or is_link_or_reparse_point(target):
+                if is_link_or_reparse_point(target):
+                    raise OSError("plugin profile rollback target became a linked path")
                 source.parent.mkdir(parents=True, exist_ok=True)
                 target.rename(source)
         raise
@@ -216,7 +233,7 @@ def _cleanup_operation_created_paths(created_paths: tuple[Path, ...]) -> None:
         key=lambda path: len(path.parts),
         reverse=True,
     ):
-        if created_path.is_dir() and not created_path.is_symlink():
+        if created_path.is_dir() and not is_link_or_reparse_point(created_path):
             shutil.rmtree(created_path, ignore_errors=True)
         else:
             created_path.unlink(missing_ok=True)
@@ -369,18 +386,6 @@ class PluginCliService:
                             "err_type={}",
                             type(worker_exc).__name__,
                         )
-                    await upgrade_support.await_cancellation_safe(
-                        self._rollback_install_state(
-                            source_manager=source_manager,
-                            source_snapshot=source_snapshot,
-                            inventory_snapshot=inventory_snapshot,
-                            saved=None,
-                            unpacked_target_dirs=target_dirs,
-                            unpacked_profile_dirs=profile_dirs,
-                            rollback_created_paths=rollback_created_paths,
-                            delete_saved_package=False,
-                        )
-                    )
                     raise
                 target_dirs = self._extract_unpack_target_dirs(result)
                 profile_dirs = self._extract_unpack_profile_dirs(result)
@@ -402,8 +407,8 @@ class PluginCliService:
                 if not _retain_rollback_metadata:
                     response.pop("_rollback_created_paths", None)
                 return response
-            except asyncio.CancelledError:
-                await upgrade_support.await_cancellation_safe(
+            except asyncio.CancelledError as cancel_exc:
+                recovery_errors = await upgrade_support.await_cancellation_safe(
                     self._rollback_install_state(
                         source_manager=source_manager,
                         source_snapshot=source_snapshot,
@@ -415,6 +420,7 @@ class PluginCliService:
                         delete_saved_package=False,
                     )
                 )
+                self._annotate_cancelled_rollback(cancel_exc, recovery_errors)
                 raise
             except Exception as exc:
                 recovery_errors = await self._await_cleanup_before_cancellation(
@@ -457,11 +463,11 @@ class PluginCliService:
         target_root = (
             _require_within(
                 Path(plugins_root).expanduser().resolve(),
-                policy.user_plugins_root,
+                policy.install_plugins_root,
                 field="plugins_root",
             )
             if plugins_root
-            else policy.user_plugins_root
+            else policy.install_plugins_root
         )
         directory_name = _require_safe_directory_name(
             str(plan_dict["directory_name"]),
@@ -537,7 +543,7 @@ class PluginCliService:
             raise
 
         async def install_new() -> dict[str, object]:
-            return await asyncio.to_thread(
+            return await self._await_sync_mutation(
                 self._install_sync,
                 package=str(package_snapshot),
                 plugins_root=plugins_root,
@@ -604,24 +610,58 @@ class PluginCliService:
                 commit=commit_install,
             )
         except upgrade_support.ReplacePluginError as exc:
-            metadata_rollback_completed = True
-            if source_manager is not None and source_snapshot is not None:
-                try:
-                    await asyncio.to_thread(
-                        source_manager.restore_snapshot_for_rollback,
-                        source_snapshot,
-                    )
-                except Exception:
-                    metadata_rollback_completed = False
-            if inventory_snapshot is not None:
-                try:
-                    await asyncio.to_thread(
-                        restore_inventory_snapshot,
-                        inventory_snapshot,
-                    )
-                except Exception:
-                    metadata_rollback_completed = False
+            if exc.committed:
+                raise ServerDomainError(
+                    code="PLUGIN_REPLACEMENT_COMMITTED_CLEANUP_INCOMPLETE",
+                    message=(
+                        "Plugin replacement was committed, but transaction cleanup "
+                        "did not finish"
+                    ),
+                    status_code=500,
+                    details={
+                        "plugin_id": plan.plugin_id,
+                        "stage": exc.stage,
+                        "committed": True,
+                        "rollback_status": exc.rollback_status,
+                        "error_type": type(exc.cause).__name__,
+                    },
+                ) from exc
+
+            async def restore_replacement_metadata() -> bool:
+                metadata_restored = True
+                if source_manager is not None and source_snapshot is not None:
+                    try:
+                        await asyncio.to_thread(
+                            source_manager.restore_snapshot_for_rollback,
+                            source_snapshot,
+                        )
+                    except Exception:
+                        metadata_restored = False
+                if inventory_snapshot is not None:
+                    try:
+                        await asyncio.to_thread(
+                            restore_inventory_snapshot,
+                            inventory_snapshot,
+                        )
+                    except Exception:
+                        metadata_restored = False
+                return metadata_restored
+
+            metadata_rollback_completed = await self._await_cleanup_before_cancellation(
+                restore_replacement_metadata()
+            )
             cause_code = getattr(exc.cause, "code", None)
+            if isinstance(exc.cause, ServerDomainError):
+                raise ServerDomainError(
+                    code=exc.cause.code,
+                    message=exc.cause.message,
+                    status_code=exc.cause.status_code,
+                    details={
+                        **exc.cause.details,
+                        "rollback_status": exc.rollback_status,
+                        "metadata_rollback_completed": metadata_rollback_completed,
+                    },
+                ) from exc
             if cause_code == "PLUGIN_UPGRADE_PLAN_CHANGED":
                 raise ServerDomainError(
                     code="PLUGIN_UPGRADE_PLAN_CHANGED",
@@ -711,8 +751,15 @@ class PluginCliService:
                 expected_config_paths[plugin_id] = (target_dir / "plugin.toml").resolve()
                 if await upgrade_support.plugin_is_running(plugin_id):
                     running_plugin_ids.append(plugin_id)
+                installation_recorder = (
+                    record_managed_installation
+                    if self._path_policy().managed_plugins_root is not None
+                    and target_dir.parent.resolve(strict=False)
+                    == self._path_policy().install_plugins_root
+                    else record_user_installation
+                )
                 await self._await_sync_mutation(
-                    record_user_installation,
+                    installation_recorder,
                     plugin_id,
                     directory_name=target_dir.name,
                     package_id=str(install_result.get("package_id") or ""),
@@ -770,6 +817,17 @@ class PluginCliService:
                 "reason": "installed_plugin_identity_missing",
             }
         install_result["activation"] = activation
+        if activation["status"] == "blocked":
+            raise ServerDomainError(
+                code="PLUGIN_INSTALLATION_ACTIVATION_BLOCKED",
+                message="installed plugin could not be activated safely",
+                status_code=409,
+                details={
+                    "plugin_ids": list(activation["plugin_ids"]),
+                    "reason": str(activation["reason"]),
+                    "available_actions": ["retry", "inspect_plugin_state"],
+                },
+            )
         return activation
 
     async def _record_requested_install_source(
@@ -796,6 +854,13 @@ class PluginCliService:
                 type(exc).__name__,
                 str(exc),
             )
+            if strict_write:
+                raise ServerDomainError(
+                    code="PLUGIN_INSTALL_SOURCE_PREPARE_FAILED",
+                    message="plugin install source could not be verified",
+                    status_code=500,
+                    details={"error_type": type(exc).__name__},
+                ) from exc
             return {
                 **install_result,
                 "install_source_warning": f"install_source_prepare_failed: {exc}",
@@ -872,6 +937,21 @@ class PluginCliService:
         except asyncio.CancelledError:
             await upgrade_support.await_cancellation_safe(cleanup)
             raise
+
+    @staticmethod
+    def _annotate_cancelled_rollback(
+        cancel_exc: asyncio.CancelledError,
+        recovery_errors: list[str],
+    ) -> None:
+        if not recovery_errors:
+            return
+        setattr(cancel_exc, "rollback_code", "PLUGIN_INSTALL_ROLLBACK_INCOMPLETE")
+        setattr(cancel_exc, "recovery_errors", tuple(recovery_errors))
+        logger.error(
+            "plugin install cancellation rollback incomplete code={} errors={}",
+            "PLUGIN_INSTALL_ROLLBACK_INCOMPLETE",
+            ",".join(recovery_errors),
+        )
 
     @staticmethod
     async def _save_package_mutation(function, /, *args, **kwargs) -> dict[str, object]:
@@ -1070,8 +1150,8 @@ class PluginCliService:
                         source="imported",
                     )
                 return payload
-            except asyncio.CancelledError:
-                await upgrade_support.await_cancellation_safe(
+            except asyncio.CancelledError as cancel_exc:
+                recovery_errors = await upgrade_support.await_cancellation_safe(
                     self._rollback_install_state(
                         source_manager=source_manager,
                         source_snapshot=source_snapshot,
@@ -1083,6 +1163,7 @@ class PluginCliService:
                         delete_saved_package=owns_saved_package,
                     )
                 )
+                self._annotate_cancelled_rollback(cancel_exc, recovery_errors)
                 raise
             except Exception as exc:
                 recovery_errors = await self._await_cleanup_before_cancellation(
@@ -1335,8 +1416,8 @@ class PluginCliService:
                 warnings=warnings,
             )
 
-        except asyncio.CancelledError:
-            await upgrade_support.await_cancellation_safe(
+        except asyncio.CancelledError as cancel_exc:
+            recovery_errors = await upgrade_support.await_cancellation_safe(
                 self._rollback_install_state(
                     source_manager=source_manager,
                     source_snapshot=source_snapshot,
@@ -1348,6 +1429,7 @@ class PluginCliService:
                     delete_saved_package=owns_saved_package,
                 )
             )
+            self._annotate_cancelled_rollback(cancel_exc, recovery_errors)
             raise
         except Exception as exc:
             recovery_errors = await self._await_cleanup_before_cancellation(
@@ -1645,7 +1727,7 @@ class PluginCliService:
         """
 
         try:
-            if target_dir.is_dir() and not target_dir.is_symlink():
+            if target_dir.is_dir() and not is_link_or_reparse_point(target_dir):
                 shutil.rmtree(target_dir, ignore_errors=True)
             else:
                 target_dir.unlink(missing_ok=True)
@@ -1868,11 +1950,11 @@ class PluginCliService:
             target_root = (
                 _require_within(
                     Path(plugins_root).expanduser().resolve(),
-                    policy.user_plugins_root,
+                    policy.install_plugins_root,
                     field="plugins_root",
                 )
                 if plugins_root
-                else policy.user_plugins_root
+                else policy.install_plugins_root
             )
             profiles_root_path = (
                 _require_within(
@@ -1952,7 +2034,7 @@ class PluginCliService:
         try:
             rollback_created_paths: dict[Path, tuple[Path, ...]] = {}
             policy = self._path_policy()
-            install_plugins_root = policy.user_plugins_root
+            install_plugins_root = policy.install_plugins_root
             install_profiles_root = policy.package_profiles_root
             plugins_root_path = (
                 _require_within(Path(plugins_root).expanduser().resolve(), install_plugins_root, field="plugins_root")
@@ -2099,7 +2181,7 @@ class PluginCliService:
                 source_profile = Path(staged.profile_dir)
                 requested_profile = profiles_root / source_profile.name
                 if requested_profile.exists():
-                    if not requested_profile.is_dir() or requested_profile.is_symlink():
+                    if not requested_profile.is_dir() or is_link_or_reparse_point(requested_profile):
                         raise FileExistsError(
                             "plugin profile conflicts with an existing local item"
                         )

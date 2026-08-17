@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
-import stat
 from typing import Mapping, TypeVar
 import uuid
 
@@ -20,8 +20,10 @@ from plugin.server.application.plugins.package_ownership import (
 )
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.config_paths import ensure_plugin_layout_runtime_config
+from plugin.server.infrastructure.path_safety import is_link_or_reparse_point
 
 logger = get_logger("server.application.plugins.upgrade_support")
+_PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _MANIFEST_ADJACENT_PROFILE_PATHS = (Path("profiles.toml"), Path("profiles"))
 _CleanupResult = TypeVar("_CleanupResult")
@@ -41,6 +43,22 @@ async def await_cancellation_safe(
                 return cleanup.result()
 
 
+async def _run_thread_mutation(function, /, *args, **kwargs):
+    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        try:
+            await await_cancellation_safe(operation)
+        except Exception as operation_exc:
+            logger.error(
+                "plugin file mutation failed while cancellation was pending "
+                "err_type={}",
+                type(operation_exc).__name__,
+            )
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class ReplacePluginResult:
     restarted: bool
@@ -50,11 +68,19 @@ class ReplacePluginResult:
 
 
 class ReplacePluginError(RuntimeError):
-    def __init__(self, *, stage: str, rollback_status: str, cause: Exception) -> None:
+    def __init__(
+        self,
+        *,
+        stage: str,
+        rollback_status: str,
+        cause: Exception,
+        committed: bool = False,
+    ) -> None:
         super().__init__(f"{stage} failed: {cause}")
         self.stage = stage
         self.rollback_status = rollback_status
         self.cause = cause
+        self.committed = committed
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +88,7 @@ class ReplacementRecoveryResult:
     recovered_operation_ids: tuple[str, ...]
     manual_recovery_operation_ids: tuple[str, ...]
     manual_recovery_plugin_ids: tuple[str, ...] = ()
+    block_user_plugin_root: bool = False
 
 
 class _ReplacementJournal:
@@ -74,6 +101,7 @@ class _ReplacementJournal:
         targets: tuple[dict[str, object], ...],
     ) -> None:
         self.path = path
+        self.owner_path = path.with_suffix(".owner")
         self.state: dict[str, object] = {
             "schema_version": 1,
             "operation_id": operation_id,
@@ -81,7 +109,13 @@ class _ReplacementJournal:
             "phase": "precommit",
             "targets": [dict(item) for item in targets],
         }
-        self._write()
+        try:
+            self._write_owner()
+            self._write()
+        except BaseException:
+            self.path.unlink(missing_ok=True)
+            self.owner_path.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def create(
@@ -126,6 +160,7 @@ class _ReplacementJournal:
 
     def finish(self) -> None:
         self.path.unlink(missing_ok=True)
+        self.owner_path.unlink(missing_ok=True)
         try:
             self.path.parent.rmdir()
         except OSError:
@@ -145,9 +180,28 @@ class _ReplacementJournal:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _write_owner(self) -> None:
+        payload = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "operation_id": self.state["operation_id"],
+                    "plugin_id": self.state["plugin_id"],
+                    "kind": "replacement",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with self.owner_path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
 
 def _remove_path_sync(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
+    if path.is_dir() and not is_link_or_reparse_point(path):
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
@@ -157,6 +211,7 @@ def _journal_target_records(
     raw: object,
     *,
     allowed_roots: tuple[Path, ...] | None,
+    plugin_id: str,
 ) -> tuple[dict[str, object], ...]:
     if not isinstance(raw, list) or not raw:
         raise ValueError("replacement journal targets are missing")
@@ -193,7 +248,30 @@ def _journal_target_records(
                 "moved": item.get("moved") is True,
             }
         )
+    first_target = records[0]["target"]
+    if not isinstance(first_target, Path) or first_target.name.casefold() != plugin_id.casefold():
+        raise ValueError("replacement journal plugin target identity is invalid")
     return tuple(records)
+
+
+def _load_replacement_owner(
+    journal_path: Path,
+) -> tuple[str, str]:
+    owner_path = journal_path.with_suffix(".owner")
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    if not isinstance(owner, dict) or owner.get("schema_version") != 1:
+        raise ValueError("replacement journal owner marker is invalid")
+    operation_id = owner.get("operation_id")
+    plugin_id = owner.get("plugin_id")
+    if (
+        owner.get("kind") != "replacement"
+        or not isinstance(operation_id, str)
+        or operation_id != journal_path.stem
+        or not isinstance(plugin_id, str)
+        or not _PLUGIN_ID_PATTERN.fullmatch(plugin_id)
+    ):
+        raise ValueError("replacement journal owner identity is invalid")
+    return operation_id, plugin_id
 
 
 def recover_incomplete_plugin_replacements(
@@ -206,30 +284,35 @@ def recover_incomplete_plugin_replacements(
     recovered: list[str] = []
     manual: list[str] = []
     manual_plugin_ids: list[str] = []
+    block_user_plugin_root = False
     if not journal_root.is_dir():
         return ReplacementRecoveryResult((), ())
     for journal_path in sorted(journal_root.glob("*.json")):
         operation_id = journal_path.stem
         plugin_id: object = None
         try:
+            owner_operation_id, owner_plugin_id = _load_replacement_owner(journal_path)
+            operation_id = owner_operation_id
+            plugin_id = owner_plugin_id
             state = json.loads(journal_path.read_text(encoding="utf-8"))
-            plugin_id = state.get("plugin_id") if isinstance(state, dict) else None
             if not isinstance(state, dict) or state.get("schema_version") != 1:
                 manual.append(operation_id)
                 if isinstance(plugin_id, str) and plugin_id:
                     manual_plugin_ids.append(plugin_id.casefold())
                 continue
             raw_operation_id = state.get("operation_id")
-            if not isinstance(raw_operation_id, str) or not raw_operation_id:
-                manual.append(operation_id)
-                if isinstance(plugin_id, str) and plugin_id:
-                    manual_plugin_ids.append(plugin_id.casefold())
-                continue
+            state_plugin_id = state.get("plugin_id")
+            if (
+                raw_operation_id != owner_operation_id
+                or state_plugin_id != owner_plugin_id
+            ):
+                raise ValueError("replacement journal identity does not match owner")
             operation_id = raw_operation_id
             phase = state.get("phase")
             records = _journal_target_records(
                 state.get("targets"),
                 allowed_roots=allowed_roots,
+                plugin_id=owner_plugin_id,
             )
             if phase == "commit_started":
                 manual.append(operation_id)
@@ -249,6 +332,7 @@ def recover_incomplete_plugin_replacements(
                 for item in records:
                     _remove_path_sync(item["backup"])  # type: ignore[arg-type]
                 journal_path.unlink(missing_ok=True)
+                journal_path.with_suffix(".owner").unlink(missing_ok=True)
                 recovered.append(operation_id)
                 continue
             if phase != "precommit":
@@ -271,6 +355,8 @@ def recover_incomplete_plugin_replacements(
                         ambiguous = True
                 elif backup_exists:
                     ambiguous = True
+                elif target_exists:
+                    ambiguous = True
             if ambiguous:
                 manual.append(operation_id)
                 if isinstance(plugin_id, str) and plugin_id:
@@ -285,9 +371,10 @@ def recover_incomplete_plugin_replacements(
                     _remove_path_sync(target)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     backup.rename(target)
-                elif not item["preexisting"]:
-                    _remove_path_sync(target)
+                elif not item["preexisting"] and target.exists():
+                    raise RuntimeError("new replacement target requires manual recovery")
             journal_path.unlink(missing_ok=True)
+            journal_path.with_suffix(".owner").unlink(missing_ok=True)
             recovered.append(operation_id)
         except Exception as exc:
             logger.error(
@@ -299,10 +386,13 @@ def recover_incomplete_plugin_replacements(
             manual.append(operation_id)
             if isinstance(plugin_id, str) and plugin_id:
                 manual_plugin_ids.append(plugin_id.casefold())
+            else:
+                block_user_plugin_root = True
     return ReplacementRecoveryResult(
         tuple(recovered),
         tuple(dict.fromkeys(manual)),
         tuple(dict.fromkeys(manual_plugin_ids)),
+        block_user_plugin_root,
     )
 
 
@@ -370,13 +460,13 @@ async def restore_directory(backup_dir: Path, target_dir: Path) -> None:
     if not backup_dir.exists():
         return
     await remove_directory(target_dir)
-    await asyncio.to_thread(backup_dir.rename, target_dir)
+    await _run_thread_mutation(backup_dir.rename, target_dir)
 
 
 async def remove_directory(target_dir: Path) -> None:
     if not target_dir.exists():
         return
-    await asyncio.to_thread(shutil.rmtree, target_dir)
+    await _run_thread_mutation(shutil.rmtree, target_dir)
 
 
 async def merge_directory_contents(source_dir: Path, target_dir: Path) -> None:
@@ -384,15 +474,20 @@ async def merge_directory_contents(source_dir: Path, target_dir: Path) -> None:
         return
     if not source_dir.is_dir():
         raise NotADirectoryError(source_dir)
-    await asyncio.to_thread(target_dir.mkdir, parents=True, exist_ok=True)
-    await asyncio.to_thread(shutil.copytree, source_dir, target_dir, dirs_exist_ok=True)
+    await _run_thread_mutation(target_dir.mkdir, parents=True, exist_ok=True)
+    await _run_thread_mutation(
+        shutil.copytree,
+        source_dir,
+        target_dir,
+        dirs_exist_ok=True,
+    )
 
 
 async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path) -> None:
     for relative_path in _MANIFEST_ADJACENT_PROFILE_PATHS:
         source = backup_dir / relative_path
-        if source.is_symlink():
-            raise OSError(f"symbolic links are not supported for profile paths: {source}")
+        if is_link_or_reparse_point(source):
+            raise OSError(f"linked paths are not supported for profile paths: {source}")
         if not source.exists():
             continue
         target = target_dir / relative_path
@@ -401,18 +496,8 @@ async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path
             continue
         if not source.is_file():
             raise OSError(f"unsupported profile path: {source}")
-        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(shutil.copy2, source, target)
-
-
-def _is_link_or_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        attributes = getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0)
-    except FileNotFoundError:
-        return False
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        await _run_thread_mutation(target.parent.mkdir, parents=True, exist_ok=True)
+        await _run_thread_mutation(shutil.copy2, source, target)
 
 
 def _merge_preserved_state_sync(
@@ -425,7 +510,7 @@ def _merge_preserved_state_sync(
 ) -> None:
     """Copy old runtime state into a replacement without overwriting package files."""
 
-    if _is_link_or_reparse_point(source) or _is_link_or_reparse_point(target):
+    if is_link_or_reparse_point(source) or is_link_or_reparse_point(target):
         relative = source.relative_to(root).as_posix()
         raise OSError(f"links are not supported for plugin state paths: {relative}")
     if source.is_dir():
@@ -485,7 +570,7 @@ async def _restore_collocated_runtime_state(
 
     for relative_path in relative_paths:
         source = backup_dir / relative_path
-        if not source.exists() and not _is_link_or_reparse_point(source):
+        if not source.exists() and not is_link_or_reparse_point(source):
             continue
         operation = asyncio.create_task(
             asyncio.to_thread(
@@ -566,6 +651,14 @@ async def _rollback_targets(
                         type(exc).__name__,
                     )
             continue
+        if not backup.exists():
+            restored = False
+            logger.error(
+                "plugin replacement target rollback skipped because backup is missing "
+                "target={}",
+                target.name,
+            )
+            continue
         try:
             await remove_directory(target)
             await restore_directory(backup, target)
@@ -618,7 +711,7 @@ async def replace_plugin(
     if any(target not in targets for target in preserve_targets):
         raise ValueError("preserve targets must also be replacement targets")
 
-    await asyncio.to_thread(
+    await _run_thread_mutation(
         ensure_plugin_layout_runtime_config,
         layout,
     )
@@ -904,6 +997,27 @@ async def replace_plugin(
             )
         raise
     except Exception as exc:
+        if committed:
+            persistence_errors: list[str] = []
+            try:
+                await _run_thread_mutation(journal.ensure_persisted)
+            except Exception as persistence_exc:
+                persistence_errors.append(type(persistence_exc).__name__)
+            logger.error(
+                "plugin replacement committed cleanup incomplete plugin_id={} "
+                "err_type={} journal_persistence_errors={}",
+                plugin_id,
+                type(exc).__name__,
+                ",".join(persistence_errors),
+            )
+            if isinstance(exc, ReplacePluginError) and exc.committed:
+                raise
+            raise ReplacePluginError(
+                stage="cleanup",
+                rollback_status="not_needed",
+                cause=exc,
+                committed=True,
+            ) from exc
         _notify_rollback_start(on_rollback_start)
         restored = await _rollback_targets(
             targets=targets,

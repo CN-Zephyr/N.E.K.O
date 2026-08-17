@@ -39,8 +39,9 @@ def _write_plugin_fixture(tmp_path: Path, plugin_id: str) -> Path:
     root = tmp_path / "plugins"
     plugin_dir = root / plugin_id
     plugin_dir.mkdir(parents=True, exist_ok=True)
-    module_name = f"{plugin_id}_entry"
-    (tmp_path / f"{module_name}.py").write_text(
+    (plugin_dir / "__init__.py").write_text("", encoding="utf-8")
+    module_name = "entry"
+    (plugin_dir / f"{module_name}.py").write_text(
         "\n".join(
             [
                 "from plugin.sdk.plugin.decorators import plugin_entry",
@@ -61,7 +62,7 @@ def _write_plugin_fixture(tmp_path: Path, plugin_id: str) -> Path:
                 f"id = '{plugin_id}'",
                 f"name = '{plugin_id}'",
                 "type = 'plugin'",
-                f"entry = '{module_name}:DemoPlugin'",
+                f"entry = 'plugin.plugins.{plugin_id}.{module_name}:DemoPlugin'",
                 "version = '0.1.0'",
                 "",
                 "[plugin_runtime]",
@@ -276,21 +277,21 @@ async def test_explicit_user_installation_is_the_only_imported_same_id_candidate
     user_dir.mkdir(parents=True)
     builtin_marker = tmp_path / "builtin-imported.txt"
     user_marker = tmp_path / "user-imported.txt"
-    (tmp_path / "builtin_demo_entry.py").write_text(
+    (builtin_dir / "__init__.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(builtin_marker)!r}).write_text('builtin', encoding='utf-8')\n"
         "class DemoPlugin:\n    pass\n",
         encoding="utf-8",
     )
-    (tmp_path / "user_demo_entry.py").write_text(
+    (user_dir / "__init__.py").write_text(
         "from pathlib import Path\n"
         f"Path({str(user_marker)!r}).write_text('user', encoding='utf-8')\n"
         "class DemoPlugin:\n    pass\n",
         encoding="utf-8",
     )
     for plugin_dir, entry in (
-        (builtin_dir, "builtin_demo_entry:DemoPlugin"),
-        (user_dir, "user_demo_entry:DemoPlugin"),
+        (builtin_dir, "plugin.plugins.demo:DemoPlugin"),
+        (user_dir, "plugin.plugins.demo:DemoPlugin"),
     ):
         (plugin_dir / "plugin.toml").write_text(
             "[plugin]\n"
@@ -1007,7 +1008,7 @@ async def test_refresh_registry_preserves_future_inventory_schema(
     inventory_path = tmp_path / "plugin-installations.json"
     future_payload = json.dumps(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "generation": 17,
             "updated_at": None,
             "installations": [],

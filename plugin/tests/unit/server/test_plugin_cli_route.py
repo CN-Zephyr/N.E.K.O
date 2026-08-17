@@ -6,7 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 import errno
 from pathlib import Path
 import hashlib
+import os
 import shutil
+import subprocess
 import threading
 
 import pytest
@@ -29,7 +31,9 @@ from plugin.server.application.plugins.inventory_store import (
     get_deleted_plugin_ids,
     mark_plugin_deleted,
     record_user_installation,
+    remove_user_installation,
 )
+from plugin.server.application.plugins.registry_service import PluginRegistryService
 from plugin.server.application.install_source import (
     InstallSourceManager,
     PluginDirectoryScanner,
@@ -92,6 +96,36 @@ def _make_plugin_dir(
         encoding="utf-8",
     )
     return plugin_dir
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_staged_payload_rejects_junction_before_writing_outside_root(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "staging"
+    staged_data = source_dir / "data"
+    staged_data.mkdir(parents=True)
+    staged_file = staged_data / "package.bin"
+    staged_file.write_bytes(b"package")
+    target_dir = tmp_path / "plugin"
+    target_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = target_dir / "data"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable")
+
+    with pytest.raises(FileExistsError, match="linked path"):
+        _merge_staged_payload(source_dir, target_dir)
+
+    assert staged_file.read_bytes() == b"package"
+    assert not (outside / "package.bin").exists()
 
 
 def _copy_fixture_plugin(tmp_path: Path, fixture_name: str) -> Path:
@@ -308,6 +342,7 @@ def _patch_plugin_cli_settings(
     *,
     builtin_root: Path,
     user_root: Path | None = None,
+    managed_root: Path | None = None,
     packages_root: Path | None = None,
     profiles_root: Path | None = None,
 ) -> None:
@@ -317,12 +352,22 @@ def _patch_plugin_cli_settings(
 
     monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
     monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", user_root or builtin_root)
+    resolved_managed_root = managed_root or user_root or builtin_root
+    monkeypatch.setattr(
+        plugin_settings,
+        "MANAGED_PLUGIN_INSTALLATIONS_ROOT",
+        resolved_managed_root,
+    )
     monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root or builtin_root)
     monkeypatch.setattr(plugin_settings, "USER_PACKAGE_PROFILES_ROOT", profiles_root or (builtin_root / "profiles"))
     monkeypatch.setattr(
         registry_module,
         "PLUGIN_CONFIG_ROOTS",
-        (builtin_root, user_root or builtin_root),
+        tuple(
+            dict.fromkeys(
+                (builtin_root, resolved_managed_root, user_root or builtin_root)
+            )
+        ),
     )
     monkeypatch.setattr(
         core_registry_module,
@@ -1910,6 +1955,77 @@ async def test_upgrade_inventory_write_failure_restores_previous_plugin(
 
 
 @pytest.mark.asyncio
+async def test_upgrade_finish_failure_keeps_committed_plugin_and_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "upgrade_committed_finish_failure"
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    old_source = _make_plugin_dir(
+        tmp_path / "old-source", plugin_id=plugin_id, version="1.0.0"
+    )
+    new_source = _make_plugin_dir(
+        tmp_path / "new-source", plugin_id=plugin_id, version="2.0.0"
+    )
+    package_path = packages_root / f"{plugin_id}-2.0.0.neko-plugin"
+    pack_plugin(new_source, package_path)
+    user_root = tmp_path / "user"
+    installed_dir = user_root / plugin_id
+    shutil.copytree(old_source, installed_dir)
+    inventory_path = tmp_path / "plugin-installations.json"
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=tmp_path / "builtin",
+        user_root=user_root,
+        packages_root=packages_root,
+        profiles_root=tmp_path / "profiles",
+    )
+    monkeypatch.setenv("NEKO_PLUGIN_INSTALLATIONS_PATH", str(inventory_path))
+    record_user_installation(
+        plugin_id,
+        directory_name=plugin_id,
+        package_id=plugin_id,
+        source="manual",
+        path=inventory_path,
+    )
+    service = PluginCliService()
+    plan = await service.plan_install(package=str(package_path))
+
+    def fail_finish(_journal: object) -> None:
+        raise OSError("simulated committed journal finish failure")
+
+    monkeypatch.setattr(
+        plugin_cli_service_module.upgrade_support._ReplacementJournal,
+        "finish",
+        fail_finish,
+    )
+
+    with pytest.raises(ServerDomainError) as exc_info:
+        await service.install(
+            package=str(package_path),
+            confirm_upgrade=True,
+            confirmation_token=str(plan["confirmation_token"]),
+        )
+
+    assert exc_info.value.code == (
+        "PLUGIN_REPLACEMENT_COMMITTED_CLEANUP_INCOMPLETE"
+    )
+    assert exc_info.value.details["committed"] is True
+    assert 'version = "2.0.0"' in (installed_dir / "plugin.toml").read_text(
+        encoding="utf-8"
+    )
+    assert get_inventory_resolution(path=inventory_path).active_user_directories == {
+        plugin_id: plugin_id
+    }
+    journal_path = next(
+        (user_root / ".upgrade-backups" / ".transactions").glob("*.json")
+    )
+    assert journal_path.exists()
+    assert journal_path.with_suffix(".owner").exists()
+
+
+@pytest.mark.asyncio
 async def test_local_import_installs_newer_same_id_over_builtin_without_duplicate(
     plugin_cli_test_app: FastAPI,
     tmp_path: Path,
@@ -1937,6 +2053,7 @@ async def test_local_import_installs_newer_same_id_over_builtin_without_duplicat
     package_path = tmp_path / f"{plugin_id}.neko-plugin"
     pack_plugin(source, package_path)
     user_root = tmp_path / "plugins"
+    managed_root = tmp_path / "plugin-installations"
     monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path))
     state_config = user_root / plugin_id / "config" / "plugin.toml"
     state_data = user_root / plugin_id / "data" / "value.txt"
@@ -1950,14 +2067,15 @@ async def test_local_import_installs_newer_same_id_over_builtin_without_duplicat
         monkeypatch,
         builtin_root=builtin_root,
         user_root=user_root,
+        managed_root=managed_root,
         packages_root=packages_root,
         profiles_root=profiles_root,
     )
     manager = InstallSourceManager(
         lock_path=tmp_path / "plugins.lock.json",
         builtin_root=builtin_root,
-        user_root=user_root,
-        scanner=PluginDirectoryScanner(builtin_root, user_root),
+        user_root=managed_root,
+        scanner=PluginDirectoryScanner(builtin_root, managed_root),
     )
     set_global_manager(manager)
     try:
@@ -1991,17 +2109,41 @@ async def test_local_import_installs_newer_same_id_over_builtin_without_duplicat
         "reason": "user_installation_selected",
     }
     assert (builtin_dir / "plugin.toml").read_bytes() == builtin_manifest_before
-    assert (user_root / plugin_id / "plugin.toml").is_file()
+    assert (managed_root / plugin_id / "plugin.toml").is_file()
+    assert not (user_root / plugin_id / "plugin.toml").exists()
     assert state_config.read_text(encoding="utf-8") == "user_config = true\n"
     assert state_data.read_text(encoding="utf-8") == "preserve me\n"
-    assert (user_root / plugin_id / "data" / "defaults" / "labels.json").read_text(
+    assert get_inventory_resolution().active_installations[
+        plugin_id
+    ].installation_kind == "managed"
+    assert (managed_root / plugin_id / "data" / "defaults" / "labels.json").read_text(
         encoding="utf-8"
     ) == "{}\n"
     with plugin_state.acquire_plugins_read_lock():
         assert set(plugin_state.plugins) == {plugin_id}
         projected = dict(plugin_state.plugins[plugin_id])
-    assert Path(str(projected["config_path"])).parent == (user_root / plugin_id).resolve()
+    assert Path(str(projected["config_path"])).parent == (managed_root / plugin_id).resolve()
     assert projected.get("runtime_load_state") != "failed"
+
+    with plugin_state.acquire_plugins_write_lock():
+        plugin_state.plugins.clear()
+    await PluginRegistryService().refresh_registry()
+    with plugin_state.acquire_plugins_read_lock():
+        restarted_projection = dict(plugin_state.plugins[plugin_id])
+    assert Path(str(restarted_projection["config_path"])).parent == (
+        managed_root / plugin_id
+    ).resolve()
+
+    assert remove_user_installation(plugin_id) is True
+    shutil.rmtree(managed_root / plugin_id)
+    with plugin_state.acquire_plugins_write_lock():
+        plugin_state.plugins.clear()
+    await PluginRegistryService().refresh_registry()
+    with plugin_state.acquire_plugins_read_lock():
+        fallback_projection = dict(plugin_state.plugins[plugin_id])
+    assert Path(str(fallback_projection["config_path"])).parent == builtin_dir.resolve()
+    assert state_config.read_text(encoding="utf-8") == "user_config = true\n"
+    assert state_data.read_text(encoding="utf-8") == "preserve me\n"
 
 
 @pytest.mark.asyncio
@@ -2070,6 +2212,104 @@ async def test_market_install_clears_deleted_plugin_only_after_source_record(
 
 
 @pytest.mark.asyncio
+async def test_market_install_same_id_as_builtin_uses_managed_payload_and_shared_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "neko_warthunder"
+    canonical_entry = f"plugin.plugins.{plugin_id}:Plugin"
+    builtin_root = tmp_path / "distribution" / "plugin" / "plugins"
+    builtin_dir = _make_plugin_dir(
+        builtin_root,
+        plugin_id=plugin_id,
+        version="0.1.1",
+        entry=canonical_entry,
+    )
+    builtin_bytes = (builtin_dir / "plugin.toml").read_bytes()
+    source = _make_plugin_dir(
+        tmp_path / "market-source",
+        plugin_id=plugin_id,
+        version="0.1.1",
+        entry=canonical_entry,
+    )
+    (source / "market-build.txt").write_text("different bytes\n", encoding="utf-8")
+    package_path = tmp_path / f"{plugin_id}.neko-plugin"
+    pack_plugin(source, package_path)
+
+    managed_root = tmp_path / "plugin-installations"
+    state_root = tmp_path / "plugins"
+    packages_root = tmp_path / "packages"
+    profiles_root = tmp_path / "profiles"
+    state_config = state_root / plugin_id / "config" / "plugin.toml"
+    state_data = state_root / plugin_id / "data" / ".runtime_state.json"
+    state_config.parent.mkdir(parents=True)
+    state_data.parent.mkdir()
+    state_config.write_bytes(b"user-config\x00")
+    state_data.write_bytes(b"opaque-state\x00")
+    inventory_path = tmp_path / "plugin-installations.json"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path))
+    monkeypatch.setenv("NEKO_PLUGIN_INSTALLATIONS_PATH", str(inventory_path))
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=builtin_root,
+        user_root=state_root,
+        managed_root=managed_root,
+        packages_root=packages_root,
+        profiles_root=profiles_root,
+    )
+    manager = InstallSourceManager(
+        lock_path=tmp_path / "plugins.lock.json",
+        builtin_root=builtin_root,
+        user_root=managed_root,
+        scanner=PluginDirectoryScanner(builtin_root, managed_root),
+    )
+    set_global_manager(manager)
+    try:
+        result = await PluginCliService().upload_and_install(
+            filename=package_path.name,
+            package_path=str(package_path),
+            on_conflict="fail",
+            install_source_override={
+                "channel": "market",
+                "mode": "install",
+                "market_detail": {
+                    "plugin_market_id": "42",
+                    "expected_plugin_toml_id": plugin_id,
+                    "version": "0.1.1",
+                    "package_url": "https://market.example/neko_warthunder.neko-plugin",
+                    "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
+                    "payload_hash": None,
+                    "channel": "stable",
+                    "published_at": "2026-08-16T00:00:00.000Z",
+                },
+            },
+        )
+    finally:
+        set_global_manager(None)
+
+    assert result["unpack"]["activation"]["status"] == "active"
+    assert (builtin_dir / "plugin.toml").read_bytes() == builtin_bytes
+    assert (managed_root / plugin_id / "market-build.txt").read_text(
+        encoding="utf-8"
+    ) == "different bytes\n"
+    assert not (state_root / plugin_id / "market-build.txt").exists()
+    assert state_config.read_bytes() == b"user-config\x00"
+    assert state_data.read_bytes() == b"opaque-state\x00"
+    inventory = get_inventory_resolution(path=inventory_path)
+    assert inventory.active_installations[plugin_id].installation_kind == "managed"
+
+    with plugin_state.acquire_plugins_write_lock():
+        plugin_state.plugins.clear()
+    await PluginRegistryService().refresh_registry()
+    with plugin_state.acquire_plugins_read_lock():
+        assert set(plugin_state.plugins) == {plugin_id}
+        projected = dict(plugin_state.plugins[plugin_id])
+    assert Path(str(projected["config_path"])).parent == (
+        managed_root / plugin_id
+    ).resolve()
+
+
+@pytest.mark.asyncio
 async def test_installation_of_running_same_id_defers_switch_until_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2117,7 +2357,7 @@ async def test_installation_of_running_same_id_defers_switch_until_restart(
 
 
 @pytest.mark.asyncio
-async def test_plugin_cli_install_remains_successful_when_import_hashing_fails(
+async def test_plugin_cli_install_rolls_back_when_strict_source_hashing_fails(
     plugin_cli_test_app: FastAPI,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2150,14 +2390,58 @@ async def test_plugin_cli_install_remains_successful_when_import_hashing_fails(
             },
         )
 
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["operation"] == "install"
-    assert result["installed_plugin_count"] == 1
-    assert result["install_source_warning"] == (
-        "install_source_prepare_failed: package archive disappeared"
+    assert response.status_code == 500, response.text
+    assert response.headers["x-error-code"] == "PLUGIN_INSTALL_SOURCE_PREPARE_FAILED"
+    assert response.json()["detail"] == "plugin install source could not be verified"
+    assert not (user_root / plugin_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_plugin_cli_install_rolls_back_when_activation_is_blocked(
+    plugin_cli_test_app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "route_activation_blocked"
+    source = _make_plugin_dir(tmp_path / "source", plugin_id=plugin_id)
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / f"{plugin_id}.neko-plugin"
+    pack_plugin(source, package_path)
+    user_root = tmp_path / "user-plugins"
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=tmp_path / "builtin",
+        user_root=user_root,
+        packages_root=packages_root,
+        profiles_root=tmp_path / "profiles",
     )
-    assert (user_root / plugin_id / "plugin.toml").is_file()
+
+    async def blocked_refresh(_self: object) -> dict[str, object]:
+        return {
+            "failed": [
+                {
+                    "plugin_id": plugin_id,
+                    "error": "selected_installation_not_projected",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        plugin_cli_service_module.PluginRegistryService,
+        "refresh_registry",
+        blocked_refresh,
+    )
+    transport = ASGITransport(app=plugin_cli_test_app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/plugin-cli/install",
+            json={"package": str(package_path)},
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.headers["x-error-code"] == "PLUGIN_INSTALLATION_ACTIVATION_BLOCKED"
+    assert not (user_root / plugin_id).exists()
 
 
 @pytest.mark.asyncio

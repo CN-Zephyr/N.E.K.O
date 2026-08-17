@@ -28,7 +28,7 @@ def test_mark_and_clear_plugin_deletion_is_persistent(tmp_path: Path) -> None:
     assert get_deleted_plugin_ids(path=state_path) == frozenset({"demo_plugin"})
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["schema_version"] == 1
+    assert state["schema_version"] == 2
     assert state["generation"] == 1
     assert state["installations"] == []
     assert state["activation_claims"]["demo_plugin"]["retain_user_data"] is True
@@ -45,7 +45,7 @@ def test_store_preserves_unknown_fields_in_current_schema(tmp_path: Path) -> Non
     state_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": 4,
                 "updated_at": "2026-01-01T00:00:00.000Z",
                 "installations": [],
@@ -153,7 +153,7 @@ def test_future_schema_is_never_downgraded(tmp_path: Path) -> None:
     state_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "generation": 9,
                 "updated_at": None,
                 "installations": [],
@@ -166,7 +166,7 @@ def test_future_schema_is_never_downgraded(tmp_path: Path) -> None:
     with pytest.raises(PluginInventoryError, match="unsupported"):
         mark_plugin_deleted("demo", path=state_path)
 
-    assert json.loads(state_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert json.loads(state_path.read_text(encoding="utf-8"))["schema_version"] == 3
 
 
 def test_inventory_persists_and_reads_logical_ids_case_insensitively(

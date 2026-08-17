@@ -11,6 +11,8 @@ import type {
   PluginUiContext,
   PluginUiSurface,
   PluginUiWarning,
+  PluginInstallationProjection,
+  PluginInstallationSwitchResult,
 } from '@/types/api'
 
 /**
@@ -75,6 +77,23 @@ export function stopPlugin(pluginId: string): Promise<{ success: boolean; plugin
 export function reloadPlugin(pluginId: string): Promise<{ success: boolean; plugin_id: string; message: string }> {
   const safeId = encodeURIComponent(pluginId)
   return post(`/plugin/${safeId}/reload`)
+}
+
+export function getPluginInstallations(pluginId: string): Promise<PluginInstallationProjection> {
+  const safeId = encodeURIComponent(pluginId)
+  return get(`/plugin/${safeId}/installations`, { suppressErrorMessage: true })
+}
+
+export function switchPluginInstallation(
+  pluginId: string,
+  selectionId: string,
+  expectedGeneration: number,
+): Promise<PluginInstallationSwitchResult> {
+  const safeId = encodeURIComponent(pluginId)
+  return post(`/plugin/${safeId}/active-installation`, {
+    selection_id: selectionId,
+    expected_generation: expectedGeneration,
+  }, { suppressErrorMessage: true })
 }
 
 /**

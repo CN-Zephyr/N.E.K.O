@@ -35,12 +35,20 @@ from plugin.server.application.plugins.inventory_store import (
     load_inventory_resolution_for_registry,
     resolve_inventory_path,
 )
+from plugin.server.application.plugins.installation_selection import (
+    inspect_plugin_installations,
+    serialize_plugin_installation_projection,
+)
 from plugin.server.application.plugins.resolver import (
     PluginCandidate,
     resolve_plugin_candidates,
 )
-from plugin.server.application.plugins.mutation_guard import plugin_mutation_guard
+from plugin.server.application.plugins.mutation_guard import (
+    plugin_mutation_guard,
+    plugin_mutation_guard_is_held_by_current_task,
+)
 from plugin.server.application.plugins.upgrade_support import (
+    ReplacementRecoveryResult,
     await_cancellation_safe,
     recover_incomplete_plugin_replacements,
 )
@@ -170,7 +178,11 @@ def _find_plugin_config_path(plugin_id: str, roots: tuple[Path, ...]) -> Path | 
 
     active_user_directory = inventory.active_user_directories.get(canonical_plugin_id)
     if active_user_directory is not None and len(roots) > 1:
-        for root in roots[1:]:
+        active = inventory.active_installations.get(canonical_plugin_id)
+        candidate_roots = roots[1:]
+        if len(roots) >= 3 and active is not None:
+            candidate_roots = roots[1:2] if active.installation_kind == "managed" else roots[2:]
+        for root in candidate_roots:
             resolved_root = root.resolve()
             config_file = (resolved_root / active_user_directory / "plugin.toml").resolve()
             if resolved_root in config_file.parents and config_file.exists():
@@ -232,6 +244,8 @@ def _candidate_root_id(config_path: Path, roots: tuple[Path, ...]) -> str:
         if resolved_root in resolved_path.parents:
             if len(roots) > 1 and index == 0:
                 return "builtin"
+            if len(roots) >= 3 and index == 1:
+                return "managed"
             return "user"
     raise ValueError("plugin candidate is outside configured roots")
 
@@ -759,38 +773,100 @@ class PluginRegistryService:
     @staticmethod
     async def _recover_incomplete_replacements():
         from plugin import settings
+        from plugin.server.application.plugins.lifecycle_service import (
+            recover_incomplete_plugin_deletions,
+        )
 
-        user_plugins_root = Path(settings.USER_PLUGIN_CONFIG_ROOT).expanduser().resolve()
+        plugin_roots = tuple(
+            dict.fromkeys(
+                (
+                    Path(settings.MANAGED_PLUGIN_INSTALLATIONS_ROOT)
+                    .expanduser()
+                    .resolve(),
+                    Path(settings.USER_PLUGIN_CONFIG_ROOT).expanduser().resolve(),
+                )
+            )
+        )
         package_profiles_root = Path(
             settings.USER_PACKAGE_PROFILES_ROOT
         ).expanduser().resolve()
-        operation = asyncio.create_task(
-            asyncio.to_thread(
-                recover_incomplete_plugin_replacements,
-                journal_root=user_plugins_root / ".upgrade-backups" / ".transactions",
-                allowed_roots=(user_plugins_root, package_profiles_root),
-            )
+        results = []
+        for plugin_root in plugin_roots:
+            for recovery_call, kwargs in (
+                (
+                    recover_incomplete_plugin_replacements,
+                    {
+                        "journal_root": plugin_root
+                        / ".upgrade-backups"
+                        / ".transactions",
+                        "allowed_roots": (plugin_root, package_profiles_root),
+                    },
+                ),
+                (
+                    recover_incomplete_plugin_deletions,
+                    {
+                        "journal_root": plugin_root
+                        / ".delete-backups"
+                        / ".transactions",
+                        "user_root": plugin_root,
+                    },
+                ),
+            ):
+                operation = asyncio.create_task(
+                    asyncio.to_thread(recovery_call, **kwargs)
+                )
+                try:
+                    results.append(await asyncio.shield(operation))
+                except asyncio.CancelledError:
+                    await await_cancellation_safe(operation)
+                    raise
+        first, *remaining = results
+        return type(first)(
+            tuple(
+                operation_id
+                for result in results
+                for operation_id in result.recovered_operation_ids
+            ),
+            tuple(
+                operation_id
+                for result in results
+                for operation_id in result.manual_recovery_operation_ids
+            ),
+            tuple(
+                dict.fromkeys(
+                    plugin_id
+                    for result in results
+                    for plugin_id in result.manual_recovery_plugin_ids
+                )
+            ),
+            first.block_user_plugin_root
+            or any(result.block_user_plugin_root for result in remaining),
         )
-        try:
-            return await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            await await_cancellation_safe(operation)
-            raise
 
     async def refresh_registry(
         self,
         *,
         _mutation_guarded: bool = False,
+        _recover_incomplete: bool = True,
     ) -> dict[str, object]:
         if not _mutation_guarded:
+            nested_mutation = plugin_mutation_guard_is_held_by_current_task()
             async with plugin_mutation_guard():
-                return await self.refresh_registry(_mutation_guarded=True)
-        recovery = await self._recover_incomplete_replacements()
-        return await asyncio.to_thread(
+                return await self.refresh_registry(
+                    _mutation_guarded=True,
+                    _recover_incomplete=not nested_mutation,
+                )
+        recovery = (
+            await self._recover_incomplete_replacements()
+            if _recover_incomplete
+            else ReplacementRecoveryResult((), ())
+        )
+        return await self._await_refresh_worker(
             self._refresh_registry_sync,
             blocked_recovery_plugin_ids=frozenset(
                 recovery.manual_recovery_plugin_ids
             ),
+            block_user_plugin_root=recovery.block_user_plugin_root,
         )
 
     async def refresh_plugin(
@@ -798,24 +874,59 @@ class PluginRegistryService:
         plugin_id: str,
         *,
         _mutation_guarded: bool = False,
+        _recover_incomplete: bool = True,
     ) -> dict[str, object]:
         if not _mutation_guarded:
+            nested_mutation = plugin_mutation_guard_is_held_by_current_task()
             async with plugin_mutation_guard():
                 return await self.refresh_plugin(
                     plugin_id,
                     _mutation_guarded=True,
+                    _recover_incomplete=not nested_mutation,
                 )
-        recovery = await self._recover_incomplete_replacements()
-        return await asyncio.to_thread(
+        recovery = (
+            await self._recover_incomplete_replacements()
+            if _recover_incomplete
+            else ReplacementRecoveryResult((), ())
+        )
+        return await self._await_refresh_worker(
             self._refresh_plugin_sync,
             plugin_id,
             blocked_recovery_plugin_ids=frozenset(
                 recovery.manual_recovery_plugin_ids
             ),
+            block_user_plugin_root=recovery.block_user_plugin_root,
         )
+
+    @staticmethod
+    async def _await_refresh_worker(function, /, *args, **kwargs):
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await await_cancellation_safe(operation)
+            raise
 
     async def list_autostart_plugin_ids(self) -> list[str]:
         return await asyncio.to_thread(_get_autostart_plugin_ids_sync)
+
+    async def list_plugin_installations(self, plugin_id: str) -> dict[str, object]:
+        try:
+            projection = await self._await_refresh_worker(
+                inspect_plugin_installations,
+                plugin_id,
+            )
+        except Exception as exc:
+            raise ServerDomainError(
+                code="PLUGIN_INSTALLATIONS_UNAVAILABLE",
+                message="plugin installations could not be inspected",
+                status_code=409,
+                details={
+                    "plugin_id": plugin_id,
+                    "reason": type(exc).__name__,
+                },
+            ) from exc
+        return serialize_plugin_installation_projection(projection)
 
     async def order_plugin_ids(self, plugin_ids: list[str]) -> list[str]:
         return await asyncio.to_thread(self._order_plugin_ids_sync, plugin_ids)
@@ -825,16 +936,18 @@ class PluginRegistryService:
         only_plugin_id: str | None = None,
         *,
         blocked_recovery_plugin_ids: frozenset[str] = frozenset(),
+        block_user_plugin_root: bool = False,
     ) -> dict[str, object]:
         roots = tuple(PLUGIN_CONFIG_ROOTS)
-        _prepare_plugin_import_roots(roots, logger)
+        scan_roots = roots[:1] if block_user_plugin_root and len(roots) > 1 else roots
+        _prepare_plugin_import_roots(scan_roots, logger)
 
         existing_snapshot = _get_registered_plugin_snapshot_sync()
         running_ids = _list_running_plugin_ids_sync()
         added: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
-        snapshot = _discover_registry_snapshot_sync(roots)
+        snapshot = _discover_registry_snapshot_sync(scan_roots)
         selected_contexts = [
             ctx
             for ctx in snapshot.selected_contexts
@@ -868,6 +981,14 @@ class PluginRegistryService:
             for plugin_id in sorted(blocked_recovery_plugin_ids)
             if only_plugin_id is None or plugin_id == only_plugin_id.casefold()
         )
+        if block_user_plugin_root:
+            failed.append(
+                {
+                    "plugin_id": only_plugin_id or "__replacement_recovery__",
+                    "config_path": "",
+                    "error": "user_plugin_root_requires_manual_recovery",
+                }
+            )
         superseded_ids: set[str] = set()
         selected_id_by_path = {
             ctx.toml_path.resolve(): ctx.pid
@@ -885,6 +1006,15 @@ class PluginRegistryService:
                 )
             ):
                 superseded_ids.add(existing_plugin_id)
+        for selected_config_path, selected_plugin_id in selected_id_by_path.items():
+            existing_config_path = _resolve_meta_config_path(
+                existing_snapshot.get(selected_plugin_id)
+            )
+            if (
+                existing_config_path is not None
+                and existing_config_path != selected_config_path
+            ):
+                superseded_ids.add(selected_plugin_id)
         superseded_running = sorted(superseded_ids & running_ids)
         superseded_removed, _ = _remove_stale_plugin_metadata_sync(
             superseded_ids - running_ids,
@@ -1013,6 +1143,7 @@ class PluginRegistryService:
         plugin_id: str,
         *,
         blocked_recovery_plugin_ids: frozenset[str] = frozenset(),
+        block_user_plugin_root: bool = False,
     ) -> dict[str, object]:
         normalized_plugin_id = plugin_id.strip()
         if not _PLUGIN_ID_PATTERN.fullmatch(normalized_plugin_id):
@@ -1033,6 +1164,7 @@ class PluginRegistryService:
         refresh_result = self._refresh_registry_sync(
             only_plugin_id=normalized_plugin_id,
             blocked_recovery_plugin_ids=blocked_recovery_plugin_ids,
+            block_user_plugin_root=block_user_plugin_root,
         )
         matching_failure = next(
             (

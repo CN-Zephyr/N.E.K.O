@@ -17,6 +17,14 @@ const ERROR_KEYS = {
   PLUGIN_PACKAGE_STATE_CONFLICT: 'package.install.error.packageStateConflict',
 } as const
 
+export function resolvePluginPackageErrorCodeMessage(
+  code: string,
+  t: Translate,
+): string | null {
+  if (!(code in ERROR_KEYS)) return null
+  return t(ERROR_KEYS[code as keyof typeof ERROR_KEYS])
+}
+
 function readHeader(headers: unknown, name: string): string {
   if (!headers || typeof headers !== 'object') return ''
   const bag = headers as Record<string, unknown> & { get?: (key: string) => unknown }
@@ -88,12 +96,10 @@ export function resolvePluginPackageErrorMessage(
     return t('package.install.rollbackCompleted')
   }
 
-  const key = (
-    code in ERROR_KEYS
-      ? ERROR_KEYS[code as keyof typeof ERROR_KEYS]
-      : ''
-  ) || legacyErrorKey(error)
-  if (key) return t(key)
+  const codeMessage = resolvePluginPackageErrorCodeMessage(code, t)
+  if (codeMessage) return codeMessage
+  const legacyKey = legacyErrorKey(error)
+  if (legacyKey) return t(legacyKey)
 
   if (phase === 'plan') return t('package.install.planFailed')
   if (phase === 'inspect') return t('package.install.error.inspectFailed')

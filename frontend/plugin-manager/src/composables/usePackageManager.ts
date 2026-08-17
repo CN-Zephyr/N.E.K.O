@@ -746,7 +746,11 @@ export function usePackageManager(options: UsePackageManagerOptions = {}) {
     }
     setResult('install', response)
     await refreshPluginSources()
-    if (response.activation?.status === 'pending_restart') {
+    if (response.activation?.status === 'blocked') {
+      ElMessage.error(t('package.install.activationBlocked', {
+        reason: response.activation.reason,
+      }))
+    } else if (response.activation?.status === 'pending_restart') {
       ElMessage.success(t('package.install.restartRequired'))
     } else if (response.operation === 'upgrade') {
       const plan = installPlan.value

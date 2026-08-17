@@ -36,6 +36,9 @@ def _patch_roots(
         builtin_root,
     )
     monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", user_root)
+    monkeypatch.setattr(
+        plugin_settings, "MANAGED_PLUGIN_INSTALLATIONS_ROOT", user_root
+    )
     monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
     monkeypatch.setattr(
         plugin_settings,
@@ -52,6 +55,21 @@ def _file_snapshot(root: Path) -> dict[str, bytes]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def test_cancelled_install_rollback_exposes_stable_incomplete_diagnostics() -> None:
+    cancellation = asyncio.CancelledError()
+
+    PluginCliService._annotate_cancelled_rollback(
+        cancellation,
+        ["payload_cleanup_incomplete", "inventory_restore:OSError"],
+    )
+
+    assert cancellation.rollback_code == "PLUGIN_INSTALL_ROLLBACK_INCOMPLETE"
+    assert cancellation.recovery_errors == (
+        "payload_cleanup_incomplete",
+        "inventory_restore:OSError",
+    )
 
 
 async def _event_loop_checkpoint() -> None:

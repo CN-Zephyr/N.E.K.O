@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from plugin.server.application.plugins.inventory_store import InventoryResolution
+from plugin.server.application.plugins.inventory_store import (
+    ActiveInstallation,
+    InventoryResolution,
+)
 
 
-RootId = Literal["builtin", "user"]
+RootId = Literal["builtin", "managed", "legacy", "user"]
 ResolutionStatus = Literal["selected", "deleted", "blocked"]
 
 
@@ -19,6 +22,7 @@ class PluginCandidate:
     root_id: RootId
     directory_name: str
     config_path: Path
+    installation_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +50,9 @@ def resolve_plugin_candidates(
         group = sorted(
             grouped[canonical_plugin_id],
             key=lambda candidate: (
-                0 if candidate.root_id == "builtin" else 1,
+                {"builtin": 0, "managed": 1, "legacy": 2, "user": 2}[
+                    candidate.root_id
+                ],
                 candidate.directory_name,
                 str(candidate.config_path),
             ),
@@ -87,17 +93,57 @@ def resolve_plugin_candidates(
             )
             continue
 
-        claimed_directory = inventory.active_user_directories.get(canonical_plugin_id)
-        if claimed_directory is not None:
-            user_candidates = [
-                candidate for candidate in group if candidate.root_id == "user"
+        active_installation = inventory.active_installations.get(canonical_plugin_id)
+        if active_installation is None:
+            claimed_directory = inventory.active_user_directories.get(
+                canonical_plugin_id
+            )
+            if claimed_directory is not None:
+                active_installation = ActiveInstallation(
+                    installation_key=f"user:{claimed_directory}",
+                    installation_kind="legacy",
+                    directory_name=claimed_directory,
+                )
+        if active_installation is not None:
+            def _candidate_kind(candidate: PluginCandidate) -> str | None:
+                if candidate.root_id == "managed":
+                    return "managed"
+                if candidate.root_id in {"legacy", "user"}:
+                    return "legacy"
+                return None
+
+            def _candidate_keys(candidate: PluginCandidate) -> frozenset[str]:
+                if candidate.installation_key is not None:
+                    return frozenset({candidate.installation_key})
+                if candidate.root_id == "user":
+                    return frozenset(
+                        {
+                            f"user:{candidate.directory_name}",
+                            f"legacy:{candidate.directory_name}",
+                        }
+                    )
+                kind = _candidate_kind(candidate)
+                if kind is None:
+                    return frozenset()
+                return frozenset({f"{kind}:{candidate.directory_name}"})
+
+            install_candidates = [
+                candidate
+                for candidate in group
+                if _candidate_kind(candidate)
+                == active_installation.installation_kind
             ]
             claimed = [
                 candidate
-                for candidate in user_candidates
-                if candidate.directory_name == claimed_directory
+                for candidate in install_candidates
+                if candidate.directory_name == active_installation.directory_name
+                and active_installation.installation_key in _candidate_keys(candidate)
             ]
-            if len(claimed) == 1 and len(user_candidates) == 1:
+            claim_is_unambiguous = len(claimed) == 1 and (
+                active_installation.installation_kind == "managed"
+                or len(install_candidates) == 1
+            )
+            if claim_is_unambiguous:
                 selected = claimed[0]
                 resolutions.append(
                     PluginResolution(
@@ -105,12 +151,16 @@ def resolve_plugin_candidates(
                         status="selected",
                         selected=selected,
                         rejected=tuple(item for item in group if item != selected),
-                        reason="explicit_user_installation",
+                        reason=(
+                            "explicit_managed_installation"
+                            if active_installation.installation_kind == "managed"
+                            else "explicit_user_installation"
+                        ),
                     )
                 )
                 continue
 
-            if len(claimed) == 1 and len(user_candidates) > 1:
+            if len(claimed) == 1 and len(install_candidates) > 1:
                 resolutions.append(
                     PluginResolution(
                         logical_plugin_id=plugin_id,
@@ -148,7 +198,10 @@ def resolve_plugin_candidates(
             continue
 
         builtin = [candidate for candidate in group if candidate.root_id == "builtin"]
-        users = [candidate for candidate in group if candidate.root_id == "user"]
+        managed = [candidate for candidate in group if candidate.root_id == "managed"]
+        legacy = [
+            candidate for candidate in group if candidate.root_id in {"legacy", "user"}
+        ]
         if len(builtin) == 1:
             selected = builtin[0]
             resolutions.append(
@@ -161,12 +214,12 @@ def resolve_plugin_candidates(
                 )
             )
             continue
-        if not builtin and len(users) == 1:
+        if not builtin and not managed and len(legacy) == 1:
             resolutions.append(
                 PluginResolution(
                     logical_plugin_id=plugin_id,
                     status="selected",
-                    selected=users[0],
+                    selected=legacy[0],
                     rejected=(),
                     reason="single_legacy_user_installation",
                 )

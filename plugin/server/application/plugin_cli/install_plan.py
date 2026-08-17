@@ -10,6 +10,7 @@ import zipfile
 
 from plugin.core.plugin_layout import resolve_plugin_layout
 from plugin.neko_plugin_cli.public import inspect_package
+from plugin.server.infrastructure.path_safety import is_link_or_reparse_point
 
 
 InstallAction = Literal["install", "upgrade", "blocked"]
@@ -73,7 +74,7 @@ def _update_digest_with_target_snapshot(
             relative = child.relative_to(target_dir).as_posix().encode("utf-8")
             digest.update(b"\0path\0")
             digest.update(relative)
-            if child.is_symlink():
+            if is_link_or_reparse_point(child):
                 digest.update(b"\0link\0")
                 digest.update(os.readlink(child).encode("utf-8"))
                 continue
@@ -243,7 +244,7 @@ def classify_install_target_placeholder(
 
     if not target_dir.exists():
         return "absent"
-    if target_dir.is_symlink() or not target_dir.is_dir():
+    if is_link_or_reparse_point(target_dir) or not target_dir.is_dir():
         return "conflict"
     try:
         children = tuple(target_dir.iterdir())
@@ -262,7 +263,7 @@ def classify_install_target_placeholder(
         layout.cache_dir.resolve(strict=False),
     }
     for child in children:
-        if child.is_symlink() or not child.is_dir():
+        if is_link_or_reparse_point(child) or not child.is_dir():
             return "conflict"
         if child.resolve(strict=False) not in allowed_state_dirs:
             return "conflict"
