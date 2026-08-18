@@ -463,8 +463,24 @@ async def plugin_cli_unpack_legacy(
     payload: PluginCliInstallRequest,
     _: str = require_admin,
 ) -> dict[str, object]:
-    """Legacy alias for /plugin-cli/install. Translates response keys."""
-    result = await plugin_cli_install(payload, _)
+    """Legacy developer unpack alias without runtime activation side effects."""
+    try:
+        result = await service.install(
+            package=payload.package,
+            plugins_root=payload.plugins_root,
+            profiles_root=payload.profiles_root,
+            on_conflict=payload.on_conflict,
+            install_source=payload.install_source,
+            confirm_upgrade=payload.confirm_upgrade,
+            confirmation_token=payload.confirmation_token,
+            activate_installation=False,
+        )
+    except ServerDomainError as error:
+        raise_http_from_domain(
+            error,
+            logger=logger,
+            include_details=error.code == "PLUGIN_UPGRADE_ROLLED_BACK",
+        )
     # Translate new keys to legacy keys expected by frontend
     if isinstance(result, dict):
         translated = dict(result)

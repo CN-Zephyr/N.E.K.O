@@ -773,6 +773,7 @@ async def test_plugin_cli_route_workflow_pack_analyze_inspect_verify_and_unpack(
         assert unpack_body["package_type"] == "bundle"
         assert unpack_body["unpacked_plugin_count"] == 2
         assert unpack_body["payload_hash_verified"] is True
+        assert "activation" not in unpack_body
         assert (plugins_root / "bundle_alpha" / "plugin.toml").is_file()
         assert (plugins_root / "bundle_beta" / "plugin.toml").is_file()
         assert (profiles_root / "route_workflow_bundle" / "default.toml").is_file()
@@ -809,6 +810,7 @@ async def test_plugin_cli_unpack_route_uses_default_roots_when_fields_omitted(
         assert response.status_code == 200
         body = response.json()
         assert body["plugins_root"] == str(default_plugins_root.resolve())
+        assert "activation" not in body
         assert (default_plugins_root / "simple_plugin" / "plugin.toml").is_file()
 
 
