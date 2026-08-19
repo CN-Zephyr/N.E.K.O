@@ -212,10 +212,11 @@ def bridge_e2e_env(
 
     builtin_root = tmp_path / "builtin"
     user_root = tmp_path / "user"
+    legacy_root = tmp_path / "legacy-user"
     packages_root = tmp_path / "packages"
     profiles_root = tmp_path / "profiles"
     lock_path = tmp_path / "plugins.lock.json"
-    for d in (builtin_root, user_root, packages_root, profiles_root):
+    for d in (builtin_root, user_root, legacy_root, packages_root, profiles_root):
         d.mkdir(parents=True, exist_ok=True)
 
     from plugin.server.application import plugin_cli as plugin_cli_pkg
@@ -223,6 +224,10 @@ def bridge_e2e_env(
     from plugin.core import registry as core_registry_module
     import plugin.settings as plugin_settings
     from plugin.server.routes import market_bridge as market_bridge_module
+
+    monkeypatch.setattr(market_bridge_module, "_tasks", {})
+    monkeypatch.setattr(market_bridge_module, "_task_workers", {})
+    monkeypatch.setattr(market_bridge_module, "_external_handoff_attempts", {})
 
     production_download_validator = market_bridge_module._validate_market_download_url
 
@@ -239,13 +244,18 @@ def bridge_e2e_env(
     )
 
     monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
-    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", user_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", legacy_root)
+    monkeypatch.setattr(
+        plugin_settings,
+        "MANAGED_PLUGIN_INSTALLATIONS_ROOT",
+        user_root,
+    )
     monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
     monkeypatch.setattr(plugin_settings, "USER_PACKAGE_PROFILES_ROOT", profiles_root)
     monkeypatch.setattr(
         registry_module,
         "PLUGIN_CONFIG_ROOTS",
-        (builtin_root, user_root),
+        (builtin_root, user_root, legacy_root),
     )
     monkeypatch.setattr(
         core_registry_module,

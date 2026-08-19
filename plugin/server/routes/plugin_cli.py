@@ -384,10 +384,9 @@ async def plugin_cli_upload(
     passed to ``/plugin-cli/install`` or ``/plugin-cli/inspect``.
     """
     try:
-        content = await file.read()
-        return await service.save_uploaded_package(
+        return await service.save_uploaded_file(
             filename=file.filename or "unknown.neko-plugin",
-            content=content,
+            source_file=file.file,
         )
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
@@ -407,11 +406,11 @@ async def plugin_cli_upload_and_install(
     Combines upload + install into a single request for convenience.
     """
     try:
-        content = await file.read()
         return await service.upload_and_install(
             filename=file.filename or "unknown.neko-plugin",
-            content=content,
+            source_file=file.file,
             on_conflict=on_conflict,
+            activate_installation=True,
         )
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
@@ -498,8 +497,23 @@ async def plugin_cli_upload_and_unpack_legacy(
     on_conflict: str = Query(default="fail", pattern="^fail$"),
     _: str = require_admin,
 ) -> dict[str, object]:
-    """Legacy alias for /plugin-cli/upload-and-install. Translates response keys."""
-    result = await plugin_cli_upload_and_install(file, on_conflict=on_conflict, _=_)
+    """Legacy developer upload/unpack alias without runtime activation."""
+    try:
+        result = await service.upload_and_install(
+            filename=file.filename or "unknown.neko-plugin",
+            source_file=file.file,
+            on_conflict=on_conflict,
+            activate_installation=False,
+            record_install_source=False,
+        )
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+    except Exception:
+        logger.exception("Unexpected error during plugin package upload-and-unpack")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during upload-and-unpack",
+        )
     # Translate nested install keys
     if isinstance(result, dict) and isinstance(result.get("install"), dict):
         install = dict(result["install"])

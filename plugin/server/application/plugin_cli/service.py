@@ -9,7 +9,7 @@ import tomllib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from plugin.core.plugin_layout import resolve_plugin_layout
 from plugin.core.state import state as plugin_state
@@ -1006,15 +1006,71 @@ class PluginCliService:
             content=content,
         )
 
+    async def save_uploaded_file(
+        self,
+        *,
+        filename: str,
+        source_file: BinaryIO,
+    ) -> dict[str, object]:
+        """Stream an uploaded package into the managed package directory."""
+
+        return await self._save_package_mutation(
+            self._save_uploaded_file_sync,
+            filename=filename,
+            source_file=source_file,
+        )
+
+    async def _materialize_uploaded_package(
+        self,
+        *,
+        filename: str,
+        content: bytes | None,
+        source_file: BinaryIO | None,
+        package_path: str | None,
+    ) -> tuple[dict[str, object], str]:
+        if package_path is not None:
+            saved = await self._save_package_mutation(
+                self._save_package_file_sync,
+                filename=filename,
+                package_path=package_path,
+            )
+        elif source_file is not None:
+            saved = await self.save_uploaded_file(
+                filename=filename,
+                source_file=source_file,
+            )
+        else:
+            saved = await self.save_uploaded_package(
+                filename=filename,
+                content=content or b"",
+            )
+
+        try:
+            actual_sha256 = await self._await_sync_mutation(
+                self._sha256_file,
+                str(saved["path"]),
+            )
+        except (asyncio.CancelledError, Exception):
+            await upgrade_support.await_cancellation_safe(
+                asyncio.to_thread(
+                    Path(str(saved["path"])).unlink,
+                    missing_ok=True,
+                )
+            )
+            raise
+        return saved, actual_sha256
+
     async def upload_and_install(
         self,
         *,
         filename: str,
         content: bytes | None = None,
+        source_file: BinaryIO | None = None,
         package_path: str | None = None,
         on_conflict: str = "fail",
         install_source_override: dict[str, Any] | None = None,
         activate_installation: bool = True,
+        record_install_source: bool = True,
         _mutation_guarded: bool = False,
     ) -> dict[str, object]:
         """Upload, unpack, and atomically record the install source (design §3.3).
@@ -1064,20 +1120,30 @@ class PluginCliService:
                 return await self.upload_and_install(
                     filename=filename,
                     content=content,
+                    source_file=source_file,
                     package_path=package_path,
                     on_conflict=on_conflict,
                     install_source_override=install_source_override,
                     activate_installation=activate_installation,
+                    record_install_source=record_install_source,
                     _mutation_guarded=True,
                 )
 
-        if content is None and package_path is None:
-            raise ValueError("upload_and_install requires content or package_path")
-        if content is not None and package_path is not None:
-            raise ValueError("upload_and_install accepts content or package_path, not both")
+        supplied_inputs = sum(
+            value is not None for value in (content, source_file, package_path)
+        )
+        if supplied_inputs != 1:
+            raise ValueError(
+                "upload_and_install requires exactly one of content, source_file, "
+                "or package_path"
+            )
+        if install_source_override is not None and not record_install_source:
+            raise ValueError(
+                "market uploads must record their install source"
+            )
 
         if install_source_override is None:
-            owns_saved_package = content is not None or package_path is not None
+            owns_saved_package = True
             saved: dict[str, object] | None = None
             unpacked_target_dirs: list[Path] = []
             unpacked_profile_dirs: list[Path] = []
@@ -1085,34 +1151,16 @@ class PluginCliService:
             source_snapshot = None
             inventory_snapshot = None
             rollback_created_paths: dict[Path, tuple[Path, ...]] = {}
-            if package_path is not None:
-                saved = await self._save_package_mutation(
-                    self._save_package_file_sync,
-                    filename=filename,
-                    package_path=package_path,
-                )
-                try:
-                    actual_sha256 = await self._await_sync_mutation(
-                        self._sha256_file,
-                        str(saved["path"]),
-                    )
-                except asyncio.CancelledError:
-                    await upgrade_support.await_cancellation_safe(
-                        asyncio.to_thread(
-                            Path(str(saved["path"])).unlink,
-                            missing_ok=True,
-                        )
-                    )
-                    raise
-            else:
-                saved = await self.save_uploaded_package(
-                    filename=filename,
-                    content=content or b"",
-                )
-                actual_sha256 = hashlib.sha256(content or b"").hexdigest().lower()
+            saved, actual_sha256 = await self._materialize_uploaded_package(
+                filename=filename,
+                content=content,
+                source_file=source_file,
+                package_path=package_path,
+            )
             try:
-                source_manager = self._require_install_source_manager()
-                source_snapshot = source_manager.snapshot()
+                if record_install_source:
+                    source_manager = self._require_install_source_manager()
+                    source_snapshot = source_manager.snapshot()
                 inventory_snapshot = (
                     await asyncio.to_thread(capture_inventory_snapshot)
                     if activate_installation
@@ -1131,12 +1179,16 @@ class PluginCliService:
                     install_result,
                     remove=True,
                 )
-                warning = await self._record_install_source_best_effort(
-                    install_result=install_result,
-                    package_filename=str(saved["name"]),
-                    package_sha256=actual_sha256,
-                    override=None,
-                    strict_write=True,
+                warning = (
+                    await self._record_install_source_best_effort(
+                        install_result=install_result,
+                        package_filename=str(saved["name"]),
+                        package_sha256=actual_sha256,
+                        override=None,
+                        strict_write=True,
+                    )
+                    if record_install_source
+                    else None
                 )
                 payload: dict[str, object] = {
                     "upload": saved,
@@ -1206,24 +1258,13 @@ class PluginCliService:
 
         try:
             # Step 1 — materialise package bytes on disk when needed.
-            if package_path is not None:
-                saved = await self._save_package_mutation(
-                    self._save_package_file_sync,
-                    filename=filename,
-                    package_path=package_path,
-                )
-                actual_sha256 = await self._await_sync_mutation(
-                    self._sha256_file,
-                    str(saved["path"]),
-                )
-                owns_saved_package = True
-            else:
-                saved = await self.save_uploaded_package(
-                    filename=filename,
-                    content=content or b"",
-                )
-                owns_saved_package = True
-                actual_sha256 = hashlib.sha256(content or b"").hexdigest().lower()
+            saved, actual_sha256 = await self._materialize_uploaded_package(
+                filename=filename,
+                content=content,
+                source_file=source_file,
+                package_path=package_path,
+            )
+            owns_saved_package = True
 
             # Step 2 — install/unpack into the user plugin root.
             saved_path = str(saved["path"])
@@ -2340,6 +2381,79 @@ class PluginCliService:
                 "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             }
         except Exception as exc:
+            raise self._domain_error_from_exception(exc, action="upload") from exc
+
+    def _save_uploaded_file_sync(
+        self,
+        *,
+        filename: str,
+        source_file: BinaryIO,
+    ) -> dict[str, object]:
+        """Copy an upload stream with a hard limit and no unbounded read."""
+
+        dest: Path | None = None
+        try:
+            safe_name = Path(filename).name
+            if not safe_name:
+                raise ValueError("Invalid filename")
+            has_valid_suffix = any(
+                safe_name.endswith(suffix) for suffix in _ALLOWED_UPLOAD_SUFFIXES
+            )
+            if not has_valid_suffix:
+                allowed = ", ".join(sorted(_ALLOWED_UPLOAD_SUFFIXES))
+                raise ValueError(f"Unsupported file type. Allowed: {allowed}")
+
+            target_root = self._path_policy().package_artifacts_root
+            target_root.mkdir(parents=True, exist_ok=True)
+            stem = safe_name
+            suffix = ""
+            for allowed_suffix in sorted(
+                _ALLOWED_UPLOAD_SUFFIXES,
+                key=len,
+                reverse=True,
+            ):
+                if stem.endswith(allowed_suffix):
+                    suffix = allowed_suffix
+                    stem = stem[: -len(allowed_suffix)]
+                    break
+
+            dest = target_root / safe_name
+            while True:
+                try:
+                    with dest.open("xb") as output:
+                        total = 0
+                        while True:
+                            chunk = source_file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > _UPLOAD_MAX_BYTES:
+                                raise ValueError(
+                                    f"File too large: more than {_UPLOAD_MAX_BYTES} bytes "
+                                    f"(max {_UPLOAD_MAX_BYTES // (1024 * 1024)} MB)"
+                                )
+                            output.write(chunk)
+                    break
+                except FileExistsError:
+                    unique = uuid.uuid4().hex[:8]
+                    dest = target_root / f"{stem}_{unique}{suffix}"
+                except Exception:
+                    dest.unlink(missing_ok=True)
+                    raise
+
+            stat = dest.stat()
+            return {
+                "name": dest.name,
+                "path": str(dest.resolve()),
+                "size_bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    tz=timezone.utc,
+                ).isoformat(),
+            }
+        except Exception as exc:
+            if dest is not None:
+                dest.unlink(missing_ok=True)
             raise self._domain_error_from_exception(exc, action="upload") from exc
 
     def _save_package_file_sync(self, *, filename: str, package_path: str) -> dict[str, object]:

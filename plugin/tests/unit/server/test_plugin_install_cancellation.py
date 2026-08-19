@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import threading
 from pathlib import Path
 from typing import Literal
@@ -257,9 +258,9 @@ async def test_cancelled_install_waits_for_file_worker_and_rolls_back_before_gua
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["upload", "market"])
+@pytest.mark.parametrize("operation", ["upload", "stream", "market"])
 async def test_cancelled_upload_waits_for_package_copy_and_removes_saved_file(
-    operation: Literal["upload", "market"],
+    operation: Literal["upload", "stream", "market"],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -301,12 +302,14 @@ async def test_cancelled_upload_waits_for_package_copy_and_removes_saved_file(
         }
 
     monkeypatch.setattr(service, "_save_package_file_sync", save_package)
+    monkeypatch.setattr(service, "_save_uploaded_file_sync", save_package)
 
     async def run_operation() -> dict[str, object]:
-        kwargs: dict[str, object] = {
-            "filename": source_package.name,
-            "package_path": str(source_package),
-        }
+        kwargs: dict[str, object] = {"filename": source_package.name}
+        if operation == "stream":
+            kwargs["source_file"] = io.BytesIO(b"streamed-package")
+        else:
+            kwargs["package_path"] = str(source_package)
         if operation == "market":
             kwargs["install_source_override"] = {
                 "channel": "market",

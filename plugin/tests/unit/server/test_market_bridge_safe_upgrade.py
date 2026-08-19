@@ -129,6 +129,84 @@ async def test_external_handoffs_cannot_consume_local_plugin_center_reserve(
 
 
 @pytest.mark.asyncio
+async def test_external_handoffs_are_limited_per_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_bridge, "_tasks", {})
+    monkeypatch.setattr(market_bridge, "_task_workers", {})
+    monkeypatch.setattr(market_bridge, "_TASK_MAX_ENTRIES", 200)
+    monkeypatch.setattr(market_bridge, "_EXTERNAL_SOURCE_PENDING_LIMIT", 2, raising=False)
+    monkeypatch.setattr(market_bridge, "_EXTERNAL_SOURCE_RATE_LIMIT", 20, raising=False)
+    monkeypatch.setattr(market_bridge, "_external_handoff_attempts", {}, raising=False)
+
+    for plugin_id, origin in (
+        ("source-one", "https://market.project-neko.cn"),
+        ("source-two", "https://spoofed-origin.example"),
+    ):
+        response = await market_bridge.market_install(
+            _market_install_request(plugin_id),
+            market_bridge.get_bridge_token(),
+            origin=origin,
+        )
+        assert response.status == "awaiting_confirmation"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await market_bridge.market_install(
+            _market_install_request("source-three"),
+            market_bridge.get_bridge_token(),
+            origin="https://market.project-neko.cn",
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["code"] == "external_handoff_source_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_external_handoff_creation_is_rate_limited_per_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_bridge, "_tasks", {})
+    monkeypatch.setattr(market_bridge, "_task_workers", {})
+    monkeypatch.setattr(market_bridge, "_TASK_MAX_ENTRIES", 200)
+    monkeypatch.setattr(market_bridge, "_EXTERNAL_SOURCE_PENDING_LIMIT", 20, raising=False)
+    monkeypatch.setattr(market_bridge, "_EXTERNAL_SOURCE_RATE_LIMIT", 2, raising=False)
+    monkeypatch.setattr(market_bridge, "_external_handoff_attempts", {}, raising=False)
+
+    for plugin_id in ("rate-one", "rate-two"):
+        response = await market_bridge.market_install(
+            _market_install_request(plugin_id),
+            market_bridge.get_bridge_token(),
+            origin="https://market.project-neko.cn",
+        )
+        assert response.status == "awaiting_confirmation"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await market_bridge.market_install(
+            _market_install_request("rate-three"),
+            market_bridge.get_bridge_token(),
+            origin="https://market.project-neko.cn",
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["code"] == "external_handoff_rate_limited"
+
+
+def test_external_handoff_rate_state_expires_without_leaking_source_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    patch_module_clock(monkeypatch, market_bridge, time=lambda: now[0])
+    attempts = {"old.example": market_bridge.deque([100.0])}
+    monkeypatch.setattr(market_bridge, "_external_handoff_attempts", attempts)
+    monkeypatch.setattr(market_bridge, "_tasks", {})
+
+    now[0] += market_bridge._EXTERNAL_SOURCE_RATE_WINDOW_SECONDS + 1
+    market_bridge._cleanup_tasks()
+
+    assert market_bridge._external_handoff_attempts == {}
+
+
+@pytest.mark.asyncio
 async def test_market_worker_shutdown_cancels_and_awaits_every_active_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

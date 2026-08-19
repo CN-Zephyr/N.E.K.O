@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import dataclasses
 import hashlib
 import ipaddress
@@ -85,6 +86,10 @@ _TASK_TTL_SECONDS = 60 * 60
 _TASK_MAX_ENTRIES = 200
 _LOCAL_TASK_RESERVED_ENTRIES = 20
 _INSTALL_CONFIRMATION_TTL_SECONDS = 10 * 60
+_EXTERNAL_SOURCE_PENDING_LIMIT = 8
+_EXTERNAL_SOURCE_RATE_LIMIT = 16
+_EXTERNAL_SOURCE_RATE_WINDOW_SECONDS = 60
+_external_handoff_attempts: dict[str, deque[float]] = {}
 
 # 短期一次性配对码；成功交换后立即消费。
 _ONE_TIME_CODES: dict[str, float] = {}
@@ -322,6 +327,22 @@ def _worker_finished(task_id: str) -> bool:
 
 def _cleanup_tasks(*, reserve_slots: int = 0) -> None:
     now = time.time()
+    attempt_cutoff = now - _EXTERNAL_SOURCE_RATE_WINDOW_SECONDS
+    tracked_external_sources = {
+        str(task.get("request_source_key"))
+        for task in _tasks.values()
+        if task.get("request_origin") == "external"
+        and task.get("request_source_key")
+    }
+    for source_key, attempts in list(_external_handoff_attempts.items()):
+        if source_key not in tracked_external_sources:
+            _external_handoff_attempts.pop(source_key, None)
+            continue
+        while attempts and attempts[0] <= attempt_cutoff:
+            attempts.popleft()
+        if not attempts:
+            _external_handoff_attempts.pop(source_key, None)
+
     for task in _tasks.values():
         if task.get("status") != "awaiting_confirmation":
             continue
@@ -370,6 +391,48 @@ def _cleanup_tasks(*, reserve_slots: int = 0) -> None:
     for task_id, _task in ordered[:overflow]:
         _tasks.pop(task_id, None)
         _task_workers.pop(task_id, None)
+
+
+def _external_handoff_source_key(*, bridge_token: str) -> str:
+    """Return a non-secret key for the current paired bridge session."""
+
+    digest = hashlib.sha256(bridge_token.encode("utf-8")).hexdigest()
+    return f"bridge:{digest[:16]}"
+
+
+def _enforce_external_handoff_source_limits(*, source_key: str) -> None:
+    active_for_source = sum(
+        1
+        for task in _tasks.values()
+        if task.get("request_origin") == "external"
+        and task.get("request_source_key") == source_key
+        and task.get("status") not in _TERMINAL_TASK_STATUSES
+    )
+    if active_for_source >= _EXTERNAL_SOURCE_PENDING_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "external_handoff_source_limit_reached",
+                "message": "Too many confirmations are pending from this source.",
+                "available_actions": ["retry_later", "open_plugin_center"],
+            },
+        )
+
+    now = time.time()
+    cutoff = now - _EXTERNAL_SOURCE_RATE_WINDOW_SECONDS
+    attempts = _external_handoff_attempts.setdefault(source_key, deque())
+    while attempts and attempts[0] <= cutoff:
+        attempts.popleft()
+    if len(attempts) >= _EXTERNAL_SOURCE_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "external_handoff_rate_limited",
+                "message": "This source is creating install requests too quickly.",
+                "available_actions": ["retry_later", "open_plugin_center"],
+            },
+        )
+    attempts.append(now)
 
 
 async def shutdown_market_task_workers() -> None:
@@ -882,6 +945,11 @@ async def market_install(
         if origin and _is_local_bridge_origin(origin, _main_server_port())
         else "external"
     )
+    request_source_key = (
+        "local"
+        if request_origin == "local"
+        else _external_handoff_source_key(bridge_token=token)
+    )
     external_capacity = max(
         0,
         _TASK_MAX_ENTRIES - min(_LOCAL_TASK_RESERVED_ENTRIES, _TASK_MAX_ENTRIES),
@@ -901,6 +969,8 @@ async def market_install(
                 "available_actions": ["retry_later", "open_plugin_center"],
             },
         )
+    if request_origin == "external":
+        _enforce_external_handoff_source_limits(source_key=request_source_key)
 
     task_id = secrets.token_urlsafe(16)
     _tasks[task_id] = {
@@ -924,6 +994,7 @@ async def market_install(
         "logical_plugin_key": logical_plugin_key,
         "request_fingerprint": request_fingerprint,
         "request_origin": request_origin,
+        "request_source_key": request_source_key,
         "confirmation_expires_at": time.time() + _INSTALL_CONFIRMATION_TTL_SECONDS,
         # Kept only in Core memory until the local plugin manager confirms the
         # one-shot handoff.  It is intentionally excluded from the response

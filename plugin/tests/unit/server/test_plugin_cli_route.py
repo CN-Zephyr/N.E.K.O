@@ -4,6 +4,7 @@ import asyncio
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import errno
+import io
 from pathlib import Path
 import hashlib
 import os
@@ -37,6 +38,7 @@ from plugin.server.application.plugins.registry_service import PluginRegistrySer
 from plugin.server.application.install_source import (
     InstallSourceManager,
     PluginDirectoryScanner,
+    get_install_source_manager,
     set_global_manager,
 )
 from plugin.server.domain.errors import ServerDomainError
@@ -379,9 +381,10 @@ def _patch_plugin_cli_settings(
 class _MemoryUploadFile:
     def __init__(self) -> None:
         self.filename = "demo.neko-plugin"
+        self.file = io.BytesIO(b"demo")
 
     async def read(self) -> bytes:
-        return b"demo"
+        raise AssertionError("upload routes must not copy the whole file into memory")
 
 
 @pytest.fixture
@@ -408,8 +411,13 @@ def _isolate_plugin_registry_state() -> None:
             plugin_state._snapshot_cache = cache_backup
 
 
-def test_upload_and_unpack_legacy_returns_unpack_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_upload_and_install(*_args, **_kwargs) -> dict[str, object]:
+def test_upload_and_unpack_legacy_returns_unpack_key_without_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_upload_and_install(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
         return {
             "upload": {"filename": "demo.neko-plugin"},
             "install": {
@@ -419,8 +427,8 @@ def test_upload_and_unpack_legacy_returns_unpack_key(monkeypatch: pytest.MonkeyP
         }
 
     monkeypatch.setattr(
-        plugin_cli_routes,
-        "plugin_cli_upload_and_install",
+        plugin_cli_routes.service,
+        "upload_and_install",
         fake_upload_and_install,
     )
 
@@ -440,6 +448,120 @@ def test_upload_and_unpack_legacy_returns_unpack_key(monkeypatch: pytest.MonkeyP
         "unpacked_plugins": ["demo"],
         "unpacked_plugin_count": 1,
     }
+    assert captured["activate_installation"] is False
+    assert captured["record_install_source"] is False
+    assert captured["source_file"] is not None
+    assert "content" not in captured
+
+
+@pytest.mark.asyncio
+async def test_upload_and_install_streams_and_activates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_upload_and_install(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "upload": {"filename": "demo.neko-plugin"},
+            "install": {
+                "installed_plugins": [],
+                "installed_plugin_count": 0,
+            },
+        }
+
+    monkeypatch.setattr(
+        plugin_cli_routes.service,
+        "upload_and_install",
+        fake_upload_and_install,
+    )
+
+    await plugin_cli_routes.plugin_cli_upload_and_install(
+        _MemoryUploadFile(),  # type: ignore[arg-type]
+        on_conflict="fail",
+        _="",
+    )
+
+    assert captured["activate_installation"] is True
+    assert captured["source_file"] is not None
+    assert "content" not in captured
+
+
+class _BoundedReadStream(io.BytesIO):
+    def __init__(self, content: bytes) -> None:
+        super().__init__(content)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        assert size > 0, "streaming save must always use a bounded read"
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
+def test_streamed_upload_enforces_limit_and_removes_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packages_root = tmp_path / "packages"
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=tmp_path / "builtin",
+        packages_root=packages_root,
+    )
+    monkeypatch.setattr(plugin_cli_service_module, "_UPLOAD_MAX_BYTES", 5)
+    stream = _BoundedReadStream(b"123456")
+
+    with pytest.raises(ServerDomainError):
+        PluginCliService()._save_uploaded_file_sync(
+            filename="too-large.neko-plugin",
+            source_file=stream,
+        )
+
+    assert stream.read_sizes
+    assert all(0 < size <= 1024 * 1024 for size in stream.read_sizes)
+    assert not list(packages_root.glob("*"))
+
+
+@pytest.mark.asyncio
+async def test_streamed_developer_unpack_does_not_record_source_or_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    managed_root = tmp_path / "plugin-installations"
+    user_root = tmp_path / "plugins"
+    packages_root = tmp_path / "packages"
+    profiles_root = tmp_path / "profiles"
+    inventory_path = tmp_path / "plugin-installations.json"
+    package_source = tmp_path / "developer.neko-plugin"
+    pack_plugin(
+        _make_plugin_dir(source_root, plugin_id="developer_unpack"),
+        package_source,
+    )
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=tmp_path / "builtin",
+        managed_root=managed_root,
+        user_root=user_root,
+        packages_root=packages_root,
+        profiles_root=profiles_root,
+    )
+    monkeypatch.setenv("NEKO_PLUGIN_INSTALLATIONS_PATH", str(inventory_path))
+    previous_manager = get_install_source_manager()
+    set_global_manager(None)
+    try:
+        result = await PluginCliService().upload_and_install(
+            filename=package_source.name,
+            source_file=io.BytesIO(package_source.read_bytes()),
+            activate_installation=False,
+            record_install_source=False,
+        )
+    finally:
+        set_global_manager(previous_manager)
+
+    assert result["install"]["installed_plugin_count"] == 1
+    assert (managed_root / "developer_unpack" / "plugin.toml").is_file()
+    assert not inventory_path.exists()
 
 
 @pytest.mark.asyncio
