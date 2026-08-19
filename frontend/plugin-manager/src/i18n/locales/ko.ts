@@ -655,6 +655,7 @@ export default {
     pluginBuilt: '플러그인이 패키징되었습니다: {packageName}',
     pluginDeleted: '플러그인이 삭제되었습니다',
     pluginRevertedToBuiltin: '사용자 설치 버전을 제거하고 기본 제공 버전으로 전환했습니다',
+    pluginRevertedToBuiltinNotStarted: '사용자 설치 버전을 제거하고 기본 제공 버전을 복원했지만 시작하지 못했습니다',
     startFailed: '시작에 실패했습니다',
     stopFailed: '정지에 실패했습니다',
     reloadFailed: '리로드에 실패했습니다',

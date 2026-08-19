@@ -19,6 +19,29 @@ from plugin.server.application.plugins.registry_service import PluginRegistrySer
 from plugin.server.domain.errors import ServerDomainError
 
 
+def test_delete_journal_syncs_parent_after_owner_and_state_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = tmp_path / "plugins" / "demo"
+    rollback_snapshot = tmp_path / "plugins" / ".delete-backups" / "demo.snapshot"
+    synced_paths: list[Path] = []
+    monkeypatch.setattr(
+        module,
+        "fsync_parent_directory",
+        lambda path: synced_paths.append(path),
+        raising=False,
+    )
+
+    journal = module._DeleteJournal.create(
+        plugin_id="demo",
+        plugin_dir=plugin_dir,
+        rollback_snapshot=rollback_snapshot,
+    )
+
+    assert synced_paths == [journal.owner_path, journal.path]
+
+
 async def _checkpoint() -> None:
     event = asyncio.Event()
     asyncio.get_running_loop().call_soon(event.set)

@@ -107,13 +107,20 @@ def _require_developer_install_roots(
         .expanduser()
         .resolve(strict=False)
     )
-    if resolved_plugins_root in protected_plugin_roots:
+
+    def paths_overlap(left: Path, right: Path) -> bool:
+        return left == right or left in right.parents or right in left.parents
+
+    if any(
+        paths_overlap(resolved_plugins_root, protected_root)
+        for protected_root in protected_plugin_roots
+    ):
         raise ValueError(
             "neko-plugin install is a developer extraction command and cannot "
             "write a Plugin Center runtime root; install the package through "
             "Plugin Center instead"
         )
-    if resolved_profiles_root == protected_profiles_root:
+    if paths_overlap(resolved_profiles_root, protected_profiles_root):
         raise ValueError(
             "neko-plugin install cannot write the Plugin Center runtime profile "
             "root; choose a developer profile directory"

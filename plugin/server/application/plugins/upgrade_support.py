@@ -29,6 +29,19 @@ _MANIFEST_ADJACENT_PROFILE_PATHS = (Path("profiles.toml"), Path("profiles"))
 _CleanupResult = TypeVar("_CleanupResult")
 
 
+def fsync_parent_directory(path: Path) -> None:
+    """Persist a replaced directory entry on platforms with directory fsync."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 async def await_cancellation_safe(
     operation: Awaitable[_CleanupResult],
 ) -> _CleanupResult:
@@ -177,6 +190,7 @@ class _ReplacementJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
+            fsync_parent_directory(self.path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -198,6 +212,7 @@ class _ReplacementJournal:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        fsync_parent_directory(self.owner_path)
 
 
 def _remove_path_sync(path: Path) -> None:

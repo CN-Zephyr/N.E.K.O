@@ -1900,10 +1900,12 @@ class InstallSourceManager:
         """Restore one exact in-memory snapshot after a failed install commit."""
 
         with self._lock:
+            old_lock = self._current
             try:
                 self._current = snapshot
                 self.save()
             except Exception as exc:
+                self._current = old_lock
                 raise InstallSourceError(
                     "lock_write_failed",
                     f"failed to restore install-source snapshot: {exc}",

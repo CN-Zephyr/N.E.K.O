@@ -655,6 +655,7 @@ export default {
     pluginBuilt: '插件已构建：{packageName}',
     pluginDeleted: '插件已删除',
     pluginRevertedToBuiltin: '已删除用户安装版，并切回内置版',
+    pluginRevertedToBuiltinNotStarted: '已删除用户安装版并恢复内置版，但内置版未能启动',
     startFailed: '启动失败',
     stopFailed: '停止失败',
     reloadFailed: '重载失败',

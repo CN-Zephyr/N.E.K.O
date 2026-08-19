@@ -109,11 +109,13 @@ def test_cli_build_inspect_verify_and_install(tmp_path: Path, capsys: pytest.Cap
 
 
 @pytest.mark.parametrize("protected_root_name", ["managed", "legacy"])
+@pytest.mark.parametrize("root_relation", ["exact", "child", "parent"])
 def test_cli_install_refuses_formal_runtime_plugin_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     protected_root_name: str,
+    root_relation: str,
 ) -> None:
     from plugin import settings
 
@@ -125,28 +127,35 @@ def test_cli_install_refuses_formal_runtime_plugin_roots(
     monkeypatch.setattr(settings, "MANAGED_PLUGIN_INSTALLATIONS_ROOT", managed_root)
     monkeypatch.setattr(settings, "USER_PLUGIN_CONFIG_ROOT", legacy_root)
     protected_root = managed_root if protected_root_name == "managed" else legacy_root
+    requested_root = {
+        "exact": protected_root,
+        "child": protected_root / "developer-child",
+        "parent": protected_root.parent,
+    }[root_relation]
 
     exit_code = neko_plugin_cli.main(
         [
             "install",
             str(package_path),
             "--plugins-root",
-            str(protected_root),
+            str(requested_root),
             "--profiles-root",
             str(tmp_path / "profiles"),
         ]
     )
 
     assert exit_code == 1
-    assert not (protected_root / "cli_demo").exists()
+    assert not (requested_root / "cli_demo").exists()
     captured = capsys.readouterr()
     assert "Plugin Center" in captured.err
 
 
+@pytest.mark.parametrize("root_relation", ["exact", "child", "parent"])
 def test_cli_install_refuses_formal_runtime_profile_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    root_relation: str,
 ) -> None:
     from plugin import settings
 
@@ -156,6 +165,11 @@ def test_cli_install_refuses_formal_runtime_profile_root(
     runtime_profiles = tmp_path / "runtime" / ".neko-package-profiles"
     monkeypatch.setattr(settings, "USER_PACKAGE_PROFILES_ROOT", runtime_profiles)
     developer_plugins = tmp_path / "developer-plugins"
+    requested_profiles_root = {
+        "exact": runtime_profiles,
+        "child": runtime_profiles / "developer-child",
+        "parent": runtime_profiles.parent,
+    }[root_relation]
 
     exit_code = neko_plugin_cli.main(
         [
@@ -164,7 +178,7 @@ def test_cli_install_refuses_formal_runtime_profile_root(
             "--plugins-root",
             str(developer_plugins),
             "--profiles-root",
-            str(runtime_profiles),
+            str(requested_profiles_root),
         ]
     )
 

@@ -655,6 +655,7 @@ export default {
     pluginBuilt: 'プラグインをパッケージ化しました: {packageName}',
     pluginDeleted: 'プラグインを削除しました',
     pluginRevertedToBuiltin: 'ユーザーインストール版を削除し、組み込み版に戻しました',
+    pluginRevertedToBuiltinNotStarted: 'ユーザーインストール版を削除して組み込み版に戻しましたが、起動できませんでした',
     startFailed: '起動に失敗しました',
     stopFailed: '停止に失敗しました',
     reloadFailed: 'リロードに失敗しました',

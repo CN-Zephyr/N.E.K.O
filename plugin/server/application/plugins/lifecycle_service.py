@@ -57,7 +57,10 @@ from plugin.server.application.plugins.installation_selection import (
 )
 from plugin.server.application.plugins.package_ownership import sha256_file
 from plugin.server.application.plugins.mutation_guard import plugin_mutation_guard
-from plugin.server.application.plugins.upgrade_support import await_cancellation_safe
+from plugin.server.application.plugins.upgrade_support import (
+    await_cancellation_safe,
+    fsync_parent_directory,
+)
 from plugin.server.infrastructure.config_resolver import resolve_plugin_config_from_path
 from plugin.server.infrastructure.path_safety import (
     ensure_tree_has_no_links_or_reparse_points,
@@ -626,6 +629,7 @@ class _DeleteJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
+            fsync_parent_directory(self.path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -647,6 +651,7 @@ class _DeleteJournal:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        fsync_parent_directory(self.owner_path)
 
 
 def _load_delete_owner(journal_path: Path) -> tuple[str, str]:

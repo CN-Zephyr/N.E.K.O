@@ -264,6 +264,76 @@ async def test_refresh_registry_excludes_deleted_plugin_before_entry_import(
             module.state._snapshot_cache = cache_backup
 
 
+def test_discovery_keeps_builtin_root_identity_when_user_roots_are_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    managed_root = tmp_path / "managed"
+    user_root = tmp_path / "user"
+    _write_ordered_plugin_fixture(builtin_root, "builtin_demo")
+    captured_root_ids: list[str] = []
+
+    def capture_candidates(candidates, *, inventory):
+        del inventory
+        captured_root_ids.extend(candidate.root_id for candidate in candidates)
+        return []
+
+    monkeypatch.setattr(module, "resolve_plugin_candidates", capture_candidates)
+
+    module._discover_registry_snapshot_sync(
+        (builtin_root,),
+        classification_roots=(builtin_root, managed_root, user_root),
+    )
+
+    assert captured_root_ids == ["builtin"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_registry_removes_deleted_mixed_case_plugin_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "plugins"
+    root.mkdir()
+    plugin_id = "DemoPlugin"
+    plugin_dir = tmp_path / "previous-root" / plugin_id
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.toml").write_text(
+        "[plugin]\n"
+        f"id='{plugin_id}'\n"
+        f"name='{plugin_id}'\n"
+        "type='plugin'\n"
+        "entry='demo_plugin_entry:DemoPlugin'\n"
+        "version='0.1.0'\n",
+        encoding="utf-8",
+    )
+    mark_plugin_deleted(plugin_id)
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": str(plugin_dir / "plugin.toml"),
+            }
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (root,))
+
+        result = await module.PluginRegistryService().refresh_registry()
+
+        assert result["removed"] == [plugin_id]
+        with module.state.acquire_plugins_read_lock():
+            assert plugin_id not in module.state.plugins
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
 @pytest.mark.asyncio
 async def test_explicit_user_installation_is_the_only_imported_same_id_candidate(
     monkeypatch: pytest.MonkeyPatch,

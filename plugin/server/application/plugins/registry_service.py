@@ -403,7 +403,11 @@ def _build_ordered_plugin_ids_sync(candidate_plugin_ids: set[str] | None = None)
     return ordered
 
 
-def _discover_registry_snapshot_sync(roots: tuple[Path, ...]) -> PluginDiscoverySnapshot:
+def _discover_registry_snapshot_sync(
+    roots: tuple[Path, ...],
+    *,
+    classification_roots: tuple[Path, ...] | None = None,
+) -> PluginDiscoverySnapshot:
     processed_paths: set[Path] = set()
     failures: list[PluginDiscoveryFailure] = []
     config_paths: set[Path] = set()
@@ -461,7 +465,7 @@ def _discover_registry_snapshot_sync(roots: tuple[Path, ...]) -> PluginDiscovery
 
     selected_contexts, resolution_failures, resolution_warnings = _resolve_plugin_contexts(
         discovered_contexts,
-        roots=roots,
+        roots=classification_roots or roots,
     )
     failures.extend(resolution_failures)
     candidate_config_paths = {ctx.toml_path.resolve() for ctx in discovered_contexts}
@@ -947,7 +951,10 @@ class PluginRegistryService:
         added: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
-        snapshot = _discover_registry_snapshot_sync(scan_roots)
+        snapshot = _discover_registry_snapshot_sync(
+            scan_roots,
+            classification_roots=roots,
+        )
         selected_contexts = [
             ctx
             for ctx in snapshot.selected_contexts
@@ -1105,11 +1112,18 @@ class PluginRegistryService:
         if only_plugin_id is not None:
             missing_ids.intersection_update({only_plugin_id})
         inventory, _inventory_issue = load_inventory_resolution_for_registry()
+        deleted_ids = {plugin_id.casefold() for plugin_id in inventory.deleted_plugin_ids}
+        normalized_only_plugin_id = (
+            only_plugin_id.casefold() if only_plugin_id is not None else None
+        )
         missing_ids.update(
-            plugin_id
-            for plugin_id in inventory.deleted_plugin_ids
-            if plugin_id in existing_snapshot
-            and (only_plugin_id is None or plugin_id == only_plugin_id)
+            registered_id
+            for registered_id in existing_snapshot
+            if registered_id.casefold() in deleted_ids
+            and (
+                normalized_only_plugin_id is None
+                or registered_id.casefold() == normalized_only_plugin_id
+            )
         )
         removed, removed_running = _remove_stale_plugin_metadata_sync(missing_ids, running_ids=running_ids)
         selected_ids = {record.plugin_id for record in records}

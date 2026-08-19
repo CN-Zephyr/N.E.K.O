@@ -655,6 +655,7 @@ export default {
     pluginBuilt: '外掛已構建：{packageName}',
     pluginDeleted: '外掛已刪除',
     pluginRevertedToBuiltin: '已刪除使用者安裝版，並切回內建版',
+    pluginRevertedToBuiltinNotStarted: '已刪除使用者安裝版並恢復內建版，但內建版未能啟動',
     startFailed: '啟動失敗',
     stopFailed: '停止失敗',
     reloadFailed: '重新載入失敗',

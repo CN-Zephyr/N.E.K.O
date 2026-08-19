@@ -21,6 +21,31 @@ from plugin.server.domain.errors import ServerDomainError
 pytestmark = pytest.mark.plugin_unit
 
 
+def test_replacement_journal_syncs_parent_after_owner_and_state_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "plugins" / "demo"
+    backup = tmp_path / "plugins" / ".upgrade-backups" / "demo.bak"
+    synced_paths: list[Path] = []
+    monkeypatch.setattr(
+        upgrade_support,
+        "fsync_parent_directory",
+        lambda path: synced_paths.append(path),
+        raising=False,
+    )
+
+    journal = upgrade_support._ReplacementJournal.create(
+        plugin_id="demo",
+        journal_root=tmp_path / "plugins" / ".upgrade-backups" / ".transactions",
+        targets=(target,),
+        backups={target: backup},
+        preexisting_targets=frozenset({target}),
+    )
+
+    assert synced_paths == [journal.owner_path, journal.path]
+
+
 async def _async_none() -> None:
     return None
 

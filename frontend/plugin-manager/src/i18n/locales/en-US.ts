@@ -655,6 +655,7 @@ export default {
     pluginBuilt: 'Plugin built: {packageName}',
     pluginDeleted: 'Plugin deleted',
     pluginRevertedToBuiltin: 'User-installed version removed; switched back to the built-in version',
+    pluginRevertedToBuiltinNotStarted: 'User-installed version removed; the built-in version was restored but could not be started',
     startFailed: 'Failed to start',
     stopFailed: 'Failed to stop',
     reloadFailed: 'Failed to reload',

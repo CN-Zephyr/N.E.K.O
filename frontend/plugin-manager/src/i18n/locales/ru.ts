@@ -655,6 +655,7 @@ export default {
     pluginBuilt: 'Плагин упакован: {packageName}',
     pluginDeleted: 'Плагин удален',
     pluginRevertedToBuiltin: 'Пользовательская версия удалена; выполнен возврат к встроенной версии',
+    pluginRevertedToBuiltinNotStarted: 'Пользовательская версия удалена; встроенная версия восстановлена, но не запустилась',
     startFailed: 'Ошибка запуска',
     stopFailed: 'Ошибка остановки',
     reloadFailed: 'Ошибка перезагрузки',
