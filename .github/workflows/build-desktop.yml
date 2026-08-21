@@ -153,8 +153,44 @@ jobs:
           # build-time prepare step and the bundled runtime.
           # `--group galgame` adds the local rapidocr-pillow fork for the
           # bundled OCR backend without the opencv/shapely dependency chain.
-          uv sync --group galgame
+          # Remove the legacy distribution before reinstalling the renamed SDK:
+          # both distributions own the same bilibili_api/ import package, so an
+          # incremental environment can otherwise retain old metadata and module
+          # files. Reinstalling afterwards restores every shared file from the
+          # selected dev SDK.
+          uv pip uninstall --python .venv bilibili-api-python || true
+          uv sync --group galgame --reinstall-package bilibili-api-dev
           uv pip install --python .venv nuitka ordered-set zstandard
+
+      - name: Verify Bilibili SDK dependency convergence
+        shell: bash
+        run: |
+          VENV_PYTHON=".venv/bin/python"
+          if [ -f ".venv/Scripts/python.exe" ]; then
+            VENV_PYTHON=".venv/Scripts/python.exe"
+          fi
+          "$VENV_PYTHON" - <<'PY'
+          from importlib import metadata
+
+          installed = {
+              str(dist.metadata.get("Name", "")).lower(): dist.version
+              for dist in metadata.distributions()
+              if "bilibili-api" in str(dist.metadata.get("Name", "")).lower()
+          }
+          expected = {"bilibili-api-dev": "18.0.0a1"}
+          if installed != expected:
+              raise SystemExit(
+                  "Bilibili SDK environment is not clean: "
+                  f"expected {expected}, found {installed}. "
+                  "Run uv sync --reinstall-package bilibili-api-dev to remove "
+                  "legacy bilibili-api-python files."
+              )
+
+          from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+
+          assert QrCodeLogin is not None
+          assert QrCodeLoginEvents is not None
+          PY
 
       - name: Prepare filtered built-in plugins for Nuitka
         shell: bash
@@ -199,6 +235,17 @@ jobs:
           src = Path(sp.__file__).parent
           dst = Path('data/browser_use_prompts')
           dst.mkdir(parents=True, exist_ok=True)
+          bad = [md.name for md in src.glob('*.md') if not md.name.isascii()]
+          if bad:
+              # Non-ASCII basenames under Contents/MacOS/ make codesign emit a
+              # hex-literal identifier and the whole bundle then fails to seal.
+              # scripts/check_no_nonascii_asset_names.py cannot see this one:
+              # data/ is gitignored and the analyze job installs no dependencies,
+              # so the names only exist here, right after generation.
+              raise SystemExit(
+                  'non-ASCII browser_use prompt template name(s), which break '
+                  f'macOS signing: {bad}'
+              )
           for md in src.glob('*.md'):
               shutil.copy2(md, dst / md.name)
               print(f'Copied {md.name}')
@@ -435,8 +482,16 @@ jobs:
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=onnxruntime.transformers"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=tokenizers"
           # bilibili_dm/bilibili_danmaku plugins import bilibili_api; compile the
-          # package itself (CI previously only carried its package-data).
+          # package itself (CI previously only carried its package-data).  The
+          # dev SDK imports these transitive packages from login_v2/__init__ at
+          # runtime, so list them explicitly rather than relying on Nuitka's
+          # optional-import discovery.
           NUITKA_OPTS="$NUITKA_OPTS --include-package=bilibili_api"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=Cryptodome"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=chompjs"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=frozendict"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=qrcode"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=qrcode_terminal"
           # galgame_plugin native OCR/vision cohort. Installed on every platform by
           # `uv sync --group galgame` (local rapidocr-pillow fork + pyclipper).
           # Nuitka's auto-follow misses their data files, so include package +
@@ -598,6 +653,12 @@ jobs:
           set NUITKA_OPTS=%NUITKA_OPTS% --include-package-data=jinja2
           set NUITKA_OPTS=%NUITKA_OPTS% --include-package-data=certifi
           set NUITKA_OPTS=%NUITKA_OPTS% --include-package=bilibili_api
+          rem bilibili-api-dev login_v2 imports these transitive packages at runtime.
+          set NUITKA_OPTS=%NUITKA_OPTS% --include-package=Cryptodome
+          set NUITKA_OPTS=%NUITKA_OPTS% --include-package=chompjs
+          set NUITKA_OPTS=%NUITKA_OPTS% --include-package=frozendict
+          set NUITKA_OPTS=%NUITKA_OPTS% --include-package=qrcode
+          set NUITKA_OPTS=%NUITKA_OPTS% --include-package=qrcode_terminal
           set NUITKA_OPTS=%NUITKA_OPTS% --include-package-data=bilibili_api
           rem galgame_plugin native OCR/vision cohort (uv sync --group galgame:
           rem local rapidocr-pillow fork + pyclipper; mss/dxcam from main deps).
@@ -640,6 +701,18 @@ jobs:
           # macOS: playwright_browsers was excluded from Nuitka (xattr bug with
           # spaces in .app paths), copy it manually into the output directory
           if [[ "$RUNNER_OS" == "macOS" && -d "playwright_browsers" ]]; then
+            # This tree lands under Contents/MacOS/, where codesign treats every
+            # file as nested code; a non-ASCII basename becomes a hex-literal
+            # identifier and the whole bundle then fails to seal. The payload is
+            # downloaded, so scripts/check_no_nonascii_asset_names.py structurally
+            # cannot see it — the only place to look is right here, before the copy.
+            # Files only: a CJK *directory* holding ASCII files seals fine
+            # (verified against a real Developer ID cert; see the checker's
+            # module docstring), and failing on it would block the build for nothing.
+            # One physical line on purpose: `python -c` rejects a first line that
+            # starts with whitespace, and a YAML block scalar cannot carry the
+            # column-0 lines a multi-line form would need.
+            .venv/bin/python -c "import sys; from pathlib import Path; bad = [str(p) for p in Path('playwright_browsers').rglob('*') if p.is_file() and not p.name.isascii()]; sys.exit('non-ASCII name(s) in playwright_browsers, which break macOS signing: ' + repr(bad[:10])) if bad else None"
             cp -R playwright_browsers "$RUNTIME_DIR/playwright_browsers"
             echo "Copied playwright_browsers into $RUNTIME_DIR/"
           fi
@@ -819,7 +892,18 @@ jobs:
 
       - name: Install npm dependencies
         working-directory: electron-app
-        run: npm ci || npm install
+        shell: bash
+        run: |
+          npm ci || npm install
+          # The electron repo's own `dist*` scripts go through `npm run`, so its
+          # scripts/build-electron-distribution.js can spawn a bare
+          # `electron-builder` and let npm's PATH injection find it. We invoke
+          # that script with plain `node`, which gets no such PATH — the spawn
+          # then dies with ENOENT. Put the local bin dir on PATH ourselves so
+          # every call site in this job resolves the same binary npm would.
+          # Not $PWD: on the Windows runner bash reports a /d/a/... MSYS path,
+          # which the runner cannot put on the process PATH.
+          echo "$GITHUB_WORKSPACE/electron-app/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Update version in package.json
         working-directory: electron-app
