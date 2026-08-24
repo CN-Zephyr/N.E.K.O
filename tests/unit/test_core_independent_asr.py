@@ -118,6 +118,20 @@ class _Runtime(AsrRuntimeMixin):
         object.__setattr__(self, name, value)
 
 
+class _GateAsyncLock:
+    def __init__(self) -> None:
+        self.requested = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aenter__(self):
+        self.requested.set()
+        await self.release.wait()
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        return None
+
+
 class _TestSmartTurnLease:
     def __init__(self, token) -> None:
         self.token = token
@@ -4115,6 +4129,74 @@ async def test_cancelled_successor_close_owns_runtime_cleanup_after_old_close() 
     runtime._asr_runtime.close.assert_awaited_once_with()
 
 
+async def test_stale_start_waiting_for_pipeline_lock_cannot_replace_successor(
+    monkeypatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.core_api_type = "gemini"
+    runtime._close_independent_asr = AsyncMock()
+    gate = _GateAsyncLock()
+    runtime._voice_input_pipeline_transition_lock = gate
+    monkeypatch.setattr(
+        core_module,
+        "aload_global_conversation_settings",
+        AsyncMock(
+            return_value={
+                "independentAsrEnabled": False,
+                "noiseReductionEnabled": False,
+            }
+        ),
+    )
+
+    starting = asyncio.create_task(runtime._start_independent_asr_if_enabled("audio"))
+    await asyncio.wait_for(gate.requested.wait(), 1)
+    runtime._begin_asr_route_operation()
+    successor_pipeline = SimpleNamespace(
+        nr_enabled=True,
+        close=AsyncMock(),
+    )
+    runtime._voice_input_audio_pipeline = successor_pipeline
+    gate.release.set()
+    await asyncio.wait_for(starting, 1)
+
+    assert runtime._voice_input_audio_pipeline is successor_pipeline
+    assert runtime._voice_input_noise_reduction_enabled is True
+    successor_pipeline.close.assert_not_awaited()
+
+
+async def test_stale_close_waiting_for_pipeline_lock_cannot_replace_successor() -> None:
+    runtime = _Runtime()
+    runtime._asr_runtime.close = AsyncMock()
+    runtime._set_microphone_route("independent")
+    runtime._independent_asr_provider = "old-provider"
+    runtime._independent_asr_route_key = "old-core"
+    gate = _GateAsyncLock()
+    runtime._voice_input_pipeline_transition_lock = gate
+
+    closing = asyncio.create_task(
+        runtime._close_independent_asr(next_route_mode="blocked")
+    )
+    await asyncio.wait_for(gate.requested.wait(), 1)
+    runtime._begin_asr_route_operation()
+    successor_pipeline = SimpleNamespace(
+        nr_enabled=True,
+        close=AsyncMock(),
+    )
+    runtime._voice_input_audio_pipeline = successor_pipeline
+    runtime._independent_asr_provider = "new-provider"
+    runtime._independent_asr_route_key = "new-core"
+    runtime._set_microphone_route("independent")
+    gate.release.set()
+    await asyncio.wait_for(closing, 1)
+
+    assert runtime._voice_input_audio_pipeline is successor_pipeline
+    assert runtime._independent_asr_provider == "new-provider"
+    assert runtime._independent_asr_route_key == "new-core"
+    assert runtime._asr_route_mode == "independent"
+    successor_pipeline.close.assert_not_awaited()
+    runtime._asr_runtime.close.assert_not_awaited()
+
+
 async def test_cancelled_start_settings_swap_keeps_pipeline_cleanup_owned(
     monkeypatch,
 ) -> None:
@@ -7963,6 +8045,36 @@ async def test_cancelled_lease_resync_send_retries_same_episode() -> None:
 
     runtime.send_status.assert_awaited_once()
     assert runtime._voice_lease_resync_signal_state is not None
+
+
+async def test_lease_resync_rearms_for_new_microphone_route_generation() -> None:
+    runtime = _Runtime()
+    assert runtime._begin_voice_input_connection("chat-window") is True
+
+    await runtime._maybe_signal_voice_lease_resync()
+    first_episode = runtime._voice_lease_resync_signal_state
+    assert first_episode is not None
+    assert first_episode[-1] == runtime._microphone_route_generation
+
+    runtime._set_microphone_route("native")
+    assert runtime._voice_lease_resync_signal_state is None
+    await runtime._maybe_signal_voice_lease_resync()
+    native_episode = runtime._voice_lease_resync_signal_state
+    assert native_episode is not None
+
+    runtime._set_microphone_route("native")
+    await runtime._maybe_signal_voice_lease_resync()
+    assert runtime._voice_lease_resync_signal_state == native_episode
+    assert runtime.send_status.await_count == 2
+
+    runtime._set_microphone_route("blocked")
+
+    await runtime._maybe_signal_voice_lease_resync()
+    second_episode = runtime._voice_lease_resync_signal_state
+    assert second_episode is not None
+    assert second_episode != first_episode
+    assert second_episode[-1] == runtime._microphone_route_generation
+    assert runtime.send_status.await_count == 3
 
 
 async def test_blocked_text_notice_commits_only_for_current_connection() -> None:

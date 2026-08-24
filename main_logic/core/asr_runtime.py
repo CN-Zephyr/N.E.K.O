@@ -225,9 +225,9 @@ class AsrRuntimeMixin:
         self._voice_lease_requires_abort = False
         self._voice_input_suppressed = True
         self._voice_input_suppression_reasons: set[str] = {"owner_none"}
-        self._voice_lease_resync_signal_state: tuple[str, int, bool, str] | None = (
-            None
-        )
+        self._voice_lease_resync_signal_state: (
+            tuple[str, int, bool, str, int] | None
+        ) = None
         self._voice_lease_resync_delivery_state: (
             tuple[object, set[str]] | None
         ) = None
@@ -471,6 +471,7 @@ class AsrRuntimeMixin:
     ) -> None:
         if mode not in {"native", "independent", "blocked"}:
             raise ValueError("MICROPHONE_ROUTE_INVALID")
+        leaving_blocked = self._asr_route_mode == "blocked" and mode != "blocked"
         if mode != self._asr_route_mode:
             self._microphone_route_generation += 1
         if mode != "blocked":
@@ -478,6 +479,8 @@ class AsrRuntimeMixin:
             # the lease-resync signal now that a live route exists again.
             self._blocked_text_mode_microphone_signal_state = None
             self._blocked_text_mode_microphone_delivery_state = None
+            if leaving_blocked:
+                self._voice_lease_resync_signal_state = None
             self._voice_lease_resync_delivery_state = None
             self._voice_lease_resync_suppressed = False
         self._asr_route_mode = mode
@@ -761,9 +764,11 @@ class AsrRuntimeMixin:
         if not core_start_is_current():
             return
         nr_enabled = settings.get("noiseReductionEnabled", True) is not False
-        self._voice_input_noise_reduction_enabled = nr_enabled
         pipeline_cleanup = None
         async with self._voice_input_pipeline_transition_lock:
+            if not core_start_is_current():
+                return
+            self._voice_input_noise_reduction_enabled = nr_enabled
             if self._voice_input_audio_pipeline.nr_enabled != nr_enabled:
                 pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
                     self,
@@ -1114,6 +1119,8 @@ class AsrRuntimeMixin:
                 reason="independent_asr_close",
             )
         async with self._voice_input_pipeline_transition_lock:
+            if not self._asr_route_operation_matches(operation_generation):
+                return
             pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
                 self,
                 nr_enabled=self._voice_input_noise_reduction_enabled,
@@ -1338,7 +1345,7 @@ class AsrRuntimeMixin:
 
     def _voice_lease_resync_episode(
         self,
-    ) -> tuple[str, int, bool, str] | None:
+    ) -> tuple[str, int, bool, str, int] | None:
         if self._voice_lease_resync_suppressed:
             # The backend revoked this lease on purpose (fail-closed route, or
             # a text session took over). Asking the client to resync would make
@@ -1360,6 +1367,7 @@ class AsrRuntimeMixin:
             self._voice_lease_generation,
             self._voice_lease_synchronized,
             self._voice_lease_owner,
+            self._microphone_route_generation,
         )
 
     async def _maybe_signal_blocked_text_mode_microphone(self) -> None:
