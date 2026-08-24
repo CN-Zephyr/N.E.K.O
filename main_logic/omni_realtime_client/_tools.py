@@ -424,7 +424,7 @@ class _ToolingMixin:
             "type": "function_call_output",
             "output": result.output_as_json_string(),
         }
-        api = self._api_type.lower()
+        api = canonical_realtime_dialect(self._api_type)
         if api == 'glm':
             # GLM 协议不接受 call_id。哪怕我们内部合成了，也不外传。
             pass

@@ -54,6 +54,14 @@ from main_logic import core as _core_facade
 
 from ._shared import logger
 
+
+@dataclass(slots=True)
+class _VoiceControlDeliveryProgress:
+    episode: object
+    display_delivered: bool = False
+    voice_owner_settled: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class _QueuedMicFrame:
     # Longest microphone PCM frame accepted at ingress. Bounded by DURATION,
@@ -227,6 +235,9 @@ class AsrRuntimeMixin:
         self._voice_lease_resync_signal_state: tuple[str, int, bool, str] | None = (
             None
         )
+        self._voice_lease_resync_delivery_state: (
+            _VoiceControlDeliveryProgress | None
+        ) = None
         self._audio_stream_queue = _AudioDurationQueue(
             capacity_us=2_000_000,
             max_frames=256,
@@ -272,6 +283,9 @@ class AsrRuntimeMixin:
             int,
             object,
         ] | None = None
+        self._blocked_text_mode_microphone_delivery_state: (
+            _VoiceControlDeliveryProgress | None
+        ) = None
         # Identity of the independent-ASR turn that owns the frontend's
         # singleton preview bubble, plus its last rendered text. Both are
         # stamped/refreshed from the ordered partial stream so a late final
@@ -352,6 +366,8 @@ class AsrRuntimeMixin:
             self._voice_input_transition_generation = 0
         if not hasattr(self, "_voice_lease_resync_signal_state"):
             self._voice_lease_resync_signal_state = None
+        if not hasattr(self, "_voice_lease_resync_delivery_state"):
+            self._voice_lease_resync_delivery_state = None
         if not hasattr(self, "_voice_input_noise_reduction_enabled"):
             self._voice_input_noise_reduction_enabled = True
         if not hasattr(self, "_core_asr_cleanup_tasks"):
@@ -380,6 +396,8 @@ class AsrRuntimeMixin:
             self._core_asr_preview_turn_token = None
         if not hasattr(self, "_blocked_text_mode_microphone_signal_state"):
             self._blocked_text_mode_microphone_signal_state = None
+        if not hasattr(self, "_blocked_text_mode_microphone_delivery_state"):
+            self._blocked_text_mode_microphone_delivery_state = None
         if not hasattr(self, "_voice_input_websocket"):
             self._voice_input_websocket = None
         if not hasattr(self, "_voice_lease_resync_suppressed"):
@@ -463,6 +481,8 @@ class AsrRuntimeMixin:
             # Re-arm the one-shot text-mode notice for the next episode, and
             # the lease-resync signal now that a live route exists again.
             self._blocked_text_mode_microphone_signal_state = None
+            self._blocked_text_mode_microphone_delivery_state = None
+            self._voice_lease_resync_delivery_state = None
             self._voice_lease_resync_suppressed = False
         self._asr_route_mode = mode
 
@@ -1215,7 +1235,12 @@ class AsrRuntimeMixin:
             reason,
         )
 
-    async def _send_voice_control_status(self, message: str) -> bool:
+    async def _send_voice_control_status(
+        self,
+        message: str,
+        *,
+        progress: _VoiceControlDeliveryProgress | None = None,
+    ) -> tuple[bool, bool]:
         """Send a mic control-plane status to the current AND voice sockets.
 
         ``self.websocket`` is the newest socket, which is not necessarily the
@@ -1227,20 +1252,29 @@ class AsrRuntimeMixin:
         The extra delivery is getattr-guarded rather than folded into
         ``send_status``: that signature is doubled by a large number of focused
         tests, and narrow manager doubles do not carry the notify mixin at all.
+        The returned pair records each plane independently so episode retries
+        can skip a plane that already accepted this exact status.
         """
 
-        display_delivered = bool(await self.send_status(message))
+        if progress is None:
+            progress = _VoiceControlDeliveryProgress(episode=None)
+        if not progress.display_delivered:
+            progress.display_delivered = bool(await self.send_status(message))
+        if progress.voice_owner_settled:
+            return progress.display_delivered, True
         voice_owner_resolver = getattr(self, "_voice_owner_socket", None)
         voice_owner_socket = (
             voice_owner_resolver() if callable(voice_owner_resolver) else None
         )
         send_to_voice_owner = getattr(self, "_send_to_voice_owner", None)
         if voice_owner_socket is None or not callable(send_to_voice_owner):
-            return display_delivered
+            progress.voice_owner_settled = True
+            return progress.display_delivered, True
         delivered_socket = await send_to_voice_owner(
             {"type": "status", "message": message}
         )
-        return display_delivered or delivered_socket is voice_owner_socket
+        progress.voice_owner_settled = delivered_socket is voice_owner_socket
+        return progress.display_delivered, progress.voice_owner_settled
 
     async def _maybe_signal_voice_lease_resync(self) -> None:
         """Nudge a client whose PCM is dropped only because no lease is set.
@@ -1254,12 +1288,16 @@ class AsrRuntimeMixin:
 
         async with self._asr_notification_lock:
             signal_state = self._voice_lease_resync_episode()
-            if (
-                signal_state is None
-                or signal_state == self._voice_lease_resync_signal_state
-            ):
+            if signal_state is None:
+                self._voice_lease_resync_delivery_state = None
                 return
-            delivered = await self._send_voice_control_status(
+            if signal_state == self._voice_lease_resync_signal_state:
+                return
+            progress = self._voice_lease_resync_delivery_state
+            if progress is None or progress.episode != signal_state:
+                progress = _VoiceControlDeliveryProgress(signal_state)
+                self._voice_lease_resync_delivery_state = progress
+            await self._send_voice_control_status(
                 json.dumps(
                     {
                         "code": "VOICE_INPUT_LEASE_RESYNC_REQUIRED",
@@ -1269,12 +1307,16 @@ class AsrRuntimeMixin:
                                 if not signal_state[2]
                                 else "owner_none"
                             ),
-                        },
+                        }
                     }
                 ),
+                progress=progress,
             )
-            if delivered and self._voice_lease_resync_episode() == signal_state:
+            if self._voice_lease_resync_episode() != signal_state:
+                return
+            if progress.display_delivered and progress.voice_owner_settled:
                 self._voice_lease_resync_signal_state = signal_state
+                self._voice_lease_resync_delivery_state = None
 
     def _voice_lease_resync_episode(
         self,
@@ -1318,21 +1360,29 @@ class AsrRuntimeMixin:
 
         async with self._asr_notification_lock:
             signal_state = self._blocked_text_mode_microphone_episode()
-            if (
-                signal_state is None
-                or signal_state == self._blocked_text_mode_microphone_signal_state
-            ):
+            if signal_state is None:
+                self._blocked_text_mode_microphone_delivery_state = None
                 return
-            delivered = await self._send_voice_control_status(
+            if signal_state == self._blocked_text_mode_microphone_signal_state:
+                return
+            progress = self._blocked_text_mode_microphone_delivery_state
+            if progress is None or progress.episode != signal_state:
+                progress = _VoiceControlDeliveryProgress(signal_state)
+                self._blocked_text_mode_microphone_delivery_state = progress
+            await self._send_voice_control_status(
                 json.dumps(
                     {
                         "code": "VOICE_INPUT_BLOCKED_TEXT_SESSION",
                         "details": {"reason": "text_session_active"},
                     }
                 ),
+                progress=progress,
             )
-            if delivered and self._blocked_text_mode_microphone_episode() == signal_state:
+            if self._blocked_text_mode_microphone_episode() != signal_state:
+                return
+            if progress.display_delivered and progress.voice_owner_settled:
                 self._blocked_text_mode_microphone_signal_state = signal_state
+                self._blocked_text_mode_microphone_delivery_state = None
 
     def _blocked_text_mode_microphone_episode(
         self,

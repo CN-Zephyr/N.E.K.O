@@ -2119,7 +2119,19 @@ async def test_lease_resync_retries_when_display_and_voice_delivery_fail():
     assert voice.attempts == 2
 
 
-async def test_blocked_text_notice_commits_when_display_delivery_succeeds():
+@pytest.mark.parametrize(
+    ("display_fails", "voice_fails", "display_attempts", "voice_attempts"),
+    [
+        (False, True, 1, 2),
+        (True, False, 2, 1),
+    ],
+)
+async def test_blocked_text_notice_retries_only_failed_delivery_plane(
+    display_fails: bool,
+    voice_fails: bool,
+    display_attempts: int,
+    voice_attempts: int,
+):
     class _LiveState:
         CONNECTED = "connected"
 
@@ -2143,23 +2155,68 @@ async def test_blocked_text_notice_commits_when_display_delivery_succeeds():
     mgr._begin_voice_input_connection("socket-a")
     mgr.input_mode = "text"
     mgr._set_microphone_route("blocked")
-    display = _Socket(fail=False)
-    voice = _Socket(fail=True)
+    display = _Socket(fail=display_fails)
+    voice = _Socket(fail=voice_fails)
     mgr.websocket = display
     mgr.sync_message_queue = SimpleNamespace(put=MagicMock())
     assert mgr._set_voice_input_websocket("socket-a", voice) is True
 
     await LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
 
-    assert mgr._blocked_text_mode_microphone_signal_state is not None
+    assert mgr._blocked_text_mode_microphone_signal_state is None
     assert display.attempts == 1
     assert voice.attempts == 1
+
+    display.fail = False
+    voice.fail = False
+    await LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
+
+    assert mgr._blocked_text_mode_microphone_signal_state is not None
+    assert display.attempts == display_attempts
+    assert voice.attempts == voice_attempts
+
+
+async def test_cancelled_voice_notice_retry_does_not_repeat_display_delivery():
+    mgr = LLMSessionManager.__new__(LLMSessionManager)
+    mgr.lanlan_name = "Test"
+    mgr._init_asr_runtime_state()
+    mgr._begin_voice_input_connection("socket-a")
+    mgr.input_mode = "text"
+    mgr._set_microphone_route("blocked")
+    mgr.send_status = AsyncMock(return_value=True)
+    voice_owner = object()
+    voice_send_started = asyncio.Event()
+    voice_attempts = 0
+
+    mgr._voice_owner_socket = lambda: voice_owner
+
+    async def send_to_voice_owner(_payload):
+        nonlocal voice_attempts
+        voice_attempts += 1
+        if voice_attempts == 1:
+            voice_send_started.set()
+            await asyncio.Event().wait()
+        return voice_owner
+
+    mgr._send_to_voice_owner = send_to_voice_owner
+
+    first = asyncio.create_task(
+        LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
+    )
+    await asyncio.wait_for(voice_send_started.wait(), timeout=1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert mgr._blocked_text_mode_microphone_signal_state is None
+    assert mgr.send_status.await_count == 1
+    assert voice_attempts == 1
 
     await LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
 
     assert mgr._blocked_text_mode_microphone_signal_state is not None
-    assert display.attempts == 1
-    assert voice.attempts == 1
+    assert mgr.send_status.await_count == 1
+    assert voice_attempts == 2
 
 
 async def test_voice_socket_setter_rejects_a_stale_claim():

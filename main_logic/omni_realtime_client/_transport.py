@@ -2014,25 +2014,12 @@ class _TransportMixin:
                             "function_call_arguments.done with no name (call_id=%s) — skipping",
                             call_id,
                         )
-                    elif self.on_tool_call is None:
-                        logger.warning(
-                            "function_call '%s' but no on_tool_call handler bound — replying with error",
-                            name,
-                        )
-                        owner = self._capture_tool_task_owner(
-                            message_ws,
-                            connection_generation=message_generation,
-                        )
-                        self._start_raw_tool_call(
-                            ToolCall(
-                                name=name,
-                                arguments={},
-                                call_id=call_id,
-                                raw_arguments=raw_args,
-                            ),
-                            owner,
-                        )
                     else:
+                        if self.on_tool_call is None:
+                            logger.warning(
+                                "function_call '%s' but no on_tool_call handler bound — replying with error",
+                                name,
+                            )
                         # Execute and reply asynchronously — don't block the
                         # message loop. handle_messages stays responsive to
                         # other events while the tool runs.
@@ -2043,7 +2030,11 @@ class _TransportMixin:
                         self._start_raw_tool_call(
                             ToolCall(
                                 name=name,
-                                arguments=parse_arguments_json(raw_args),
+                                arguments=(
+                                    {}
+                                    if self.on_tool_call is None
+                                    else parse_arguments_json(raw_args)
+                                ),
                                 call_id=call_id,
                                 raw_arguments=raw_args,
                             ),

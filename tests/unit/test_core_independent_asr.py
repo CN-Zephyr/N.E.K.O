@@ -7947,7 +7947,7 @@ async def test_voice_control_status_resolves_owner_after_display_delivery() -> N
 
     delivered = await runtime._send_voice_control_status("lease changed")
 
-    assert delivered is True
+    assert delivered == (True, True)
     runtime._send_to_voice_owner.assert_awaited_once_with(
         {"type": "status", "message": "lease changed"}
     )
