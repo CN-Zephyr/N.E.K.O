@@ -55,13 +55,6 @@ from main_logic import core as _core_facade
 from ._shared import logger
 
 
-@dataclass(slots=True)
-class _VoiceControlDeliveryProgress:
-    episode: object
-    display_delivered: bool = False
-    voice_owner_settled: bool = False
-
-
 @dataclass(frozen=True, slots=True)
 class _QueuedMicFrame:
     # Longest microphone PCM frame accepted at ingress. Bounded by DURATION,
@@ -236,7 +229,7 @@ class AsrRuntimeMixin:
             None
         )
         self._voice_lease_resync_delivery_state: (
-            _VoiceControlDeliveryProgress | None
+            tuple[object, set[str]] | None
         ) = None
         self._audio_stream_queue = _AudioDurationQueue(
             capacity_us=2_000_000,
@@ -284,7 +277,7 @@ class AsrRuntimeMixin:
             object,
         ] | None = None
         self._blocked_text_mode_microphone_delivery_state: (
-            _VoiceControlDeliveryProgress | None
+            tuple[object, set[str]] | None
         ) = None
         # Identity of the independent-ASR turn that owns the frontend's
         # singleton preview bubble, plus its last rendered text. Both are
@@ -1239,7 +1232,7 @@ class AsrRuntimeMixin:
         self,
         message: str,
         *,
-        progress: _VoiceControlDeliveryProgress | None = None,
+        progress: tuple[object, set[str]] | None = None,
     ) -> tuple[bool, bool]:
         """Send a mic control-plane status to the current AND voice sockets.
 
@@ -1257,24 +1250,30 @@ class AsrRuntimeMixin:
         """
 
         if progress is None:
-            progress = _VoiceControlDeliveryProgress(episode=None)
-        if not progress.display_delivered:
-            progress.display_delivered = bool(await self.send_status(message))
-        if progress.voice_owner_settled:
-            return progress.display_delivered, True
+            progress = (None, set())
+        delivered_planes = progress[1]
+        if "display_delivered" not in delivered_planes:
+            if await self.send_status(message):
+                delivered_planes.add("display_delivered")
+        if "voice_owner_settled" in delivered_planes:
+            return "display_delivered" in delivered_planes, True
         voice_owner_resolver = getattr(self, "_voice_owner_socket", None)
         voice_owner_socket = (
             voice_owner_resolver() if callable(voice_owner_resolver) else None
         )
         send_to_voice_owner = getattr(self, "_send_to_voice_owner", None)
         if voice_owner_socket is None or not callable(send_to_voice_owner):
-            progress.voice_owner_settled = True
-            return progress.display_delivered, True
+            delivered_planes.add("voice_owner_settled")
+            return "display_delivered" in delivered_planes, True
         delivered_socket = await send_to_voice_owner(
             {"type": "status", "message": message}
         )
-        progress.voice_owner_settled = delivered_socket is voice_owner_socket
-        return progress.display_delivered, progress.voice_owner_settled
+        if delivered_socket is voice_owner_socket:
+            delivered_planes.add("voice_owner_settled")
+        return (
+            "display_delivered" in delivered_planes,
+            "voice_owner_settled" in delivered_planes,
+        )
 
     async def _maybe_signal_voice_lease_resync(self) -> None:
         """Nudge a client whose PCM is dropped only because no lease is set.
@@ -1294,8 +1293,8 @@ class AsrRuntimeMixin:
             if signal_state == self._voice_lease_resync_signal_state:
                 return
             progress = self._voice_lease_resync_delivery_state
-            if progress is None or progress.episode != signal_state:
-                progress = _VoiceControlDeliveryProgress(signal_state)
+            if progress is None or progress[0] != signal_state:
+                progress = (signal_state, set())
                 self._voice_lease_resync_delivery_state = progress
             await self._send_voice_control_status(
                 json.dumps(
@@ -1314,7 +1313,10 @@ class AsrRuntimeMixin:
             )
             if self._voice_lease_resync_episode() != signal_state:
                 return
-            if progress.display_delivered and progress.voice_owner_settled:
+            if {
+                "display_delivered",
+                "voice_owner_settled",
+            }.issubset(progress[1]):
                 self._voice_lease_resync_signal_state = signal_state
                 self._voice_lease_resync_delivery_state = None
 
@@ -1366,8 +1368,8 @@ class AsrRuntimeMixin:
             if signal_state == self._blocked_text_mode_microphone_signal_state:
                 return
             progress = self._blocked_text_mode_microphone_delivery_state
-            if progress is None or progress.episode != signal_state:
-                progress = _VoiceControlDeliveryProgress(signal_state)
+            if progress is None or progress[0] != signal_state:
+                progress = (signal_state, set())
                 self._blocked_text_mode_microphone_delivery_state = progress
             await self._send_voice_control_status(
                 json.dumps(
@@ -1380,7 +1382,10 @@ class AsrRuntimeMixin:
             )
             if self._blocked_text_mode_microphone_episode() != signal_state:
                 return
-            if progress.display_delivered and progress.voice_owner_settled:
+            if {
+                "display_delivered",
+                "voice_owner_settled",
+            }.issubset(progress[1]):
                 self._blocked_text_mode_microphone_signal_state = signal_state
                 self._blocked_text_mode_microphone_delivery_state = None
 
