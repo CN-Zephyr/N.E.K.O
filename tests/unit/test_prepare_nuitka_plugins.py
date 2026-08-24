@@ -9,7 +9,11 @@ import sys
 import pytest
 
 from plugin.neko_plugin_cli.core.build_rules import _DEFAULT_EXCLUDE_DIR_NAMES
-from scripts.check_nuitka_dist import _check_plugin_stage, _check_plugin_tomls
+from scripts.check_nuitka_dist import (
+    _MARKETPLACE_ONLY_PLUGIN_DIRS,
+    _check_plugin_stage,
+    _check_plugin_tomls,
+)
 from scripts.prepare_nuitka_plugins import install_plugins, prepare_plugins
 
 
@@ -146,6 +150,29 @@ def test_dist_check_matches_stage_and_allows_shared_directory(tmp_path: Path) ->
     issues = _check_plugin_stage(dist_root, stage)
     assert len(issues) == 1
     assert "unstaged file" in issues[0]
+
+
+def test_nuitka_dist_rejects_marketplace_only_plugin(tmp_path: Path) -> None:
+    dist_root = tmp_path / "dist"
+    _write(dist_root / "plugin" / "plugins" / "demo" / "plugin.toml")
+    _write(dist_root / "plugin" / "plugins" / "neko_warthunder" / "plugin.toml")
+
+    issues = _check_plugin_tomls(dist_root)
+
+    assert issues == [
+        "marketplace-only plugin bundled: plugin/plugins/neko_warthunder"
+    ]
+
+
+def test_marketplace_only_plugins_are_not_vendored_in_source_tree() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    plugins_root = repo_root / "plugin" / "plugins"
+
+    assert not [
+        plugin_id
+        for plugin_id in sorted(_MARKETPLACE_ONLY_PLUGIN_DIRS)
+        if (plugins_root / plugin_id / "plugin.toml").is_file()
+    ]
 
 
 def test_install_plugins_restores_previous_payload_when_replace_fails(
