@@ -1171,7 +1171,15 @@ class AsrRuntimeMixin:
         self._ensure_asr_runtime_state()
         nr_enabled = bool(enabled)
         self._voice_input_noise_reduction_enabled = nr_enabled
-        async with self._voice_input_pipeline_transition_lock:
+        transition_lock = getattr(
+            self,
+            "_voice_input_pipeline_transition_lock",
+            None,
+        )
+        if transition_lock is None:
+            transition_lock = asyncio.Lock()
+            self._voice_input_pipeline_transition_lock = transition_lock
+        async with transition_lock:
             if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
                 return False
             pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
