@@ -1240,7 +1240,7 @@ class AsrRuntimeMixin:
         delivered_socket = await send_to_voice_owner(
             {"type": "status", "message": message}
         )
-        return delivered_socket is voice_owner_socket
+        return display_delivered or delivered_socket is voice_owner_socket
 
     async def _maybe_signal_voice_lease_resync(self) -> None:
         """Nudge a client whose PCM is dropped only because no lease is set.

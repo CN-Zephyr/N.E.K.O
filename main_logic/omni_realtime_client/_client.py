@@ -176,6 +176,10 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._close_task = None
         self._failed_transport_close_task = None
         self._gemini_close_task = None
+        # A replacement can reset the connection-wide close latch while the
+        # retired Gemini context is still exiting. Keep a separate latch per
+        # context so every path joins the same one-shot ``__aexit__`` call.
+        self._gemini_context_close_tasks: dict[int, tuple[Any, asyncio.Task]] = {}
         # Bumped when a replacement connection attaches. A teardown that
         # outlived its caller compares it after every await: the socket it
         # detached is still its own to close, but client-wide state (silence

@@ -285,7 +285,7 @@ def test_public_audio_docs_match_the_120_ms_frame_limit(relative_path: str) -> N
     )
     assert re.search(r"\b10\s*[-–]\s*32 ms\b", normalized)
     assert not re.search(
-        r"\b(?:at most|no longer than) one second\b",
+        r"\b(?:at most|no longer than)\s+(?:one|1)\s*(?:s|secs?|seconds?)\b",
         normalized,
         re.IGNORECASE,
     )

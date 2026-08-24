@@ -50,6 +50,10 @@ from ._protocol_capabilities import (
 
 _ATTACHED_TRANSPORT = object()
 
+
+class _RealtimeEventOwnerRetired(ConnectionError):
+    """The explicit send guard rejected this event before transport I/O."""
+
 # Ceiling on each host step inside a fail-open release that may be cut short.
 # The arbiter bounds the WHOLE notification with one shared budget
 # (_STUCK_RELEASE_NOTIFY_TIMEOUT, 2.0s); without a per-step ceiling the first
@@ -530,7 +534,9 @@ class _TransportMixin:
         async with self._send_semaphore:  # 限制并发发送数量
             try:
                 if send_guard is not None and not send_guard():
-                    raise ConnectionError("realtime event owner is no longer current")
+                    raise _RealtimeEventOwnerRetired(
+                        "realtime event owner is no longer current"
+                    )
                 if not self.ws:
                     return
                 payload = json.dumps(event)
@@ -550,11 +556,15 @@ class _TransportMixin:
                             )
                         return
                 if send_guard is not None and not send_guard():
-                    raise ConnectionError("realtime event owner is no longer current")
+                    raise _RealtimeEventOwnerRetired(
+                        "realtime event owner is no longer current"
+                    )
                 transport = self.ws
                 if not transport:
                     return
                 await transport.send(payload)
+            except _RealtimeEventOwnerRetired:
+                raise
             except Exception as e:
                 if send_guard is not None and not send_guard():
                     logger.info(
@@ -1765,6 +1775,13 @@ class _TransportMixin:
             async def retire_if_replaced() -> bool:
                 if receive_owner_is_current():
                     return False
+                if self._transport_detached_for_teardown(
+                    message_generation,
+                ):
+                    logger.info(
+                        "Raw receive event retired by the connection teardown"
+                    )
+                    return True
                 logger.info(
                     "Raw receive event retired after a replacement connection attached"
                 )
@@ -2165,7 +2182,10 @@ class _TransportMixin:
                     self._client_vad_last_speech_time = _now
                     self._user_recent_activity_time = _now
                 elif event_type == "conversation.item.input_audio_transcription.completed":
-                    if not self._raw_speech_started_scope_pending_transcript:
+                    if (
+                        not self._has_server_vad
+                        and not self._raw_speech_started_scope_pending_transcript
+                    ):
                         # Compatibility proxies may omit both server-VAD
                         # boundary events. The completed transcript is then the
                         # first authoritative signal that a new user turn has
@@ -2347,6 +2367,21 @@ class _TransportMixin:
                 status_code="CHARACTER_DISCONNECTED",
             )
 
+    def _transport_detached_for_teardown(
+        self,
+        connection_generation: int,
+    ) -> bool:
+        """Whether the current generation's close path already seized a socket."""
+
+        return bool(
+            connection_generation == self._connection_generation
+            and self.ws is None
+            and (
+                self._close_task is not None
+                or self._failed_transport_close_task is not None
+            )
+        )
+
     def _on_connection_attached(self) -> None:
         """Mark a replacement connection as live and hand it the teardown latches.
 
@@ -2432,6 +2467,17 @@ class _TransportMixin:
         if not self._still_owns_connection(generation) or self.ws is not message_ws:
             local_failure = self._consume_local_failure_recovery(generation)
             if local_failure is None:
+                if not self._transport_detached_for_teardown(
+                    generation,
+                ):
+                    # A replacement can attach before the retired receive
+                    # iterator reaches EOF. Release the socket captured by
+                    # this loop without touching successor-wide fatal state.
+                    await self._abort_failed_transport(
+                        reason,
+                        message_ws,
+                        generation,
+                    )
                 logger.info(
                     "Realtime receive loop ended after its transport was already "
                     "closed or replaced; no connection error will be reported"
@@ -2611,21 +2657,22 @@ class _TransportMixin:
         strand the manager on a live session over a dead transport.
         """
 
-        if ws is _ATTACHED_TRANSPORT:
-            tool_tasks = self._advance_tool_scope()
-            await self._await_retired_tool_tasks(tool_tasks)
-        if generation is None or self._still_owns_connection(generation):
+        attached_transport = ws is _ATTACHED_TRANSPORT
+        if attached_transport:
+            generation = getattr(self, "_connection_generation", None)
+            ws, self.ws = self.ws, None
             self._fatal_error_occurred = True
-        if ws is _ATTACHED_TRANSPORT:
-            # getattr, because this path is reachable on a client shell built
-            # without __init__ (abort is deliberately the one teardown that
-            # needs nothing but a socket) — and a shell has no receive loop to
-            # claim the latch anyway.
+            # Arm recovery before the first await. The receive loop can wake as
+            # soon as the socket is detached and must still be able to report
+            # the local abort to the manager while retired tool tasks unwind.
             self._local_failure_recovery = (
-                getattr(self, "_connection_generation", 0),
+                0 if generation is None else generation,
                 reason,
             )
-            ws, self.ws = self.ws, None
+            tool_tasks = self._advance_tool_scope()
+            await self._await_retired_tool_tasks(tool_tasks)
+        elif generation is None or self._still_owns_connection(generation):
+            self._fatal_error_occurred = True
         if ws is not None:
             try:
                 await ws.close()
@@ -2768,7 +2815,7 @@ class _TransportMixin:
                 # a second __aexit__ on the same one-shot context.
                 await asyncio.shield(gemini_close_task)
             elif gemini_context is not None:
-                await self._close_gemini_impl(gemini_context, ws)
+                await self._close_gemini_context(gemini_context, ws)
             return
         if ws:
             try:

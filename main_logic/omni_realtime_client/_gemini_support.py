@@ -416,12 +416,8 @@ class _GeminiMixin:
                 kw["id"] = r.call_id
             function_responses.append(types.FunctionResponse(**kw))
         try:
-            if owner is not None:
-                self._gemini_tool_continuation_owner = owner
             await session.send_tool_response(function_responses=function_responses)
         except Exception as e:
-            if getattr(self, "_gemini_tool_continuation_owner", None) is owner:
-                self._gemini_tool_continuation_owner = None
             logger.error("Gemini send_tool_response failed: %s", e)
 
     async def _close_gemini(self) -> None:
@@ -444,11 +440,51 @@ class _GeminiMixin:
         """Seize the context to exit, synchronously (see ``_own_teardown``)."""
 
         tool_tasks = self._advance_tool_scope()
-        return self._close_gemini_impl(
+        return self._close_gemini_context(
             self._gemini_context_manager,
             self._gemini_session,
             tool_tasks,
         )
+
+    async def _close_gemini_context(self, context, session, tool_tasks=()) -> None:
+        """Exit one Gemini context exactly once, even across replacements."""
+
+        if context is None:
+            await self._await_retired_tool_tasks(tool_tasks)
+            return
+        registry = self._gemini_context_close_tasks
+        key = id(context)
+        existing = registry.get(key)
+        if existing is not None and existing[0] is context:
+            close_task = existing[1]
+            await self._await_retired_tool_tasks(tool_tasks)
+        else:
+            close_task = asyncio.create_task(
+                self._close_gemini_impl(context, session, tool_tasks)
+            )
+            registry[key] = (context, close_task)
+
+            def _forget_finished_context(done_task) -> None:
+                current = registry.get(key)
+                if (
+                    current is not None
+                    and current[0] is context
+                    and current[1] is done_task
+                ):
+                    registry.pop(key, None)
+
+            close_task.add_done_callback(_forget_finished_context)
+        try:
+            await asyncio.shield(close_task)
+        finally:
+            current = registry.get(key)
+            if (
+                close_task.done()
+                and current is not None
+                and current[0] is context
+                and current[1] is close_task
+            ):
+                registry.pop(key, None)
 
     async def _close_gemini_impl(self, context, session, tool_tasks=()) -> None:
         await self._await_retired_tool_tasks(tool_tasks)
@@ -766,10 +802,6 @@ class _GeminiMixin:
                 # 这个 issue 本身。Gemini 这条路继续靠前端的 give-up 计时器兜底：
                 # 漏发是可接受的降级，早发不是。
                 if getattr(server_content, 'turn_complete', False):
-                    self._settle_gemini_tool_continuation(
-                        connection_generation=connection_generation,
-                        provider_session=session,
-                    )
                     # Gemini Live API 不返回 token 数，仅记录调用次数
                     try:
                         from utils.token_tracker import TokenTracker
@@ -794,10 +826,6 @@ class _GeminiMixin:
 
                 # 检查是否被中断
                 if was_interrupted:
-                    self._settle_gemini_tool_continuation(
-                        connection_generation=connection_generation,
-                        provider_session=session,
-                    )
                     settle_event_outcome(
                         error_msg="Gemini proactive response interrupted"
                     )

@@ -416,10 +416,6 @@ class _ResponseMixin:
             raise RuntimeError("realtime session has fatal_error_occurred set")
         if not text or not text.strip():
             return
-        if self.has_inflight_tool_turn():
-            raise RuntimeError(
-                "proactive realtime inject deferred while a tool turn is in flight"
-            )
 
         if self._is_gemini:
             # Symmetric with create_response → _create_response_gemini.
@@ -781,7 +777,7 @@ class _ResponseMixin:
             if still_current_connection:
                 await self._close_gemini()
             else:
-                await self._close_gemini_impl(context, provider_session)
+                await self._close_gemini_context(context, provider_session)
         except Exception as exc:
             logger.warning(
                 "Gemini proactive quarantine close failed: %s",

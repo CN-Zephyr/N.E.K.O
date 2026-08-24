@@ -166,60 +166,11 @@ class _ToolingMixin:
             call_ids=call_ids,
         )
 
-    def has_inflight_tool_turn(self) -> bool:
-        """Whether proactive injection must wait for the current tool turn.
-
-        A tracked task covers callback execution and result submission. Raw
-        realtime then has an exact arbiter ticket for the model continuation;
-        Gemini has no response id, so it retains the captured owner until the
-        next terminal event.
-        """
-
-        if any(
-            not task.done()
-            for task in tuple(getattr(self, "_tool_tasks", ()))
-        ):
-            return True
-        if any(
-            not continuation.done()
-            for continuation in tuple(
-                getattr(self, "_tool_continuation_futures", ())
-            )
-        ):
-            return True
-        owner = getattr(self, "_gemini_tool_continuation_owner", None)
-        return bool(owner is not None and self._tool_task_owner_is_current(owner))
-
-    def _track_raw_tool_continuation(self, completion: asyncio.Future) -> None:
-        continuations = getattr(self, "_tool_continuation_futures", None)
-        if continuations is None:
-            continuations = set()
-            self._tool_continuation_futures = continuations
-        continuations.add(completion)
-        completion.add_done_callback(continuations.discard)
-
-    def _settle_gemini_tool_continuation(
-        self,
-        *,
-        connection_generation: int,
-        provider_session: Any,
-    ) -> None:
-        owner = getattr(self, "_gemini_tool_continuation_owner", None)
-        if owner is None:
-            return
-        if (
-            owner.connection_generation == connection_generation
-            and owner.provider_session is provider_session
-        ):
-            self._gemini_tool_continuation_owner = None
-
     def _advance_tool_scope(self) -> tuple[asyncio.Task, ...]:
         """Retire every tool owned by the preceding user/connection scope."""
 
         self._tool_scope_generation = getattr(self, "_tool_scope_generation", 0) + 1
         getattr(self, "_cancelled_tool_call_ids", set()).clear()
-        getattr(self, "_tool_continuation_futures", set()).clear()
-        self._gemini_tool_continuation_owner = None
         current_task = asyncio.current_task()
         tasks = tuple(getattr(self, "_tool_tasks", ()))
         for task in tasks:
@@ -503,7 +454,6 @@ class _ToolingMixin:
             event_sender=_send_owned_event if owner is not None else None,
             priority=5,
         )
-        self._track_raw_tool_continuation(ticket.done)
         try:
             if owner is not None and not self._tool_task_owner_is_current(owner):
                 await arbiter.cancel_ticket(ticket, wait=False)

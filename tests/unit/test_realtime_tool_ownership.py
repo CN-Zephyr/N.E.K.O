@@ -58,6 +58,33 @@ class _FailingBlockingSendSocket(_BlockingSendSocket):
         raise ConnectionError("1006 retired transport failed")
 
 
+class _ClosingReceiveSocket(_QueueSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.receive_started = asyncio.Event()
+        self.close_calls = 0
+
+    async def __anext__(self):
+        self.receive_started.set()
+        return await super().__anext__()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.finish()
+
+
+class _GatedGeminiContext:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.exit_calls = 0
+
+    async def __aexit__(self, *_exc_info) -> None:
+        self.exit_calls += 1
+        self.entered.set()
+        await self.release.wait()
+
+
 class _GeminiSession:
     def __init__(self) -> None:
         self.tool_responses: list[list] = []
@@ -157,7 +184,7 @@ async def _wait_for_socket_sends(socket: _QueueSocket, count: int) -> None:
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["gpt", "gemini"])
-async def test_proactive_inject_waits_for_current_turn_tool_task(
+async def test_proactive_inject_does_not_cancel_current_turn_tool_task(
     api_type: str,
     monkeypatch,
 ) -> None:
@@ -196,6 +223,12 @@ async def test_proactive_inject_waits_for_current_turn_tool_task(
         client.ws = _QueueSocket()
         client._send_tool_result_openai_realtime = AsyncMock()
     client._on_connection_attached()
+    if api_type != "gemini":
+        sent = asyncio.get_running_loop().create_future()
+        sent.set_result(None)
+        client._response_arbiter = SimpleNamespace(
+            enqueue=AsyncMock(return_value=SimpleNamespace(sent=sent)),
+        )
     original_scope = client._tool_scope_generation
     owner = client._capture_tool_task_owner(client.ws)
     call = ToolCall(name="lookup", arguments={}, call_id="call-1")
@@ -205,32 +238,21 @@ async def test_proactive_inject_waits_for_current_turn_tool_task(
         client._start_raw_tool_call(call, owner)
     await asyncio.wait_for(started.wait(), timeout=1)
 
-    with pytest.raises(RuntimeError, match="tool turn is in flight"):
-        await client.inject_text_and_request_response("plugin proactive event")
+    await client.inject_text_and_request_response("plugin proactive event")
 
     assert client._tool_scope_generation == original_scope
     assert not cancelled.is_set()
     if api_type == "gemini":
-        client._gemini_session.send_client_content.assert_not_awaited()
+        client._gemini_session.send_client_content.assert_awaited_once()
     else:
-        assert client.ws.sent == []
+        client._response_arbiter.enqueue.assert_awaited_once()
 
     release.set()
     await _wait_for_tool_tasks(client)
-    assert client.has_inflight_tool_turn() is False
     if api_type == "gemini":
         client._send_tool_result_gemini.assert_awaited_once()
-        await client.inject_text_and_request_response("plugin proactive event")
-        client._gemini_session.send_client_content.assert_awaited_once()
     else:
         client._send_tool_result_openai_realtime.assert_awaited_once()
-        sent = asyncio.get_running_loop().create_future()
-        sent.set_result(None)
-        client._response_arbiter = SimpleNamespace(
-            enqueue=AsyncMock(return_value=SimpleNamespace(sent=sent)),
-        )
-        await client.inject_text_and_request_response("plugin proactive event")
-        client._response_arbiter.enqueue.assert_awaited_once()
 
 
 @pytest.mark.unit
@@ -264,49 +286,176 @@ async def test_true_user_turn_still_cancels_current_tool_task() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-@pytest.mark.parametrize("api_type", ["gpt", "gemini"])
-async def test_proactive_inject_waits_for_tool_result_continuation(
-    api_type: str,
-) -> None:
+async def test_send_guard_rejection_after_semaphore_is_not_reported_as_sent() -> None:
     client = OmniRealtimeClient(
         "wss://example.invalid/realtime",
         "test-key",
-        model="gemini-live" if api_type == "gemini" else "gpt-realtime",
-        api_type=api_type,
+        model="gpt-realtime",
+        api_type="gpt",
     )
-    if api_type == "gemini":
-        session = AsyncMock()
-        client._gemini_session = session
-        client.ws = session
-        client._on_connection_attached()
-        owner = client._capture_tool_task_owner(session)
-        client._gemini_tool_continuation_owner = owner
-    else:
-        client.ws = object()
-        client._on_connection_attached()
-        continuation = asyncio.get_running_loop().create_future()
-        client._track_raw_tool_continuation(continuation)
+    socket = _QueueSocket()
+    client.ws = socket
+    gate = _SendGate()
+    client._send_semaphore = gate
+    current = [True]
 
-    with pytest.raises(RuntimeError, match="tool turn is in flight"):
-        await client.inject_text_and_request_response("plugin proactive event")
+    sending = asyncio.create_task(
+        client.send_event(
+            {"type": "response.create"},
+            send_guard=lambda: current[0],
+        )
+    )
+    await asyncio.wait_for(gate.entered.wait(), timeout=1)
+    current[0] = False
+    gate.release.set()
 
-    if api_type == "gemini":
-        session.send_client_content.assert_not_awaited()
-        client._settle_gemini_tool_continuation(
-            connection_generation=client._connection_generation,
-            provider_session=session,
+    with pytest.raises(ConnectionError, match="owner is no longer current"):
+        await asyncio.wait_for(sending, timeout=1)
+    assert socket.sent == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_transport_failure_after_owner_retirement_remains_suppressed() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+    )
+    socket = _FailingBlockingSendSocket()
+    client.ws = socket
+    current = [True]
+
+    sending = asyncio.create_task(
+        client.send_event(
+            {"type": "response.cancel"},
+            send_guard=lambda: current[0],
         )
-        await client.inject_text_and_request_response("plugin proactive event")
-        session.send_client_content.assert_awaited_once()
-    else:
-        continuation.set_result(None)
-        sent = asyncio.get_running_loop().create_future()
-        sent.set_result(None)
-        client._response_arbiter = SimpleNamespace(
-            enqueue=AsyncMock(return_value=SimpleNamespace(sent=sent)),
+    )
+    await asyncio.wait_for(socket.send_started.wait(), timeout=1)
+    current[0] = False
+    socket.release_send.set()
+
+    await asyncio.wait_for(sending, timeout=1)
+    assert client._fatal_error_occurred is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_failed_transport_detaches_before_waiting_for_retired_tools() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+    )
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    tool_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def slow_cancelled_tool() -> None:
+        tool_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_cleanup.wait()
+            raise
+
+    tool_task = client._create_tool_task(slow_cancelled_tool(), call_ids=("call-1",))
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+    abort_task = asyncio.create_task(
+        client._abort_failed_transport("tool owner transport failed")
+    )
+    try:
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+
+        assert client.ws is None
+        assert client._fatal_error_occurred is True
+        assert client._local_failure_recovery == (
+            client._connection_generation,
+            "tool owner transport failed",
         )
-        await client.inject_text_and_request_response("plugin proactive event")
-        client._response_arbiter.enqueue.assert_awaited_once()
+        assert socket.closed is False
+
+        await client.send_event({"type": "response.create"})
+        assert socket.sent == []
+    finally:
+        release_cleanup.set()
+
+    await asyncio.wait_for(abort_task, timeout=1)
+    await asyncio.gather(tool_task, return_exceptions=True)
+    assert socket.closed is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_ordinary_close_does_not_turn_receive_eof_into_fatal_close() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+    )
+    socket = _ClosingReceiveSocket()
+    client.ws = socket
+    receiving = asyncio.create_task(client.handle_messages())
+    await asyncio.wait_for(socket.receive_started.wait(), timeout=1)
+
+    await asyncio.wait_for(client.close(), timeout=1)
+    await asyncio.wait_for(receiving, timeout=1)
+
+    assert client._fatal_error_occurred is False
+    assert socket.close_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_replacement_paths_join_one_retired_gemini_context_exit() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    retired_context = _GatedGeminiContext()
+    retired_session = object()
+    client._gemini_context_manager = retired_context
+    client._gemini_session = retired_session
+    client.ws = retired_session
+
+    first_close = asyncio.create_task(client._close_gemini())
+    await asyncio.wait_for(retired_context.entered.wait(), timeout=1)
+
+    replacement_context = _GatedGeminiContext()
+    replacement_session = object()
+    client._gemini_context_manager = replacement_context
+    client._gemini_session = replacement_session
+    client.ws = replacement_session
+    client._on_connection_attached()
+
+    second_close_started = asyncio.Event()
+
+    async def close_retired_context_again() -> None:
+        second_close_started.set()
+        await client._close_gemini_context(retired_context, retired_session)
+
+    second_close = asyncio.create_task(close_retired_context_again())
+    await asyncio.wait_for(second_close_started.wait(), timeout=1)
+    assert retired_context.exit_calls == 1
+
+    retired_context.release.set()
+    await asyncio.wait_for(asyncio.gather(first_close, second_close), timeout=1)
+
+    assert retired_context.exit_calls == 1
+    assert replacement_context.exit_calls == 0
+    assert client._gemini_context_manager is replacement_context
+    assert client._gemini_session is replacement_session
+    assert client.ws is replacement_session
 
 
 @pytest.mark.unit
@@ -633,6 +782,7 @@ async def test_raw_transcript_only_turn_cancels_previous_tool() -> None:
         on_input_transcript=on_input_transcript,
         on_tool_call=handler,
     )
+    client._has_server_vad = False
     socket = _QueueSocket()
     client.ws = socket
     client._on_connection_attached()
@@ -711,6 +861,61 @@ async def test_raw_transcript_does_not_advance_scope_twice_after_speech_started(
     socket.feed({"type": "response.created", "response": {"id": "tool-response"}})
     socket.feed({"type": "response.done", "response": {"id": "tool-response"}})
     await client._response_arbiter.wait_until_idle(timeout=1)
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_server_vad_transcript_without_boundary_keeps_same_turn_tool() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    transcript_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(call):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    async def on_input_transcript(_transcript: str) -> None:
+        transcript_seen.set()
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        on_input_transcript=on_input_transcript,
+        on_tool_call=handler,
+    )
+    client._has_server_vad = True
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(_raw_tool_event())
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "same server-vad turn",
+        }
+    )
+    await asyncio.wait_for(transcript_seen.wait(), timeout=1)
+    release.set()
+    await _wait_for_tool_tasks(client)
+
+    assert not cancelled.is_set()
+    assert [event["type"] for event in socket.sent] == [
+        "conversation.item.create",
+        "response.create",
+    ]
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
 

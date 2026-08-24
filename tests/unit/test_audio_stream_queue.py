@@ -2119,7 +2119,7 @@ async def test_lease_resync_retries_when_display_and_voice_delivery_fail():
     assert voice.attempts == 2
 
 
-async def test_blocked_text_notice_retries_when_only_voice_delivery_fails():
+async def test_blocked_text_notice_commits_when_display_delivery_succeeds():
     class _LiveState:
         CONNECTED = "connected"
 
@@ -2151,16 +2151,15 @@ async def test_blocked_text_notice_retries_when_only_voice_delivery_fails():
 
     await LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
 
-    assert mgr._blocked_text_mode_microphone_signal_state is None
+    assert mgr._blocked_text_mode_microphone_signal_state is not None
     assert display.attempts == 1
     assert voice.attempts == 1
 
-    voice.fail = False
     await LLMSessionManager._maybe_signal_blocked_text_mode_microphone(mgr)
 
     assert mgr._blocked_text_mode_microphone_signal_state is not None
-    assert display.attempts == 2
-    assert voice.attempts == 2
+    assert display.attempts == 1
+    assert voice.attempts == 1
 
 
 async def test_voice_socket_setter_rejects_a_stale_claim():
