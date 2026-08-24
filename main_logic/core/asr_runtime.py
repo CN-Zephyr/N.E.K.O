@@ -1177,7 +1177,6 @@ class AsrRuntimeMixin:
 
         self._ensure_asr_runtime_state()
         nr_enabled = bool(enabled)
-        self._voice_input_noise_reduction_enabled = nr_enabled
         transition_lock = getattr(
             self,
             "_voice_input_pipeline_transition_lock",
@@ -1186,15 +1185,27 @@ class AsrRuntimeMixin:
         if transition_lock is None:
             transition_lock = asyncio.Lock()
             self._voice_input_pipeline_transition_lock = transition_lock
-        async with transition_lock:
-            if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
-                return False
-            pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
-                self,
-                nr_enabled=nr_enabled,
-            )
-        await asyncio.shield(pipeline_cleanup)
-        return True
+
+        async def transition() -> bool:
+            async with transition_lock:
+                self._voice_input_noise_reduction_enabled = nr_enabled
+                if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
+                    return False
+                pipeline_cleanup = (
+                    AsrRuntimeMixin._replace_voice_input_audio_pipeline(
+                        self,
+                        nr_enabled=nr_enabled,
+                    )
+                )
+            await asyncio.shield(pipeline_cleanup)
+            return True
+
+        transition_task = AsrRuntimeMixin._schedule_core_asr_cleanup(
+            self,
+            transition(),
+            name="core-voice-input-pipeline-transition",
+        )
+        return await asyncio.shield(transition_task)
 
     async def _reconcile_independent_asr_after_core_change(self) -> None:
         self._ensure_asr_runtime_state()
