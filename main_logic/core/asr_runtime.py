@@ -257,6 +257,7 @@ class AsrRuntimeMixin:
         # has atomically exposed the replacement.
         self._core_voice_session_swap_lock = asyncio.Lock()
         self._core_voice_session_swap_barrier_timeout_s = 5.0
+        self._voice_input_pipeline_transition_lock = asyncio.Lock()
         self._independent_asr_provider: str | None = None
         self._independent_asr_route_key: str | None = None
         self._independent_asr_handshake_override: bool | None = None
@@ -355,6 +356,8 @@ class AsrRuntimeMixin:
             self._core_voice_session_swap_lock = asyncio.Lock()
         if not hasattr(self, "_core_voice_session_swap_barrier_timeout_s"):
             self._core_voice_session_swap_barrier_timeout_s = 5.0
+        if not hasattr(self, "_voice_input_pipeline_transition_lock"):
+            self._voice_input_pipeline_transition_lock = asyncio.Lock()
         if not hasattr(self, "_voice_input_transition_generation"):
             self._voice_input_transition_generation = 0
         if not hasattr(self, "_voice_lease_resync_signal_state"):
@@ -759,11 +762,14 @@ class AsrRuntimeMixin:
             return
         nr_enabled = settings.get("noiseReductionEnabled", True) is not False
         self._voice_input_noise_reduction_enabled = nr_enabled
-        if self._voice_input_audio_pipeline.nr_enabled != nr_enabled:
-            pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
-                self,
-                nr_enabled=nr_enabled,
-            )
+        pipeline_cleanup = None
+        async with self._voice_input_pipeline_transition_lock:
+            if self._voice_input_audio_pipeline.nr_enabled != nr_enabled:
+                pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
+                    self,
+                    nr_enabled=nr_enabled,
+                )
+        if pipeline_cleanup is not None:
             await asyncio.shield(pipeline_cleanup)
             if not core_start_is_current():
                 return
@@ -1107,10 +1113,11 @@ class AsrRuntimeMixin:
             self._voice_input_registry.invalidate_utterance(
                 reason="independent_asr_close",
             )
-        pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
-            self,
-            nr_enabled=self._voice_input_noise_reduction_enabled,
-        )
+        async with self._voice_input_pipeline_transition_lock:
+            pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
+                self,
+                nr_enabled=self._voice_input_noise_reduction_enabled,
+            )
         self._independent_asr_provider = None
         self._independent_asr_route_key = None
 
@@ -1164,12 +1171,13 @@ class AsrRuntimeMixin:
         self._ensure_asr_runtime_state()
         nr_enabled = bool(enabled)
         self._voice_input_noise_reduction_enabled = nr_enabled
-        if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
-            return False
-        pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
-            self,
-            nr_enabled=nr_enabled,
-        )
+        async with self._voice_input_pipeline_transition_lock:
+            if self._voice_input_audio_pipeline.nr_enabled == nr_enabled:
+                return False
+            pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
+                self,
+                nr_enabled=nr_enabled,
+            )
         await asyncio.shield(pipeline_cleanup)
         return True
 
@@ -1559,6 +1567,22 @@ class AsrRuntimeMixin:
         return current
 
     async def _fail_voice_input_pipeline(
+        self,
+        *,
+        ingress_token: VoiceIngressToken,
+        session_ref: object,
+        audio_epoch: int,
+        pipeline_ref: VoiceInputAudioPipeline,
+    ) -> None:
+        async with self._voice_input_pipeline_transition_lock:
+            await self._fail_voice_input_pipeline_locked(
+                ingress_token=ingress_token,
+                session_ref=session_ref,
+                audio_epoch=audio_epoch,
+                pipeline_ref=pipeline_ref,
+            )
+
+    async def _fail_voice_input_pipeline_locked(
         self,
         *,
         ingress_token: VoiceIngressToken,

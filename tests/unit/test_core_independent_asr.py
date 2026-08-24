@@ -6019,6 +6019,69 @@ async def test_current_audio_pipeline_failure_blocks_once_without_pcm() -> None:
     ]
 
 
+async def test_noise_reduction_replacement_waits_for_pipeline_failure_revoke() -> None:
+    class _ObservedAsyncLock:
+        def __init__(self) -> None:
+            self._lock = asyncio.Lock()
+            self._requests = 0
+            self.second_request = asyncio.Event()
+
+        async def __aenter__(self):
+            self._requests += 1
+            if self._requests == 2:
+                self.second_request.set()
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            self._lock.release()
+
+    runtime = _Runtime()
+    runtime.is_active = True
+    runtime._set_microphone_route("independent")
+    runtime._independent_asr_provider = "glm"
+    assert runtime._begin_voice_input_connection("socket-a") is True
+    runtime._voice_lease_owner = "core"
+    runtime._voice_lease_synchronized = True
+    transition_lock = _ObservedAsyncLock()
+    runtime._voice_input_pipeline_transition_lock = transition_lock
+    abort_started = asyncio.Event()
+    release_abort = asyncio.Event()
+
+    async def block_first_abort(_reason: str) -> None:
+        abort_started.set()
+        await release_abort.wait()
+
+    runtime._asr_runtime.abort = AsyncMock(side_effect=block_first_abort)
+    source_pipeline = runtime._voice_input_audio_pipeline
+    failure = asyncio.create_task(
+        runtime._fail_voice_input_pipeline(
+            ingress_token=runtime._capture_ingress_token(),
+            session_ref=runtime.session,
+            audio_epoch=runtime._audio_stream_epoch,
+            pipeline_ref=source_pipeline,
+        )
+    )
+    await asyncio.wait_for(abort_started.wait(), 1)
+
+    replacement = asyncio.create_task(runtime.apply_voice_input_noise_reduction(False))
+    await asyncio.wait_for(transition_lock.second_request.wait(), 1)
+    release_abort.set()
+    failure_result, replacement_result = await asyncio.wait_for(
+        asyncio.gather(failure, replacement),
+        1,
+    )
+
+    assert failure_result is None
+    assert replacement_result is True
+    assert runtime._asr_route_mode == "blocked"
+    assert runtime._voice_lease_connection_id == ""
+    assert runtime._voice_lease_owner == "none"
+    assert runtime._voice_input_audio_pipeline is not source_pipeline
+    assert runtime._voice_input_audio_pipeline.nr_enabled is False
+    assert runtime._voice_input_pipeline_failed is False
+
+
 async def test_pipeline_failure_from_replaced_connection_is_silent() -> None:
     runtime = _Runtime()
     runtime.is_active = True
