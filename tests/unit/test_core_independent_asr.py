@@ -4045,6 +4045,44 @@ async def test_cancelled_core_close_keeps_detached_cleanup_owned() -> None:
     runtime._asr_runtime.close.assert_awaited_once_with()
 
 
+async def test_cancelled_core_close_waiting_for_pipeline_lock_stays_owned() -> None:
+    runtime = _Runtime()
+    gate = _GateAsyncLock()
+    runtime._voice_input_pipeline_transition_lock = gate
+    old_pipeline = SimpleNamespace(close=AsyncMock())
+    runtime._voice_input_audio_pipeline = old_pipeline
+    runtime._independent_asr_provider = "old-provider"
+    runtime._independent_asr_route_key = "old-core"
+    runtime._voice_input_registry.wait_idle = AsyncMock()
+    runtime._asr_runtime.close = AsyncMock()
+
+    closing = asyncio.create_task(
+        runtime._close_independent_asr(next_route_mode="blocked")
+    )
+    await asyncio.wait_for(gate.requested.wait(), 1)
+    close_cleanup = next(
+        task
+        for task in runtime._core_asr_cleanup_tasks
+        if task.get_name() == "core-independent-asr-close"
+    )
+
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert close_cleanup.cancelled() is False
+    assert runtime._voice_input_audio_pipeline is old_pipeline
+    gate.release.set()
+    await asyncio.wait_for(asyncio.shield(close_cleanup), 1)
+
+    assert runtime._voice_input_audio_pipeline is not old_pipeline
+    assert runtime._independent_asr_provider is None
+    assert runtime._independent_asr_route_key is None
+    old_pipeline.close.assert_awaited_once_with()
+    runtime._voice_input_registry.wait_idle.assert_awaited_once_with()
+    runtime._asr_runtime.close.assert_awaited_once_with()
+
+
 async def test_core_close_detaches_shared_state_before_registry_wait() -> None:
     runtime = _Runtime()
     registry_wait_started = asyncio.Event()

@@ -1118,17 +1118,18 @@ class AsrRuntimeMixin:
             self._voice_input_registry.invalidate_utterance(
                 reason="independent_asr_close",
             )
-        async with self._voice_input_pipeline_transition_lock:
-            if not self._asr_route_operation_matches(operation_generation):
-                return
-            pipeline_cleanup = AsrRuntimeMixin._replace_voice_input_audio_pipeline(
-                self,
-                nr_enabled=self._voice_input_noise_reduction_enabled,
-            )
-        self._independent_asr_provider = None
-        self._independent_asr_route_key = None
-
         async def finish_close() -> None:
+            async with self._voice_input_pipeline_transition_lock:
+                if not self._asr_route_operation_matches(operation_generation):
+                    return
+                pipeline_cleanup = (
+                    AsrRuntimeMixin._replace_voice_input_audio_pipeline(
+                        self,
+                        nr_enabled=self._voice_input_noise_reduction_enabled,
+                    )
+                )
+            self._independent_asr_provider = None
+            self._independent_asr_route_key = None
             await self._voice_input_registry.wait_idle()
             # A successor start advances the route generation and installs its
             # own cancellation-safe close before its first suspension. Once
