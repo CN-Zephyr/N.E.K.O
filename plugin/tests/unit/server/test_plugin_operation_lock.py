@@ -1,11 +1,47 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+import os
+from pathlib import Path
 import threading
+from typing import Any
 
 import pytest
 
-from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
+from plugin.server.application.plugins.operation_lock import (
+    plugin_operation_lock,
+    serialized_plugin_operation,
+)
+
+
+def _hold_operation_file_lock(lock_path: str, ready: Any, release: Any) -> None:
+    os.environ["NEKO_PLUGIN_OPERATION_LOCK_PATH"] = lock_path
+    from plugin.server.application.plugins import operation_lock
+
+    handle = operation_lock._acquire_file_lock_sync()
+    ready.set()
+    try:
+        release.wait()
+    finally:
+        operation_lock._release_file_lock_sync(handle)
+
+
+class _CountingExecutor(ThreadPoolExecutor):
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self._count_lock = threading.Lock()
+        self.submission_count = 0
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._count_lock:
+            self.submission_count += 1
+        return super().submit(fn, *args, **kwargs)
+
+    def reset_count(self) -> None:
+        with self._count_lock:
+            self.submission_count = 0
 
 
 @pytest.mark.plugin_unit
@@ -73,3 +109,125 @@ async def test_plugin_operation_lock_waits_for_thread_work_after_cancellation() 
         await first_task
     await second_task
     assert observed == ["second"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows msvcrt retry semantics")
+def test_windows_file_lock_retries_without_a_fixed_attempt_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from plugin.server.application.plugins import operation_lock
+    import msvcrt
+
+    attempts = 0
+
+    def controlled_locking(_fd: int, mode: int, _size: int) -> None:
+        nonlocal attempts
+        if mode == msvcrt.LK_UNLCK:
+            return
+        attempts += 1
+        if attempts <= 20:
+            raise OSError(13, "controlled contention")
+
+    class _ImmediateRetryEvent:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, _timeout: float | None = None) -> bool:
+            return False
+
+    monkeypatch.setenv(
+        "NEKO_PLUGIN_OPERATION_LOCK_PATH",
+        str(tmp_path / "operation.lock"),
+    )
+    monkeypatch.setattr(msvcrt, "locking", controlled_locking)
+
+    handle = operation_lock._acquire_file_lock_sync(_ImmediateRetryEvent())
+    try:
+        assert attempts == 21
+    finally:
+        operation_lock._release_file_lock_sync(handle)
+
+
+@pytest.mark.asyncio
+async def test_waiter_does_not_consume_the_default_executor() -> None:
+    loop = asyncio.get_running_loop()
+    previous_executor = getattr(loop, "_default_executor", None)
+    executor = _CountingExecutor()
+    loop.set_default_executor(executor)
+    waiter_started = asyncio.Event()
+    waiter_entered = asyncio.Event()
+    waiter_task: asyncio.Task[None] | None = None
+
+    async def waiter() -> None:
+        waiter_started.set()
+        async with plugin_operation_lock.hold():
+            waiter_entered.set()
+
+    try:
+        async with plugin_operation_lock.hold():
+            executor.reset_count()
+            waiter_task = asyncio.create_task(waiter())
+            await waiter_started.wait()
+            barrier = asyncio.Event()
+            loop.call_soon(barrier.set)
+            await barrier.wait()
+            assert executor.submission_count == 0
+            await asyncio.to_thread(lambda: None)
+            assert executor.submission_count == 1
+            assert not waiter_entered.is_set()
+        await waiter_task
+    finally:
+        if waiter_task is not None:
+            await asyncio.gather(waiter_task, return_exceptions=True)
+        loop._default_executor = previous_executor  # type: ignore[attr-defined]
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_cross_process_file_lock_wait_can_be_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "operation.lock"
+    monkeypatch.setenv("NEKO_PLUGIN_OPERATION_LOCK_PATH", str(lock_path))
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_operation_file_lock,
+        args=(str(lock_path), ready, release),
+    )
+    process.start()
+    waiter_task: asyncio.Task[None] | None = None
+
+    async def waiter() -> None:
+        async with plugin_operation_lock.hold():
+            raise AssertionError("cancelled waiter must not enter")
+
+    try:
+        assert await asyncio.to_thread(ready.wait, 10)
+        waiter_task = asyncio.create_task(waiter())
+        barrier = asyncio.Event()
+        asyncio.get_running_loop().call_soon(barrier.set)
+        await barrier.wait()
+        assert not waiter_task.done()
+
+        waiter_task.cancel()
+        waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_task
+
+        release.set()
+        async with plugin_operation_lock.hold():
+            pass
+    finally:
+        release.set()
+        if waiter_task is not None and not waiter_task.done():
+            waiter_task.cancel()
+            await asyncio.gather(waiter_task, return_exceptions=True)
+        await asyncio.to_thread(process.join, 10)
+        if process.is_alive():
+            process.terminate()
+            await asyncio.to_thread(process.join, 10)
+        assert process.exitcode == 0

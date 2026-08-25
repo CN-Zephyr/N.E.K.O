@@ -5,12 +5,42 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
 from pathlib import Path
 
 import pytest
 
 from plugin.core import host as host_module
+
+
+def _probe_child_import_roots(
+    builtin_root: str,
+    user_root: str,
+    config_path: str,
+    result_queue,
+) -> None:
+    from plugin import settings
+    from plugin.core import host
+
+    class _ChildLogger:
+        def debug(self, *_args, **_kwargs) -> None:
+            return
+
+        def info(self, *_args, **_kwargs) -> None:
+            return
+
+    settings.BUILTIN_PLUGIN_CONFIG_ROOT = Path(builtin_root)
+    settings.PLUGIN_CONFIG_ROOTS = (Path(builtin_root), Path(user_root))
+    host._prepare_child_plugin_import_roots(_ChildLogger())
+    host._prepare_child_current_plugin_import_root(Path(config_path), _ChildLogger())
+
+    for name in tuple(sys.modules):
+        if name == "json" or name.startswith("json."):
+            sys.modules.pop(name, None)
+    import json
+
+    result_queue.put((bool(getattr(json, "UNSELECTED_PLUGIN_SHADOW", False)), json.__file__))
 
 
 class _StubLogger:
@@ -79,3 +109,36 @@ def test_import_plugin_module_raises_for_missing_submodule(
     config_path = _make_user_plugin(tmp_path)
     with pytest.raises(ModuleNotFoundError):
         host_module._import_plugin_module("plugins.myplug.missing", config_path, _StubLogger())
+
+
+@pytest.mark.plugin_unit
+def test_child_import_only_exposes_selected_plugin(tmp_path: Path) -> None:
+    builtin_root = tmp_path / "builtin" / "plugins"
+    user_root = tmp_path / "user" / "plugins"
+    selected_dir = user_root / "selected"
+    sibling_dir = user_root / "json"
+    builtin_root.mkdir(parents=True)
+    selected_dir.mkdir(parents=True)
+    sibling_dir.mkdir(parents=True)
+    config_path = selected_dir / "plugin.toml"
+    config_path.write_text("[plugin]\nid='selected'\n", encoding="utf-8")
+    (selected_dir / "__init__.py").write_text("VALUE = 'selected'\n", encoding="utf-8")
+    (sibling_dir / "__init__.py").write_text(
+        "UNSELECTED_PLUGIN_SHADOW = True\n",
+        encoding="utf-8",
+    )
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_probe_child_import_roots,
+        args=(str(builtin_root), str(user_root), str(config_path), result_queue),
+    )
+    process.start()
+    process.join(15)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    assert process.exitcode == 0
+    shadowed, imported_from = result_queue.get(timeout=5)
+    assert shadowed is False, imported_from

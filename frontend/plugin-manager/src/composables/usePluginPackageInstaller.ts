@@ -3,18 +3,20 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
+  discardUploadedPluginPackage,
   installPluginPackage,
   planPluginInstall,
   type PluginCliInstallRequest,
   type PluginCliInstallPlanResponse,
   type PluginCliInstallResponse,
 } from '@/api/pluginCli'
-import { formatHttpError } from '@/utils/request'
+import { resolvePluginPackageErrorMessage } from '@/utils/pluginPackageError'
 
 export type InstallPackagePathOptions = {
   pluginsRoot?: string
   profilesRoot?: string
   installSource?: 'imported'
+  discardOnFailure?: boolean
 }
 
 export function usePluginPackageInstaller() {
@@ -34,6 +36,7 @@ export function usePluginPackageInstaller() {
 
     const pluginsRoot = options.pluginsRoot?.trim() || undefined
     const profilesRoot = options.profilesRoot?.trim() || undefined
+    let installRequested = false
     installing.value = true
     installPlan.value = null
     try {
@@ -67,48 +70,48 @@ export function usePluginPackageInstaller() {
         on_conflict: 'fail',
         install_source: options.installSource,
       }
-      if (plan.action === 'upgrade') {
+      if (plan.action === 'upgrade' || plan.action === 'reinstall' || plan.action === 'downgrade') {
+        const messagePrefix = plan.action
         try {
           await ElMessageBox.confirm(
-            t('package.install.upgradeBody', {
+            t(`package.install.${messagePrefix}Body`, {
               current: plan.current_version || '-',
               target: plan.target_version || '-',
             }),
-            t('package.install.upgradeTitle', {
+            t(`package.install.${messagePrefix}Title`, {
               plugin: plan.plugin_id || plan.directory_name,
             }),
             {
               type: 'warning',
-              confirmButtonText: t('package.install.upgradeConfirm'),
+              confirmButtonText: t(`package.install.${messagePrefix}Confirm`),
               cancelButtonText: t('common.cancel'),
             },
           )
         } catch {
-          ElMessage.info(t('package.install.upgradeCancelled'))
+          ElMessage.info(t(`package.install.${messagePrefix}Cancelled`))
           return null
         }
         request.confirm_upgrade = true
         request.confirmation_token = plan.confirmation_token
       }
 
+      installRequested = true
       return await installPluginPackage(request)
     } catch (error) {
-      const errorCode = (error as any)?.response?.data?.detail?.code
-        || (error as any)?.response?.data?.code
-      if (errorCode === 'PLUGIN_UPGRADE_ROLLED_BACK') {
-        const rollbackStatus = (error as any)?.response?.data?.detail?.details?.rollback_status
-        ElMessage.error(t(
-          rollbackStatus === 'completed'
-            ? 'package.install.rollbackCompleted'
-            : 'package.install.rollbackIncomplete',
-        ))
-      } else if (!installPlan.value) {
-        ElMessage.error(t('package.install.planFailed'))
-      } else {
-        ElMessage.error(t('package.install.installFailed', { error: formatHttpError(error) }))
-      }
+      ElMessage.error(resolvePluginPackageErrorMessage(
+        error,
+        t,
+        installPlan.value ? 'install' : 'plan',
+      ))
       return null
     } finally {
+      if (options.discardOnFailure && !installRequested) {
+        try {
+          await discardUploadedPluginPackage(packagePath)
+        } catch (cleanupError) {
+          console.warn('Failed to discard abandoned plugin package upload', cleanupError)
+        }
+      }
       installing.value = false
     }
   }
