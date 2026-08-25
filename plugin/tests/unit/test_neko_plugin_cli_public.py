@@ -513,6 +513,24 @@ def test_inspect_package_rejects_file_directory_prefix_collision(tmp_path: Path)
         inspect_package(package_path)
 
 
+def test_inspect_package_rejects_file_explicit_directory_prefix_collision(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    package_path = tmp_path / "explicit-directory-prefix-collision.neko-plugin"
+    build_plugin(plugin_dir, package_path)
+    _append_package_members(
+        package_path,
+        [
+            ("payload/plugins/demo_plugin/collision", b"file"),
+            ("payload/plugins/demo_plugin/collision/empty/", b""),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="file/directory path conflict"):
+        inspect_package(package_path)
+
+
 def test_inspect_package_enforces_global_entry_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -41,6 +41,11 @@ def _hold_operation_file_lock(lock_path: str, ready: Any, release: Any) -> None:
         operation_lock._release_file_lock_sync(handle)
 
 
+def _keep_forked_child_alive(ready: Any, release: Any) -> None:
+    ready.set()
+    release.wait()
+
+
 class _CountingExecutor(ThreadPoolExecutor):
     def __init__(self) -> None:
         super().__init__(max_workers=1)
@@ -160,6 +165,64 @@ def test_windows_file_lock_retries_without_a_fixed_attempt_limit(
         assert attempts == 21
     finally:
         operation_lock._release_file_lock_sync(handle)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fork semantics are POSIX-only")
+def test_forked_child_does_not_keep_parent_file_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from plugin.server.application.plugins import operation_lock
+
+    lock_path = tmp_path / "fork-operation.lock"
+    monkeypatch.setenv("NEKO_PLUGIN_OPERATION_LOCK_PATH", str(lock_path))
+    parent_handle = operation_lock._acquire_file_lock_sync()
+    context = multiprocessing.get_context("fork")
+    child_ready = context.Event()
+    release_child = context.Event()
+    child = context.Process(
+        target=_keep_forked_child_alive,
+        args=(child_ready, release_child),
+    )
+    child.start()
+
+    contender_finished = threading.Event()
+    contender_handles: list[Any] = []
+    contender_errors: list[BaseException] = []
+
+    def acquire_after_parent_release() -> None:
+        try:
+            contender_handles.append(operation_lock._acquire_file_lock_sync())
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            contender_errors.append(exc)
+        finally:
+            contender_finished.set()
+
+    contender: threading.Thread | None = None
+    acquired_while_child_alive = False
+    try:
+        assert child_ready.wait(5)
+        operation_lock._release_file_lock_sync(parent_handle)
+        parent_handle = None
+        contender = threading.Thread(target=acquire_after_parent_release)
+        contender.start()
+        acquired_while_child_alive = contender_finished.wait(5)
+    finally:
+        release_child.set()
+        child.join(10)
+        if contender is not None:
+            contender.join(10)
+        if parent_handle is not None:
+            operation_lock._release_file_lock_sync(parent_handle)
+        for handle in contender_handles:
+            operation_lock._release_file_lock_sync(handle)
+        if child.is_alive():
+            child.terminate()
+            child.join(10)
+
+    assert acquired_while_child_alive
+    assert not contender_errors
+    assert child.exitcode == 0
 
 
 @pytest.mark.asyncio

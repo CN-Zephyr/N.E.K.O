@@ -85,15 +85,16 @@ def validate_archive_structure(archive: zipfile.ZipFile) -> None:
         original_names[canonical] = info.filename
         (directories if info.is_dir() else files).add(canonical)
 
-    for file_path in files:
-        parts = file_path.split("/")
+    for entry_path in files | directories:
+        parts = entry_path.split("/")
         for index in range(1, len(parts)):
             parent = "/".join(parts[:index])
             if parent in files:
                 raise ValueError(
                     "package archive contains a file/directory path conflict: "
-                    f"{original_names[parent]!r} and {original_names[file_path]!r}"
+                    f"{original_names[parent]!r} and {original_names[entry_path]!r}"
                 )
+    for file_path in files:
         if file_path in directories:
             raise ValueError(
                 "package archive contains a file/directory path conflict at "

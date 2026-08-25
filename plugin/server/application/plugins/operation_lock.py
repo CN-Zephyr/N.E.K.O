@@ -127,6 +127,26 @@ _OPERATION_OWNER: ContextVar[asyncio.Task[Any] | None] = ContextVar(
     default=None,
 )
 _FILE_LOCK_RETRY_INTERVAL_SECONDS = 0.05
+_ACTIVE_FILE_LOCK_HANDLE: Any | None = None
+
+
+def _drop_inherited_file_lock_handle() -> None:
+    """Close a forked child's copy without unlocking the parent's handle."""
+
+    global _ACTIVE_FILE_LOCK_HANDLE
+
+    handle = _ACTIVE_FILE_LOCK_HANDLE
+    _ACTIVE_FILE_LOCK_HANDLE = None
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_inherited_file_lock_handle)
 
 
 def _operation_file_lock_path() -> Path:
@@ -163,6 +183,8 @@ def _acquire_file_lock_sync(
     cancel_event: threading.Event | None = None,
     contention_event: Any | None = None,
 ) -> Any:
+    global _ACTIVE_FILE_LOCK_HANDLE
+
     path = _operation_file_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
@@ -177,6 +199,7 @@ def _acquire_file_lock_sync(
                 raise _FileLockAcquireCancelled
             try:
                 _lock_file_once(handle)
+                _ACTIVE_FILE_LOCK_HANDLE = handle
                 return handle
             except OSError as exc:
                 if not _is_file_lock_contention(exc):
@@ -194,6 +217,10 @@ def _acquire_file_lock_sync(
 
 
 def _release_file_lock_sync(handle: Any) -> None:
+    global _ACTIVE_FILE_LOCK_HANDLE
+
+    if _ACTIVE_FILE_LOCK_HANDLE is handle:
+        _ACTIVE_FILE_LOCK_HANDLE = None
     try:
         handle.seek(0)
         if os.name == "nt":

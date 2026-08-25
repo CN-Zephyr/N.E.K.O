@@ -135,7 +135,31 @@ def test_failed_plugin_import_removes_loaded_children_only(
 
     assert "plugins.myplug" not in sys.modules
     assert "plugins.myplug.helper" not in sys.modules
+    assert not hasattr(sys.modules["plugins"], "myplug")
     assert sys.modules["plugins.unrelated"] is unrelated
+
+
+@pytest.mark.plugin_unit
+def test_manual_plugin_load_binds_child_on_plugins_namespace(
+    _isolate_plugins_namespace, tmp_path: Path
+) -> None:
+    config_path = _make_user_plugin(tmp_path)
+    plugin_dir = config_path.parent
+    (plugin_dir / "helper.py").write_text("VALUE = 'bound'\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "import plugins.myplug.helper\nVALUE = plugins.myplug.helper.VALUE\n",
+        encoding="utf-8",
+    )
+
+    module = host_module._import_current_plugin_from_config(
+        "plugins.myplug",
+        config_path,
+        _StubLogger(),
+    )
+
+    assert module is not None
+    assert module.VALUE == "bound"
+    assert getattr(sys.modules["plugins"], "myplug") is module
 
 
 @pytest.mark.plugin_unit

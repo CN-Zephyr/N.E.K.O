@@ -256,6 +256,27 @@ def _ensure_plugins_namespace(plugin_root: Path, logger: Any) -> None:
         logger.debug("[Plugin Process] Existing 'plugins' module is not a package; path fallback may be required")
 
 
+def _evict_plugin_module_tree(plugin_module_path: str) -> None:
+    """Remove one synthetic plugin package without disturbing its siblings."""
+
+    loaded_module = sys.modules.get(plugin_module_path)
+    module_prefix = f"{plugin_module_path}."
+    for loaded_name in tuple(sys.modules):
+        if loaded_name == plugin_module_path or loaded_name.startswith(module_prefix):
+            sys.modules.pop(loaded_name, None)
+
+    parent_name, _, child_name = plugin_module_path.rpartition(".")
+    parent_module = sys.modules.get(parent_name)
+    if parent_module is None:
+        return
+    bound_child = getattr(parent_module, child_name, None)
+    if bound_child is not None and (
+        bound_child is loaded_module
+        or getattr(bound_child, "__name__", None) == plugin_module_path
+    ):
+        delattr(parent_module, child_name)
+
+
 def _import_current_plugin_from_config(module_path: str, config_path: Path, logger: Any) -> Any | None:
     """在命名空间导入失败时，按当前 plugin.toml 同目录直接加载插件包。"""
 
@@ -297,11 +318,7 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         except (OSError, ValueError):
             pass
     if existing is not None and not existing_matches:
-        for loaded_name in tuple(sys.modules):
-            if loaded_name == plugin_module_path or loaded_name.startswith(
-                f"{plugin_module_path}."
-            ):
-                sys.modules.pop(loaded_name, None)
+        _evict_plugin_module_tree(plugin_module_path)
 
     if plugin_module_path not in sys.modules:
         spec = importlib.util.spec_from_file_location(
@@ -315,15 +332,11 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
 
         module = importlib.util.module_from_spec(spec)
         sys.modules[plugin_module_path] = module
+        setattr(sys.modules["plugins"], parts[1], module)
         try:
             spec.loader.exec_module(module)
         except Exception:
-            failed_module_prefix = f"{plugin_module_path}."
-            for loaded_name in tuple(sys.modules):
-                if loaded_name == plugin_module_path or loaded_name.startswith(
-                    failed_module_prefix
-                ):
-                    sys.modules.pop(loaded_name, None)
+            _evict_plugin_module_tree(plugin_module_path)
             raise
 
     if len(parts) > 2:
