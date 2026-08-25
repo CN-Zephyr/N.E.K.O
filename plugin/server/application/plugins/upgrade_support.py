@@ -16,7 +16,10 @@ from plugin.server.infrastructure.config_paths import ensure_plugin_layout_runti
 
 logger = get_logger("server.application.plugins.upgrade_support")
 
-_MANIFEST_ADJACENT_PROFILE_NAMES = frozenset({"profiles.toml", "profiles"})
+_MANIFEST_ADJACENT_PROFILE_NAMES = {
+    "profiles.toml": "profiles.toml",
+    "profiles": "profiles",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,12 +137,25 @@ def _assert_preserved_tree_has_no_links_or_reparse_points(source: Path) -> None:
             pending.extend(Path(entry.path) for entry in entries)
 
 
-async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path) -> None:
-    for source in await asyncio.to_thread(lambda: list(backup_dir.iterdir())):
-        if source.name.casefold() not in _MANIFEST_ADJACENT_PROFILE_NAMES:
+def _canonical_profile_sources(sources: list[Path]) -> dict[str, Path]:
+    sources_by_name: dict[str, Path] = {}
+    for source in sources:
+        canonical_name = _MANIFEST_ADJACENT_PROFILE_NAMES.get(source.name.casefold())
+        if canonical_name is None:
             continue
+        if canonical_name in sources_by_name:
+            raise OSError(f"multiple legacy profile paths map to {canonical_name}")
+        sources_by_name[canonical_name] = source
+    return sources_by_name
+
+
+async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path) -> None:
+    sources = await asyncio.to_thread(lambda: list(backup_dir.iterdir()))
+    sources_by_name = _canonical_profile_sources(sources)
+
+    for canonical_name, source in sources_by_name.items():
         await asyncio.to_thread(_assert_preserved_tree_has_no_links_or_reparse_points, source)
-        target = target_dir / source.name
+        target = target_dir / canonical_name
         if source.is_dir():
             await merge_directory_contents(source, target)
             continue

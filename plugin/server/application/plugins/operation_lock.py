@@ -128,25 +128,42 @@ _OPERATION_OWNER: ContextVar[asyncio.Task[Any] | None] = ContextVar(
 )
 _FILE_LOCK_RETRY_INTERVAL_SECONDS = 0.05
 _ACTIVE_FILE_LOCK_HANDLE: Any | None = None
+_OPEN_FILE_LOCK_HANDLES: set[Any] = set()
+_FILE_LOCK_HANDLE_GUARD = threading.Lock()
 
 
-def _drop_inherited_file_lock_handle() -> None:
-    """Close a forked child's copy without unlocking the parent's handle."""
+def _prepare_file_lock_handles_for_fork() -> None:
+    _FILE_LOCK_HANDLE_GUARD.acquire()
+
+
+def _release_file_lock_handles_after_fork() -> None:
+    _FILE_LOCK_HANDLE_GUARD.release()
+
+
+def _drop_inherited_file_lock_handles() -> None:
+    """Close a forked child's active and acquisition-phase lock handles."""
 
     global _ACTIVE_FILE_LOCK_HANDLE
 
-    handle = _ACTIVE_FILE_LOCK_HANDLE
+    handles = tuple(_OPEN_FILE_LOCK_HANDLES)
+    _OPEN_FILE_LOCK_HANDLES.clear()
     _ACTIVE_FILE_LOCK_HANDLE = None
-    if handle is None:
-        return
     try:
-        handle.close()
-    except OSError:
-        pass
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+    finally:
+        _FILE_LOCK_HANDLE_GUARD.release()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_drop_inherited_file_lock_handle)
+    os.register_at_fork(
+        before=_prepare_file_lock_handles_for_fork,
+        after_in_parent=_release_file_lock_handles_after_fork,
+        after_in_child=_drop_inherited_file_lock_handles,
+    )
 
 
 def _operation_file_lock_path() -> Path:
@@ -187,7 +204,9 @@ def _acquire_file_lock_sync(
 
     path = _operation_file_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+b")
+    with _FILE_LOCK_HANDLE_GUARD:
+        handle = path.open("a+b")
+        _OPEN_FILE_LOCK_HANDLES.add(handle)
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
@@ -199,7 +218,8 @@ def _acquire_file_lock_sync(
                 raise _FileLockAcquireCancelled
             try:
                 _lock_file_once(handle)
-                _ACTIVE_FILE_LOCK_HANDLE = handle
+                with _FILE_LOCK_HANDLE_GUARD:
+                    _ACTIVE_FILE_LOCK_HANDLE = handle
                 return handle
             except OSError as exc:
                 if not _is_file_lock_contention(exc):
@@ -212,27 +232,33 @@ def _acquire_file_lock_sync(
                 else:
                     threading.Event().wait(_FILE_LOCK_RETRY_INTERVAL_SECONDS)
     except BaseException:
-        handle.close()
+        with _FILE_LOCK_HANDLE_GUARD:
+            handle.close()
+            _OPEN_FILE_LOCK_HANDLES.discard(handle)
+            if _ACTIVE_FILE_LOCK_HANDLE is handle:
+                _ACTIVE_FILE_LOCK_HANDLE = None
         raise
 
 
 def _release_file_lock_sync(handle: Any) -> None:
     global _ACTIVE_FILE_LOCK_HANDLE
 
-    if _ACTIVE_FILE_LOCK_HANDLE is handle:
-        _ACTIVE_FILE_LOCK_HANDLE = None
-    try:
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
+    with _FILE_LOCK_HANDLE_GUARD:
+        if _ACTIVE_FILE_LOCK_HANDLE is handle:
+            _ACTIVE_FILE_LOCK_HANDLE = None
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:  # pragma: no cover - exercised by Linux CI
-            import fcntl
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - exercised by Linux CI
+                import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        handle.close()
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            _OPEN_FILE_LOCK_HANDLES.discard(handle)
 
 
 async def _acquire_file_lock_cancellation_safe() -> Any:

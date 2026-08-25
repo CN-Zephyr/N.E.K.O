@@ -139,6 +139,27 @@ describe('usePluginPackageInstaller', () => {
     expect(discardUploadedPluginPackage).toHaveBeenCalledWith('/packages/demo.neko-plugin')
   })
 
+  it('discards the upload when the plugin domain code is carried by a response header', async () => {
+    vi.mocked(planPluginInstall).mockResolvedValue({
+      ...replacePlan,
+      action: 'install',
+    })
+    vi.mocked(installPluginPackage).mockRejectedValue({
+      response: {
+        status: 409,
+        data: { detail: 'existing profile ownership does not match' },
+        headers: { 'x-error-code': 'PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT' },
+      },
+    })
+    const installer = usePluginPackageInstaller()
+
+    await installer.installPackagePath('/packages/demo.neko-plugin', {
+      discardOnFailure: true,
+    })
+
+    expect(discardUploadedPluginPackage).toHaveBeenCalledWith('/packages/demo.neko-plugin')
+  })
+
   it.each([
     {
       name: 'an incomplete rollback response',

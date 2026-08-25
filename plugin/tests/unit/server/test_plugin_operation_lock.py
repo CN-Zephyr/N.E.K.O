@@ -62,6 +62,31 @@ class _CountingExecutor(ThreadPoolExecutor):
             self.submission_count = 0
 
 
+class _TrackedHandle:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_fork_child_cleanup_closes_active_and_acquisition_phase_handles() -> None:
+    from plugin.server.application.plugins import operation_lock
+
+    active = _TrackedHandle()
+    pending = _TrackedHandle()
+    operation_lock._ACTIVE_FILE_LOCK_HANDLE = active
+    operation_lock._OPEN_FILE_LOCK_HANDLES.update({active, pending})
+
+    operation_lock._prepare_file_lock_handles_for_fork()
+    operation_lock._drop_inherited_file_lock_handles()
+
+    assert active.closed is True
+    assert pending.closed is True
+    assert operation_lock._ACTIVE_FILE_LOCK_HANDLE is None
+    assert operation_lock._OPEN_FILE_LOCK_HANDLES == set()
+
+
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
 async def test_plugin_operation_lock_serializes_tasks_and_allows_reentry() -> None:

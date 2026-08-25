@@ -10,7 +10,10 @@ import {
   type PluginCliInstallPlanResponse,
   type PluginCliInstallResponse,
 } from '@/api/pluginCli'
-import { resolvePluginPackageErrorMessage } from '@/utils/pluginPackageError'
+import {
+  readPluginPackageErrorCode,
+  resolvePluginPackageErrorMessage,
+} from '@/utils/pluginPackageError'
 
 export type InstallPackagePathOptions = {
   pluginsRoot?: string
@@ -31,7 +34,7 @@ function isConfirmedSafeInstallFailure(error: unknown): boolean {
 
   const data = asRecord(response.data)
   const detail = asRecord(data?.detail)
-  const code = data?.code ?? detail?.code
+  const code = readPluginPackageErrorCode(error)
   const details = asRecord(data?.details) ?? asRecord(detail?.details)
   const rollbackStatus = details?.rollback_status
 

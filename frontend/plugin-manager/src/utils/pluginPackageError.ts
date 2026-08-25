@@ -13,6 +13,12 @@ const ERROR_KEYS = {
   PLUGIN_PACKAGE_HASH_MISMATCH: 'package.install.error.hashMismatch',
 } as const
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : null
+}
+
 function readHeader(headers: unknown, name: string): string {
   if (!headers || typeof headers !== 'object') return ''
   const bag = headers as Record<string, unknown> & { get?: (key: string) => unknown }
@@ -22,11 +28,11 @@ function readHeader(headers: unknown, name: string): string {
   return value == null ? '' : String(value)
 }
 
-function readErrorCode(error: unknown): string {
-  const response = (error as any)?.response
-  const data = response?.data
-  const detail = data?.detail
-  if (detail && typeof detail === 'object' && typeof detail.code === 'string') {
+export function readPluginPackageErrorCode(error: unknown): string {
+  const response = asRecord(asRecord(error)?.response)
+  const data = asRecord(response?.data)
+  const detail = asRecord(data?.detail)
+  if (typeof detail?.code === 'string') {
     return detail.code
   }
   if (typeof data?.code === 'string') return data.code
@@ -34,8 +40,10 @@ function readErrorCode(error: unknown): string {
 }
 
 function readRollbackDetails(error: unknown): Record<string, unknown> {
-  const details = (error as any)?.response?.data?.detail?.details
-  return details && typeof details === 'object' ? details : {}
+  const response = asRecord(asRecord(error)?.response)
+  const data = asRecord(response?.data)
+  const detail = asRecord(data?.detail)
+  return asRecord(detail?.details) ?? {}
 }
 
 function legacyErrorKey(error: unknown): string {
@@ -69,7 +77,7 @@ export function resolvePluginPackageErrorMessage(
   t: Translate,
   phase: PluginPackageErrorPhase,
 ): string {
-  const code = readErrorCode(error)
+  const code = readPluginPackageErrorCode(error)
   if (code === 'PLUGIN_UPGRADE_ROLLED_BACK') {
     const details = readRollbackDetails(error)
     if (details.rollback_status !== 'completed') {
