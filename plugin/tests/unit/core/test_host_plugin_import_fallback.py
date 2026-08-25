@@ -163,6 +163,27 @@ def test_manual_plugin_load_binds_child_on_plugins_namespace(
 
 
 @pytest.mark.plugin_unit
+def test_namespace_plugin_loads_without_package_init(
+    _isolate_plugins_namespace, tmp_path: Path
+) -> None:
+    config_path = _make_user_plugin(tmp_path)
+    plugin_dir = config_path.parent
+    (plugin_dir / "__init__.py").unlink()
+    (plugin_dir / "main.py").write_text("VALUE = 'namespace-entry'\n", encoding="utf-8")
+
+    module = host_module._import_current_plugin_from_config(
+        "plugins.myplug.main",
+        config_path,
+        _StubLogger(),
+    )
+
+    assert module is not None
+    assert module.VALUE == "namespace-entry"
+    plugin_package = getattr(sys.modules["plugins"], "myplug")
+    assert str(plugin_dir) in plugin_package.__path__
+
+
+@pytest.mark.plugin_unit
 def test_child_import_only_exposes_selected_plugin(tmp_path: Path) -> None:
     builtin_root = tmp_path / "builtin" / "plugins"
     user_root = tmp_path / "user" / "plugins"

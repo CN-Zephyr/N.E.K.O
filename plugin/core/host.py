@@ -299,9 +299,6 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         return None
 
     source_file = plugin_dir / "__init__.py"
-    if not source_file.is_file():
-        logger.debug("[Plugin Process] Import fallback skipped because missing file: {}", source_file)
-        return None
 
     plugin_root = plugin_dir.parent
     _ensure_plugins_namespace(plugin_root, logger)
@@ -318,23 +315,40 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         except (OSError, ValueError):
             pass
     if existing is not None and not existing_matches:
+        for existing_path in getattr(existing, "__path__", ()):
+            try:
+                if Path(existing_path).resolve() == plugin_dir:
+                    existing_matches = True
+                    break
+            except (OSError, TypeError, ValueError):
+                continue
+    if existing is not None and not existing_matches:
         _evict_plugin_module_tree(plugin_module_path)
 
     if plugin_module_path not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            plugin_module_path,
-            source_file,
-            submodule_search_locations=[str(plugin_dir)],
-        )
-        if spec is None or spec.loader is None:
-            logger.debug("[Plugin Process] Import could not create spec for: {}", source_file)
+        if source_file.is_file():
+            spec = importlib.util.spec_from_file_location(
+                plugin_module_path,
+                source_file,
+                submodule_search_locations=[str(plugin_dir)],
+            )
+        else:
+            spec = importlib.machinery.ModuleSpec(
+                plugin_module_path,
+                loader=None,
+                is_package=True,
+            )
+            spec.submodule_search_locations = [str(plugin_dir)]
+        if spec is None:
+            logger.debug("[Plugin Process] Import could not create spec for: {}", plugin_dir)
             return None
 
         module = importlib.util.module_from_spec(spec)
         sys.modules[plugin_module_path] = module
         setattr(sys.modules["plugins"], parts[1], module)
         try:
-            spec.loader.exec_module(module)
+            if spec.loader is not None:
+                spec.loader.exec_module(module)
         except Exception:
             _evict_plugin_module_tree(plugin_module_path)
             raise

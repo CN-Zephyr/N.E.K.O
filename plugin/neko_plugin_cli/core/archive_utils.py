@@ -71,6 +71,7 @@ def validate_archive_structure(archive: zipfile.ZipFile) -> None:
     files: set[str] = set()
     directories: set[str] = set()
     original_names: dict[str, str] = {}
+    original_directories: dict[str, str] = {}
     for info in infos:
         path = safe_archive_path(info.filename)
         canonical = normalize_archive_key(path.as_posix()).rstrip("/").casefold()
@@ -84,6 +85,19 @@ def validate_archive_structure(archive: zipfile.ZipFile) -> None:
             )
         original_names[canonical] = info.filename
         (directories if info.is_dir() else files).add(canonical)
+
+        directory_depth = len(path.parts) if info.is_dir() else len(path.parts) - 1
+        for depth in range(1, directory_depth + 1):
+            original_directory = "/".join(path.parts[:depth])
+            canonical_directory = normalize_archive_key(original_directory).casefold()
+            previous_directory = original_directories.get(canonical_directory)
+            if previous_directory is not None and previous_directory != original_directory:
+                raise ValueError(
+                    "package archive contains directory paths that are equivalent "
+                    "on common filesystems: "
+                    f"{previous_directory!r} and {original_directory!r}"
+                )
+            original_directories[canonical_directory] = original_directory
 
     for entry_path in files | directories:
         parts = entry_path.split("/")

@@ -334,8 +334,11 @@ def serialized_plugin_operation(
         if _operation_lock_is_held_by_current_task():
             return await function(*args, **kwargs)
 
+        lock_acquired = asyncio.Event()
+
         async def run_locked() -> T:
             async with plugin_operation_lock.hold():
+                lock_acquired.set()
                 return await function(*args, **kwargs)
 
         operation = asyncio.create_task(run_locked())
@@ -345,6 +348,8 @@ def serialized_plugin_operation(
                 result = await asyncio.shield(operation)
             except asyncio.CancelledError:
                 cancelled = True
+                if not lock_acquired.is_set():
+                    operation.cancel()
                 if operation.done():
                     break
             except BaseException:

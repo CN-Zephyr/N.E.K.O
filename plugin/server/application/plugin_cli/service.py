@@ -124,23 +124,29 @@ def _validate_existing_profile_ownership(
     """
 
     manager = get_install_source_manager()
+    if manager is None:
+        raise ServerDomainError(
+            code="INSTALL_SOURCE_NOT_READY",
+            message="install source manager is not initialised",
+            status_code=503,
+            details={"hint": "wait for FastAPI lifespan startup to complete"},
+        )
     owners = []
-    if manager is not None:
-        resolved_profile = profile_dir.resolve(strict=False)
-        for entry in manager.list_entries(include_removed=True):
-            # Only an explicit modern ownership record is proof. ``None`` is
-            # a legacy row whose profile ownership was never recorded.
-            if entry.profile_installed is not True:
-                continue
-            recorded_key = entry.package_id
-            if entry.profile_dir:
-                recorded_profile = Path(entry.profile_dir).expanduser()
-            elif recorded_key:
-                recorded_profile = profiles_root / recorded_key
-            else:
-                continue
-            if recorded_profile.resolve(strict=False) == resolved_profile:
-                owners.append(entry)
+    resolved_profile = profile_dir.resolve(strict=False)
+    for entry in manager.list_entries(include_removed=True):
+        # Only an explicit modern ownership record is proof. ``None`` is
+        # a legacy row whose profile ownership was never recorded.
+        if entry.profile_installed is not True:
+            continue
+        recorded_key = entry.package_id
+        if entry.profile_dir:
+            recorded_profile = Path(entry.profile_dir).expanduser()
+        elif recorded_key:
+            recorded_profile = profiles_root / recorded_key
+        else:
+            continue
+        if recorded_profile.resolve(strict=False) == resolved_profile:
+            owners.append(entry)
 
     ownership_matches = bool(owners) and all(
         owner.plugin_id in plugin_ids and owner.package_id == package_id

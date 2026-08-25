@@ -497,6 +497,24 @@ def test_inspect_package_rejects_case_equivalent_paths(tmp_path: Path) -> None:
         inspect_package(package_path)
 
 
+def test_inspect_package_rejects_case_equivalent_implicit_directories(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _make_plugin_dir(tmp_path)
+    package_path = tmp_path / "implicit-directory-collision.neko-plugin"
+    build_plugin(plugin_dir, package_path)
+    _append_package_members(
+        package_path,
+        [
+            ("payload/plugins/demo_plugin/Config/a.py", b"a"),
+            ("payload/plugins/demo_plugin/config/b.py", b"b"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="directory paths that are equivalent"):
+        inspect_package(package_path)
+
+
 def test_inspect_package_rejects_file_directory_prefix_collision(tmp_path: Path) -> None:
     plugin_dir = _make_plugin_dir(tmp_path)
     package_path = tmp_path / "prefix-collision.neko-plugin"

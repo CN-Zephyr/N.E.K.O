@@ -97,6 +97,43 @@ async def test_plugin_operation_lock_serializes_tasks_and_allows_reentry() -> No
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
+async def test_cancelled_queued_operation_never_runs_after_lock_release() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    mutation_ran = False
+
+    @serialized_plugin_operation
+    async def holder() -> None:
+        entered.set()
+        await release.wait()
+
+    @serialized_plugin_operation
+    async def queued_mutation() -> None:
+        nonlocal mutation_ran
+        mutation_ran = True
+
+    holder_task = asyncio.create_task(holder())
+    await entered.wait()
+    queued_task = asyncio.create_task(queued_mutation())
+    scheduled = asyncio.Event()
+    asyncio.get_running_loop().call_soon(scheduled.set)
+    await scheduled.wait()
+
+    queued_task.cancel()
+    queued_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued_task
+    assert mutation_ran is False
+
+    release.set()
+    await holder_task
+    async with plugin_operation_lock.hold():
+        pass
+    assert mutation_ran is False
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
 async def test_plugin_operation_lock_waits_for_thread_work_after_cancellation() -> None:
     thread_started = threading.Event()
     release_thread = threading.Event()
