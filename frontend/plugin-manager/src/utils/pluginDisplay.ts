@@ -33,12 +33,12 @@ export function resolvePluginDisplayText(plugin: PluginMeta, locale: string): Pl
   }
 }
 
-function normalizeDisplayName(value: string): string {
+function normalizeDisplayName(value: string, locale: string): string {
   return value
     .normalize('NFKC')
     .trim()
     .replace(/\s+/g, ' ')
-    .toLocaleLowerCase()
+    .toLocaleLowerCase(locale)
 }
 
 /**
@@ -55,7 +55,7 @@ export function findDuplicatePluginDisplayNameIds(
   const idsByDisplayName = new Map<string, Set<string>>()
 
   for (const plugin of plugins) {
-    const displayName = normalizeDisplayName(resolvePluginDisplayText(plugin, locale).name)
+    const displayName = normalizeDisplayName(resolvePluginDisplayText(plugin, locale).name, locale)
     const ids = idsByDisplayName.get(displayName) ?? new Set<string>()
     ids.add(plugin.id)
     idsByDisplayName.set(displayName, ids)

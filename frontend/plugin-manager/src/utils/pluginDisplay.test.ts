@@ -142,4 +142,19 @@ describe('findDuplicatePluginDisplayNameIds', () => {
 
     expect(findDuplicatePluginDisplayNameIds([first, second], 'zh-CN')).toEqual(new Set())
   })
+
+  it('uses the active UI locale when normalizing duplicate names', () => {
+    const capitalI = pluginFixture()
+    capitalI.id = 'capital_i'
+    capitalI.i18n = undefined
+    capitalI.name = 'I'
+    const dotlessI = pluginFixture()
+    dotlessI.id = 'dotless_i'
+    dotlessI.i18n = undefined
+    dotlessI.name = 'ı'
+
+    expect(findDuplicatePluginDisplayNameIds([capitalI, dotlessI], 'tr-TR')).toEqual(
+      new Set(['capital_i', 'dotless_i']),
+    )
+  })
 })

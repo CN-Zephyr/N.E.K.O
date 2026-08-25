@@ -8,6 +8,7 @@ from __future__ import annotations
 import multiprocessing
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -109,6 +110,32 @@ def test_import_plugin_module_raises_for_missing_submodule(
     config_path = _make_user_plugin(tmp_path)
     with pytest.raises(ModuleNotFoundError):
         host_module._import_plugin_module("plugins.myplug.missing", config_path, _StubLogger())
+
+
+@pytest.mark.plugin_unit
+def test_failed_plugin_import_removes_loaded_children_only(
+    _isolate_plugins_namespace, tmp_path: Path
+) -> None:
+    config_path = _make_user_plugin(tmp_path)
+    plugin_dir = config_path.parent
+    (plugin_dir / "helper.py").write_text("VALUE = 'stale'\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "from . import helper\nraise RuntimeError('injected import failure')\n",
+        encoding="utf-8",
+    )
+    unrelated = ModuleType("plugins.unrelated")
+    sys.modules["plugins.unrelated"] = unrelated
+
+    with pytest.raises(RuntimeError, match="injected import failure"):
+        host_module._import_current_plugin_from_config(
+            "plugins.myplug",
+            config_path,
+            _StubLogger(),
+        )
+
+    assert "plugins.myplug" not in sys.modules
+    assert "plugins.myplug.helper" not in sys.modules
+    assert sys.modules["plugins.unrelated"] is unrelated
 
 
 @pytest.mark.plugin_unit

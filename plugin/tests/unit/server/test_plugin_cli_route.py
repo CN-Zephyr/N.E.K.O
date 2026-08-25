@@ -4,6 +4,7 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -1148,7 +1149,7 @@ async def test_plugin_cli_upload_and_install_failure_cleans_staging_and_saved_pa
 
 
 @pytest.mark.asyncio
-async def test_fresh_install_reuses_legacy_profile_without_changing_its_bytes(
+async def test_fresh_install_reuses_verified_retained_profile_without_changing_its_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1252,6 +1253,129 @@ async def test_fresh_install_rejects_profile_owned_by_another_plugin(
     assert caught.value.code == "PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT"
     assert not (user_root / incoming_id).exists()
     assert sentinel.read_bytes() == b"belongs-to-another-plugin\n"
+
+
+@pytest.mark.asyncio
+async def test_fresh_install_rejects_legacy_profile_with_unknown_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "legacy_unknown_profile"
+    package_path = tmp_path / "packages" / f"{plugin_id}.neko-plugin"
+    package_path.parent.mkdir()
+    pack_plugin(_make_plugin_dir(tmp_path / "source", plugin_id=plugin_id), package_path)
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user-plugins"
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / plugin_id
+    profile_dir.mkdir(parents=True)
+    sentinel = profile_dir / "default.toml"
+    sentinel.write_bytes(b"legacy-owner-unknown\n")
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=builtin_root,
+        user_root=user_root,
+        packages_root=package_path.parent,
+        profiles_root=profiles_root,
+    )
+
+    lock_path = tmp_path / "plugins.lock.json"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "updated_at": "2026-01-01T00:00:00.000000Z",
+                "entries": [
+                    {
+                        "root_id": "user",
+                        "directory_name": plugin_id,
+                        "plugin_id": plugin_id,
+                        "channel": "imported",
+                        "reason": "user_requested",
+                        "installed_at": "2026-01-01T00:00:00.000000Z",
+                        "updated_at": "2026-01-01T00:00:00.000000Z",
+                        "last_seen_at": "2026-01-01T00:00:00.000000Z",
+                        "removed": True,
+                        "source_detail": None,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = InstallSourceManager(
+        lock_path=lock_path,
+        builtin_root=builtin_root,
+        user_root=user_root,
+        scanner=PluginDirectoryScanner(builtin_root, user_root),
+    )
+    manager.load()
+    set_global_manager(manager)
+    try:
+        with pytest.raises(ServerDomainError) as caught:
+            await PluginCliService().install(package=str(package_path))
+    finally:
+        set_global_manager(None)
+
+    assert caught.value.code == "PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT"
+    assert sentinel.read_bytes() == b"legacy-owner-unknown\n"
+    assert not (user_root / plugin_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_reused_profile_survives_failure_after_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "profile_late_failure"
+    package_path = tmp_path / "packages" / f"{plugin_id}.neko-plugin"
+    package_path.parent.mkdir()
+    pack_plugin(_make_plugin_dir(tmp_path / "source", plugin_id=plugin_id), package_path)
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user-plugins"
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / plugin_id
+    profile_dir.mkdir(parents=True)
+    sentinel = profile_dir / "default.toml"
+    sentinel.write_bytes(b"preserve-after-late-failure\n")
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=builtin_root,
+        user_root=user_root,
+        packages_root=package_path.parent,
+        profiles_root=profiles_root,
+    )
+
+    previous_target = _make_plugin_dir(user_root, plugin_id=plugin_id)
+    manager = InstallSourceManager(
+        lock_path=tmp_path / "plugins.lock.json",
+        builtin_root=builtin_root,
+        user_root=user_root,
+        scanner=PluginDirectoryScanner(builtin_root, user_root),
+    )
+    manager.record_import(
+        directory_path=previous_target,
+        package_filename="previous.neko-plugin",
+        package_sha256="d" * 64,
+        package_id=plugin_id,
+        profile_dir=str(profile_dir),
+    )
+    manager.mark_removed(directory_path=previous_target)
+    shutil.rmtree(previous_target)
+    set_global_manager(manager)
+    monkeypatch.setattr(
+        plugin_cli_service,
+        "InstallResult",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("injected late failure")),
+    )
+    try:
+        with pytest.raises(ServerDomainError, match="injected late failure"):
+            await PluginCliService().install(package=str(package_path))
+    finally:
+        set_global_manager(None)
+
+    assert sentinel.read_bytes() == b"preserve-after-late-failure\n"
+    assert not (user_root / plugin_id).exists()
 
 
 @pytest.mark.asyncio

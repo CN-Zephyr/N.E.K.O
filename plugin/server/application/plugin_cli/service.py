@@ -128,9 +128,11 @@ def _validate_existing_profile_ownership(
     if manager is not None:
         resolved_profile = profile_dir.resolve(strict=False)
         for entry in manager.list_entries(include_removed=True):
-            if entry.profile_installed is False:
+            # Only an explicit modern ownership record is proof. ``None`` is
+            # a legacy row whose profile ownership was never recorded.
+            if entry.profile_installed is not True:
                 continue
-            recorded_key = entry.package_id or entry.plugin_id
+            recorded_key = entry.package_id
             if entry.profile_dir:
                 recorded_profile = Path(entry.profile_dir).expanduser()
             elif recorded_key:
@@ -141,8 +143,7 @@ def _validate_existing_profile_ownership(
                 owners.append(entry)
 
     ownership_matches = bool(owners) and all(
-        owner.plugin_id in plugin_ids
-        and (not owner.package_id or owner.package_id == package_id)
+        owner.plugin_id in plugin_ids and owner.package_id == package_id
         for owner in owners
     )
     if ownership_matches:
@@ -1471,8 +1472,8 @@ class PluginCliService:
                             for item in promoted_plugins
                         },
                     )
-                    # Historical installs can leave a package profile behind
-                    # after executable deletion. Reuse it byte-for-byte. The
+                    # A verified prior install can leave its package profile
+                    # behind after executable deletion. Reuse it byte-for-byte. The
                     # staged defaults are intentionally not merged here, so a
                     # failed fresh install never mutates legacy state.
                     promoted_profile = desired_profile.resolve()
@@ -1504,7 +1505,7 @@ class PluginCliService:
         except Exception:
             for item in promoted_plugins:
                 shutil.rmtree(item.target_dir, ignore_errors=True)
-            if promoted_profile is not None:
+            if promoted_profile is not None and not profile_reused:
                 shutil.rmtree(promoted_profile, ignore_errors=True)
             raise
         finally:

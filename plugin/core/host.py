@@ -318,7 +318,12 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         try:
             spec.loader.exec_module(module)
         except Exception:
-            sys.modules.pop(plugin_module_path, None)
+            failed_module_prefix = f"{plugin_module_path}."
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == plugin_module_path or loaded_name.startswith(
+                    failed_module_prefix
+                ):
+                    sys.modules.pop(loaded_name, None)
             raise
 
     if len(parts) > 2:

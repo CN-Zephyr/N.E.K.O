@@ -37,6 +37,7 @@ export function usePluginPackageInstaller() {
     const pluginsRoot = options.pluginsRoot?.trim() || undefined
     const profilesRoot = options.profilesRoot?.trim() || undefined
     let installRequested = false
+    let installFailureConfirmed = false
     installing.value = true
     installPlan.value = null
     try {
@@ -98,6 +99,9 @@ export function usePluginPackageInstaller() {
       installRequested = true
       return await installPluginPackage(request)
     } catch (error) {
+      installFailureConfirmed = installRequested
+        && typeof (error as { response?: unknown } | null)?.response === 'object'
+        && (error as { response?: unknown }).response !== null
       ElMessage.error(resolvePluginPackageErrorMessage(
         error,
         t,
@@ -105,7 +109,7 @@ export function usePluginPackageInstaller() {
       ))
       return null
     } finally {
-      if (options.discardOnFailure && !installRequested) {
+      if (options.discardOnFailure && (!installRequested || installFailureConfirmed)) {
         try {
           await discardUploadedPluginPackage(packagePath)
         } catch (cleanupError) {

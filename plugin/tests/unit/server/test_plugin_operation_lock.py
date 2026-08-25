@@ -16,6 +16,19 @@ from plugin.server.application.plugins.operation_lock import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operation_file_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Never let unit tests contend with a running user's Core process."""
+
+    monkeypatch.setenv(
+        "NEKO_PLUGIN_OPERATION_LOCK_PATH",
+        str(tmp_path / "operation.lock"),
+    )
+
+
 def _hold_operation_file_lock(lock_path: str, ready: Any, release: Any) -> None:
     os.environ["NEKO_PLUGIN_OPERATION_LOCK_PATH"] = lock_path
     from plugin.server.application.plugins import operation_lock
