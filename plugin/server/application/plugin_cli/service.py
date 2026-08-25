@@ -108,6 +108,60 @@ def _is_link_or_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(file_attributes & reparse_attribute)
 
 
+def _validate_existing_profile_ownership(
+    *,
+    profile_dir: Path,
+    profiles_root: Path,
+    package_id: str,
+    plugin_ids: set[str],
+) -> None:
+    """Fail closed unless install-source history owns an existing profile.
+
+    A profile directory name is selected by the package manifest and is not
+    proof that the directory belongs to the incoming package. Removed entries
+    remain in the source ledger, so a legitimate reinstall can reuse its
+    retained profile without letting an unrelated package claim orphaned state.
+    """
+
+    manager = get_install_source_manager()
+    owners = []
+    if manager is not None:
+        resolved_profile = profile_dir.resolve(strict=False)
+        for entry in manager.list_entries(include_removed=True):
+            if entry.profile_installed is False:
+                continue
+            recorded_key = entry.package_id or entry.plugin_id
+            if entry.profile_dir:
+                recorded_profile = Path(entry.profile_dir).expanduser()
+            elif recorded_key:
+                recorded_profile = profiles_root / recorded_key
+            else:
+                continue
+            if recorded_profile.resolve(strict=False) == resolved_profile:
+                owners.append(entry)
+
+    ownership_matches = bool(owners) and all(
+        owner.plugin_id in plugin_ids
+        and (not owner.package_id or owner.package_id == package_id)
+        for owner in owners
+    )
+    if ownership_matches:
+        return
+
+    raise ServerDomainError(
+        code="PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT",
+        message="existing package profile ownership does not match the incoming package",
+        status_code=409,
+        details={
+            "package_id": package_id,
+            "plugin_ids": sorted(plugin_ids),
+            "recorded_plugin_ids": sorted(
+                {owner.plugin_id for owner in owners if owner.plugin_id}
+            ),
+        },
+    )
+
+
 def _classify_package_error(exc: Exception) -> str | None:
     if isinstance(exc, ServerDomainError) and exc.code.startswith("PLUGIN_PACKAGE_"):
         return exc.code
@@ -1408,6 +1462,15 @@ class PluginCliService:
                             "existing package profile path is not a directory: "
                             f"{desired_profile.name}"
                         )
+                    _validate_existing_profile_ownership(
+                        profile_dir=desired_profile,
+                        profiles_root=profiles_root,
+                        package_id=staged.package_id,
+                        plugin_ids={
+                            self._read_installed_plugin_toml_id(Path(item.target_dir))
+                            for item in promoted_plugins
+                        },
+                    )
                     # Historical installs can leave a package profile behind
                     # after executable deletion. Reuse it byte-for-byte. The
                     # staged defaults are intentionally not merged here, so a

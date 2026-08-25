@@ -1171,13 +1171,87 @@ async def test_fresh_install_reuses_legacy_profile_without_changing_its_bytes(
         packages_root=packages_root,
         profiles_root=profiles_root,
     )
-
-    result = await PluginCliService().install(package=str(package_path))
+    previous_target = _make_plugin_dir(user_root, plugin_id=plugin_id)
+    manager = InstallSourceManager(
+        lock_path=tmp_path / "plugins.lock.json",
+        builtin_root=tmp_path / "builtin",
+        user_root=user_root,
+        scanner=PluginDirectoryScanner(tmp_path / "builtin", user_root),
+    )
+    manager.record_import(
+        directory_path=previous_target,
+        package_filename="legacy.neko-plugin",
+        package_sha256="a" * 64,
+        package_id=plugin_id,
+        profile_dir=str(profile_dir),
+    )
+    manager.mark_removed(directory_path=previous_target)
+    shutil.rmtree(previous_target)
+    set_global_manager(manager)
+    try:
+        result = await PluginCliService().install(package=str(package_path))
+    finally:
+        set_global_manager(None)
 
     assert result["installed_plugin_count"] == 1
     assert result["profile_reused"] is True
     assert (user_root / plugin_id / "plugin.toml").is_file()
     assert {path.name: path.read_bytes() for path in profile_dir.iterdir()} == before
+
+
+@pytest.mark.asyncio
+async def test_fresh_install_rejects_profile_owned_by_another_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    incoming_id = "profile_collision"
+    package_path = tmp_path / "packages" / f"{incoming_id}.neko-plugin"
+    package_path.parent.mkdir()
+    pack_plugin(_make_plugin_dir(tmp_path / "source", plugin_id=incoming_id), package_path)
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user-plugins"
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / incoming_id
+    profile_dir.mkdir(parents=True)
+    sentinel = profile_dir / "default.toml"
+    sentinel.write_bytes(b"belongs-to-another-plugin\n")
+    _patch_plugin_cli_settings(
+        monkeypatch,
+        builtin_root=builtin_root,
+        user_root=user_root,
+        packages_root=package_path.parent,
+        profiles_root=profiles_root,
+    )
+
+    previous_target = _make_plugin_dir(user_root, plugin_id="another_plugin")
+    manager = InstallSourceManager(
+        lock_path=tmp_path / "plugins.lock.json",
+        builtin_root=builtin_root,
+        user_root=user_root,
+        scanner=PluginDirectoryScanner(builtin_root, user_root),
+    )
+    manager.record_import(
+        directory_path=previous_target,
+        package_filename="another.neko-plugin",
+        package_sha256="b" * 64,
+        package_id=incoming_id,
+        profile_dir=str(profile_dir),
+    )
+    manager.mark_removed(directory_path=previous_target)
+    shutil.rmtree(previous_target)
+    set_global_manager(manager)
+    try:
+        with pytest.raises(
+            ServerDomainError,
+            match="profile ownership does not match",
+        ) as caught:
+            await PluginCliService().install(package=str(package_path))
+    finally:
+        set_global_manager(None)
+
+    assert caught.value.code == "PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT"
+    assert not (user_root / incoming_id).exists()
+    assert sentinel.read_bytes() == b"belongs-to-another-plugin\n"
 
 
 @pytest.mark.asyncio
@@ -1252,6 +1326,22 @@ async def test_market_record_failure_removes_new_code_but_preserves_reused_profi
         packages_root=packages_root,
         profiles_root=profiles_root,
     )
+    previous_target = _make_plugin_dir(user_root, plugin_id=plugin_id)
+    owner_manager = InstallSourceManager(
+        lock_path=tmp_path / "plugins.lock.json",
+        builtin_root=tmp_path / "builtin",
+        user_root=user_root,
+        scanner=PluginDirectoryScanner(tmp_path / "builtin", user_root),
+    )
+    owner_manager.record_import(
+        directory_path=previous_target,
+        package_filename="legacy.neko-plugin",
+        package_sha256="c" * 64,
+        package_id=plugin_id,
+        profile_dir=str(profile_dir),
+    )
+    owner_manager.mark_removed(directory_path=previous_target)
+    shutil.rmtree(previous_target)
 
     class _FailingManager:
         def record_market_install(self, **_kwargs: object) -> None:
@@ -1263,21 +1353,25 @@ async def test_market_record_failure_removes_new_code_but_preserves_reused_profi
     failing_manager.user_root = user_root
     monkeypatch.setattr(service, "_require_install_source_manager", lambda: failing_manager)
 
-    with pytest.raises(InstallSourceError, match="lock_write_failed"):
-        await service.upload_and_install(
-            filename=package_path.name,
-            package_path=str(package_path),
-            install_source_override={
-                "channel": "market",
-                "mode": "install",
-                "market_detail": {
-                    "plugin_market_id": plugin_id,
-                    "version": "0.0.1",
-                    "package_url": "https://example.invalid/demo.neko-plugin",
-                    "expected_plugin_toml_id": plugin_id,
+    set_global_manager(owner_manager)
+    try:
+        with pytest.raises(InstallSourceError, match="lock_write_failed"):
+            await service.upload_and_install(
+                filename=package_path.name,
+                package_path=str(package_path),
+                install_source_override={
+                    "channel": "market",
+                    "mode": "install",
+                    "market_detail": {
+                        "plugin_market_id": plugin_id,
+                        "version": "0.0.1",
+                        "package_url": "https://example.invalid/demo.neko-plugin",
+                        "expected_plugin_toml_id": plugin_id,
+                    },
                 },
-            },
-        )
+            )
+    finally:
+        set_global_manager(None)
 
     assert not (user_root / plugin_id).exists()
     assert preserved.read_bytes() == b"do-not-delete\n"
