@@ -127,6 +127,7 @@ def test_init_custom_output_generates_runnable_vscode_check_task(
         check=False,
         capture_output=True,
         text=True,
+        timeout=120,
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr

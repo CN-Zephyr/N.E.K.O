@@ -241,7 +241,7 @@ def _ensure_plugins_namespace(plugin_root: Path, logger: Any) -> None:
     """Create a namespace without exposing sibling installations."""
 
     existing = sys.modules.get("plugins")
-    if existing is None:
+    if existing is None or getattr(existing, "__path__", None) is None:
         module = types.ModuleType("plugins")
         module.__package__ = "plugins"
         module.__path__ = []
@@ -252,8 +252,13 @@ def _ensure_plugins_namespace(plugin_root: Path, logger: Any) -> None:
         logger.info("[Plugin Process] Created plugins namespace for: {}", plugin_root)
         return
 
-    if getattr(existing, "__path__", None) is None:
-        logger.debug("[Plugin Process] Existing 'plugins' module is not a package; path fallback may be required")
+    existing.__path__ = []
+    spec = getattr(existing, "__spec__", None)
+    if spec is None:
+        spec = importlib.machinery.ModuleSpec("plugins", loader=None, is_package=True)
+        existing.__spec__ = spec
+    spec.submodule_search_locations = existing.__path__
+    logger.debug("[Plugin Process] Cleared inherited plugins namespace search paths")
 
 
 def _evict_plugin_module_tree(plugin_module_path: str) -> None:

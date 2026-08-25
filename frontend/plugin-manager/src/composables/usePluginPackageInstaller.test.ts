@@ -139,6 +139,68 @@ describe('usePluginPackageInstaller', () => {
     expect(discardUploadedPluginPackage).toHaveBeenCalledWith('/packages/demo.neko-plugin')
   })
 
+  it.each([
+    {
+      name: 'an incomplete rollback response',
+      error: {
+        response: {
+          status: 409,
+          data: {
+            code: 'PLUGIN_UPGRADE_ROLLED_BACK',
+            details: { rollback_status: 'incomplete' },
+          },
+        },
+      },
+    },
+    {
+      name: 'an unknown server error',
+      error: {
+        response: {
+          status: 500,
+          data: { code: 'INTERNAL_SERVER_ERROR' },
+        },
+      },
+    },
+  ])('keeps the upload after $name', async ({ error }) => {
+    vi.mocked(planPluginInstall).mockResolvedValue({
+      ...replacePlan,
+      action: 'install',
+    })
+    vi.mocked(installPluginPackage).mockRejectedValue(error)
+    const installer = usePluginPackageInstaller()
+
+    const response = await installer.installPackagePath('/packages/demo.neko-plugin', {
+      discardOnFailure: true,
+    })
+
+    expect(response).toBeNull()
+    expect(discardUploadedPluginPackage).not.toHaveBeenCalled()
+  })
+
+  it('discards the upload after a completed rollback response', async () => {
+    vi.mocked(planPluginInstall).mockResolvedValue({
+      ...replacePlan,
+      action: 'upgrade',
+    })
+    vi.mocked(ElMessageBox.confirm).mockResolvedValue({ action: 'confirm', value: '' } as any)
+    vi.mocked(installPluginPackage).mockRejectedValue({
+      response: {
+        status: 409,
+        data: {
+          code: 'PLUGIN_UPGRADE_ROLLED_BACK',
+          details: { rollback_status: 'completed' },
+        },
+      },
+    })
+    const installer = usePluginPackageInstaller()
+
+    await installer.installPackagePath('/packages/demo.neko-plugin', {
+      discardOnFailure: true,
+    })
+
+    expect(discardUploadedPluginPackage).toHaveBeenCalledWith('/packages/demo.neko-plugin')
+  })
+
   it('plans and confirms an uploaded package path before replacing an installed plugin', async () => {
     vi.mocked(planPluginInstall).mockResolvedValue(replacePlan)
     vi.mocked(ElMessageBox.confirm).mockResolvedValue({ action: 'confirm', value: '' } as any)

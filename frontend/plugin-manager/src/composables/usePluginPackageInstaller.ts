@@ -19,6 +19,32 @@ export type InstallPackagePathOptions = {
   discardOnFailure?: boolean
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : null
+}
+
+function isConfirmedSafeInstallFailure(error: unknown): boolean {
+  const response = asRecord(asRecord(error)?.response)
+  if (!response) return false
+
+  const data = asRecord(response.data)
+  const detail = asRecord(data?.detail)
+  const code = data?.code ?? detail?.code
+  const details = asRecord(data?.details) ?? asRecord(detail?.details)
+  const rollbackStatus = details?.rollback_status
+
+  if (code === 'PLUGIN_UPGRADE_ROLLED_BACK') {
+    return rollbackStatus === 'completed'
+  }
+  if (rollbackStatus === 'incomplete') return false
+  if (rollbackStatus === 'completed') return true
+
+  const status = response.status
+  return typeof status === 'number' && status >= 400 && status < 500
+}
+
 export function usePluginPackageInstaller() {
   const { t } = useI18n()
   const installing = ref(false)
@@ -99,9 +125,7 @@ export function usePluginPackageInstaller() {
       installRequested = true
       return await installPluginPackage(request)
     } catch (error) {
-      installFailureConfirmed = installRequested
-        && typeof (error as { response?: unknown } | null)?.response === 'object'
-        && (error as { response?: unknown }).response !== null
+      installFailureConfirmed = installRequested && isConfirmedSafeInstallFailure(error)
       ElMessage.error(resolvePluginPackageErrorMessage(
         error,
         t,

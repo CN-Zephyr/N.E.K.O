@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.machinery
 import multiprocessing
 import sys
 from pathlib import Path
@@ -181,6 +183,32 @@ def test_namespace_plugin_loads_without_package_init(
     assert module.VALUE == "namespace-entry"
     plugin_package = getattr(sys.modules["plugins"], "myplug")
     assert str(plugin_dir) in plugin_package.__path__
+
+
+@pytest.mark.plugin_unit
+def test_existing_plugins_namespace_cannot_import_unselected_sibling(
+    _isolate_plugins_namespace, tmp_path: Path
+) -> None:
+    stale_root = tmp_path / "stale-root"
+    sibling_dir = stale_root / "unselected"
+    sibling_dir.mkdir(parents=True)
+    (sibling_dir / "__init__.py").write_text("LOADED = True\n", encoding="utf-8")
+    namespace = ModuleType("plugins")
+    namespace.__path__ = [str(stale_root)]
+    namespace.__spec__ = importlib.machinery.ModuleSpec(
+        "plugins",
+        loader=None,
+        is_package=True,
+    )
+    namespace.__spec__.submodule_search_locations = namespace.__path__
+    sys.modules["plugins"] = namespace
+
+    host_module._ensure_plugins_namespace(tmp_path / "selected-root", _StubLogger())
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("plugins.unselected")
+    assert namespace.__path__ == []
+    assert namespace.__spec__.submodule_search_locations == []
 
 
 @pytest.mark.plugin_unit
