@@ -460,6 +460,49 @@ async def test_replacement_paths_join_one_retired_gemini_context_exit() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_ordinary_close_keeps_completed_gemini_context_exit_owned() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    retired_exit_finished = asyncio.Event()
+
+    async def finish_retired_exit(*_args) -> None:
+        retired_exit_finished.set()
+
+    retired_context = SimpleNamespace(
+        __aexit__=AsyncMock(side_effect=finish_retired_exit)
+    )
+    retired_session = object()
+    client._gemini_context_manager = retired_context
+    client._gemini_session = retired_session
+    client.ws = retired_session
+    retired_generation = client._connection_generation
+
+    close_impl = client._detach_for_close()
+    await asyncio.wait_for(retired_exit_finished.wait(), timeout=1)
+
+    replacement_context = SimpleNamespace(__aexit__=AsyncMock())
+    replacement_session = object()
+    client._gemini_context_manager = replacement_context
+    client._gemini_session = replacement_session
+    client.ws = replacement_session
+    client._on_connection_attached()
+    assert client._connection_generation != retired_generation
+
+    await asyncio.wait_for(close_impl, timeout=1)
+
+    retired_context.__aexit__.assert_awaited_once_with(None, None, None)
+    replacement_context.__aexit__.assert_not_awaited()
+    assert client._gemini_context_manager is replacement_context
+    assert client._gemini_session is replacement_session
+    assert client.ws is replacement_session
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_tool_task_failure_logs_identity_without_exception_payload(
     monkeypatch,
 ) -> None:
@@ -967,6 +1010,71 @@ async def test_no_vad_response_done_rotation_keeps_legal_raw_tool_result() -> No
     await client._response_arbiter.wait_until_idle(timeout=1)
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_tool_after_message_rotation_keeps_current_owner(
+    monkeypatch,
+) -> None:
+    import main_logic.omni_realtime_client._gemini_support as gemini_support
+
+    monkeypatch.setattr(
+        gemini_support,
+        "types",
+        SimpleNamespace(FunctionResponse=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    host_turn = ["turn-1"]
+
+    async def rotate_host_turn() -> None:
+        host_turn[0] = "turn-2"
+
+    async def handler(call):
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        get_host_turn_id=lambda: host_turn[0],
+        on_new_message=rotate_host_turn,
+        on_tool_call=handler,
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+    generation = client._connection_generation
+    server_content = SimpleNamespace(
+        input_transcription=None,
+        output_transcription=None,
+        model_turn=SimpleNamespace(parts=[]),
+        interrupted=False,
+        turn_complete=False,
+    )
+
+    await client._process_gemini_response(
+        SimpleNamespace(
+            tool_call=None,
+            tool_call_cancellation=None,
+            voice_activity_detection_signal=None,
+            server_content=server_content,
+        ),
+        provider_session=session,
+        connection_generation=generation,
+    )
+    assert client._current_turn_host_id == "turn-2"
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-1", "lookup"),)),
+        provider_session=session,
+        connection_generation=generation,
+    )
+    await _wait_for_tool_tasks(client)
+
+    assert len(session.tool_responses) == 1
+    assert [response.id for response in session.tool_responses[0]] == ["call-1"]
 
 
 @pytest.mark.unit
@@ -1773,6 +1881,72 @@ async def test_close_cancels_and_awaits_raw_tool_tasks() -> None:
     assert socket.closed is True
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_replacement_reset_retires_predecessor_arbiter_owner() -> None:
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+    )
+    retired = _QueueSocket()
+    client.ws = retired
+    client._on_connection_attached()
+    arbiter = client._response_arbiter
+    retired_ticket = await arbiter.enqueue(source="retired-turn")
+    await _wait_for_socket_sends(retired, 1)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "retired-response"}}
+    )
+    await asyncio.wait_for(asyncio.shield(retired_ticket.sent), timeout=1)
+
+    tool_started = asyncio.Event()
+    tool_cancelled = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def cancellation_resistant_tool() -> None:
+        tool_started.set()
+        while not release_tool.is_set():
+            try:
+                await release_tool.wait()
+            except asyncio.CancelledError:
+                tool_cancelled.set()
+
+    tool_task = client._create_tool_task(cancellation_resistant_tool())
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+    closing = asyncio.create_task(client.close())
+    await asyncio.wait_for(tool_cancelled.wait(), timeout=1)
+
+    replacement = _QueueSocket()
+    client.ws = replacement
+    client._on_connection_attached()
+    arbiter.reset_connection_state()
+    assert arbiter.current_source is None
+    assert arbiter._response_owner is None
+    with pytest.raises(ConnectionError, match="replaced"):
+        await retired_ticket.done
+
+    replacement_ticket = await arbiter.enqueue(source="replacement-turn")
+    await _wait_for_socket_sends(replacement, 1)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "replacement-response"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "replacement-response", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(asyncio.shield(replacement_ticket.done), timeout=1)
+
+    release_tool.set()
+    await asyncio.wait_for(closing, timeout=1)
+    await asyncio.wait_for(asyncio.gather(tool_task), timeout=1)
+    assert retired.closed is True
+    assert replacement.closed is False
 
 
 @pytest.mark.unit

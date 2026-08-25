@@ -1422,6 +1422,9 @@ class RealtimeResponseArbiter:
         # Defensive: a cancel send spawned against a previous connection must
         # never fire into the replacement one.
         self._cancel_pending_cancel_sends()
+        retired_worker = self._retire_connection_owners(
+            "realtime connection replaced"
+        )
         self._connection_available = True
         self._dispatch_allowed.set()
         self._server_response_ids.clear()
@@ -1437,10 +1440,53 @@ class RealtimeResponseArbiter:
         self._server_vad_response_pending = False
         self._cancel_server_vad_pending_timer()
         self._cancel_stale_release_timer()
-        if self._current is None and self._response_owner is None:
-            self._server_response_active = False
-            self._idle.set()
-        self._ensure_worker()
+        self._server_response_active = False
+        self._idle.set()
+        if retired_worker is None:
+            self._ensure_worker()
+        else:
+            self._worker = asyncio.create_task(
+                self._restart_after_retired_worker(retired_worker),
+                name="realtime-response-arbiter",
+            )
+
+    def _retire_connection_owners(self, reason: str) -> asyncio.Task[None] | None:
+        """Fail only the active predecessor work before reopening a connection."""
+
+        owner = self._response_owner
+        current = self._current
+        if owner is None and current is None:
+            return None
+        exc = ConnectionError(reason)
+        seen: set[int] = set()
+        for target in (owner, current):
+            if target is None or id(target) in seen:
+                continue
+            seen.add(id(target))
+            target.interrupted = True
+            target.interrupt_event.set()
+            self._wake_current_with_error(target, exc)
+            if target.terminal is not None and not target.terminal.done():
+                target.terminal.set_exception(exc)
+            self._fail_ticket(target.ticket, exc)
+        if owner is not None:
+            self._detach_response_owner(owner)
+        if self._current is current:
+            self._current = None
+
+        worker, self._worker = self._worker, None
+        if worker is None or worker.done():
+            return None
+        worker.cancel()
+        return worker
+
+    async def _restart_after_retired_worker(
+        self,
+        retired_worker: asyncio.Task[None],
+    ) -> None:
+        await asyncio.gather(retired_worker, return_exceptions=True)
+        if self._connection_available:
+            await self._run()
 
     @staticmethod
     def _fail_ticket(ticket: ResponseTicket, exc: Exception) -> None:

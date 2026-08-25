@@ -751,6 +751,11 @@ class _GeminiMixin:
                             await self.on_new_message()
                             if not event_owner_is_current():
                                 return
+                            # Core rotates the host speech id while opening the
+                            # new message. Gemini tool calls can arrive in a
+                            # later standalone event for this same provider
+                            # turn, so keep their ownership snapshot aligned.
+                            self._current_turn_host_id = self._read_host_turn_id()
                     else:
                         logger.debug(
                             "Gemini: late content after premature turn_complete/interruption (%.2fs ago), treating as continuation",

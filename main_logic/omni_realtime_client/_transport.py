@@ -2700,6 +2700,19 @@ class _TransportMixin:
         gemini_context = self._gemini_context_manager
         gemini_close_task = self._gemini_close_task
         tool_tasks = self._advance_tool_scope()
+        if (
+            self._is_gemini
+            and gemini_context is not None
+            and gemini_close_task is None
+        ):
+            gemini_close_task = asyncio.create_task(
+                self._close_gemini_context(
+                    gemini_context,
+                    self._gemini_session,
+                    tool_tasks,
+                ),
+                name="realtime-retired-gemini-context-close",
+            )
         return self._close_impl(
             generation,
             ws,
@@ -2780,7 +2793,10 @@ class _TransportMixin:
 
         # Gemini uses different cleanup
         if self._is_gemini:
-            await self._close_gemini()
+            if gemini_close_task is not None:
+                await asyncio.shield(gemini_close_task)
+            else:
+                await self._close_gemini()
             return
 
         await self._release_retired_connection(ws, gemini_context, gemini_close_task)
