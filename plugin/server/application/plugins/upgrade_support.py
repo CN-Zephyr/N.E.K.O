@@ -16,9 +16,7 @@ from plugin.server.infrastructure.config_paths import ensure_plugin_layout_runti
 
 logger = get_logger("server.application.plugins.upgrade_support")
 
-_MANIFEST_ADJACENT_STATE_NAMES = frozenset(
-    {"profiles.toml", "profiles", "config", "data", "cache"}
-)
+_MANIFEST_ADJACENT_PROFILE_NAMES = frozenset({"profiles.toml", "profiles"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +134,9 @@ def _assert_preserved_tree_has_no_links_or_reparse_points(source: Path) -> None:
             pending.extend(Path(entry.path) for entry in entries)
 
 
-async def _restore_manifest_adjacent_state(backup_dir: Path, target_dir: Path) -> None:
+async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path) -> None:
     for source in await asyncio.to_thread(lambda: list(backup_dir.iterdir())):
-        if source.name.casefold() not in _MANIFEST_ADJACENT_STATE_NAMES:
+        if source.name.casefold() not in _MANIFEST_ADJACENT_PROFILE_NAMES:
             continue
         await asyncio.to_thread(_assert_preserved_tree_has_no_links_or_reparse_points, source)
         target = target_dir / source.name
@@ -312,7 +310,7 @@ async def replace_plugin(
             backup = backups.get(target)
             if backup is not None:
                 await merge_directory_contents(backup, target)
-        await _restore_manifest_adjacent_state(backup_dir, target_dir)
+        await _restore_manifest_adjacent_profiles(backup_dir, target_dir)
         if was_running:
             stage = "restart"
             await start(plugin_id)

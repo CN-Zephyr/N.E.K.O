@@ -42,7 +42,13 @@ function isConfirmedSafeInstallFailure(error: unknown): boolean {
   if (rollbackStatus === 'completed') return true
 
   const status = response.status
-  return typeof status === 'number' && status >= 400 && status < 500
+  const isDomainFailure = typeof code === 'string' && code.startsWith('PLUGIN_')
+  const isAmbiguousTimeout = status === 408 || status === 425 || status === 429
+  return isDomainFailure
+    && typeof status === 'number'
+    && status >= 400
+    && status < 500
+    && !isAmbiguousTimeout
 }
 
 export function usePluginPackageInstaller() {

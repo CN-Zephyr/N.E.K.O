@@ -161,6 +161,24 @@ describe('usePluginPackageInstaller', () => {
         },
       },
     },
+    {
+      name: 'an ambiguous proxy timeout',
+      error: {
+        response: {
+          status: 408,
+          data: { code: 'PLUGIN_INSTALL_TIMEOUT' },
+        },
+      },
+    },
+    {
+      name: 'a 4xx response without a plugin domain code',
+      error: {
+        response: {
+          status: 409,
+          data: { code: 'PROXY_CONFLICT' },
+        },
+      },
+    },
   ])('keeps the upload after $name', async ({ error }) => {
     vi.mocked(planPluginInstall).mockResolvedValue({
       ...replacePlan,

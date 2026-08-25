@@ -869,7 +869,7 @@ async def test_plugin_cli_route_upgrades_in_place_after_confirmation(
             "cache/user.cache": b"user-cache",
         }
         for relative_path, payload in preserved_state.items():
-            state_path = user_root / plugin_id / relative_path
+            state_path = tmp_path / "runtime_data" / "plugins" / plugin_id / relative_path
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_bytes(payload)
 
@@ -895,7 +895,9 @@ async def test_plugin_cli_route_upgrades_in_place_after_confirmation(
     installed_manifest = (user_root / plugin_id / "plugin.toml").read_text(encoding="utf-8")
     assert 'version = "2.0.0"' in installed_manifest
     for relative_path, payload in preserved_state.items():
-        assert (user_root / plugin_id / relative_path).read_bytes() == payload
+        assert (
+            tmp_path / "runtime_data" / "plugins" / plugin_id / relative_path
+        ).read_bytes() == payload
     assert not (user_root / f"{plugin_id}_1").exists()
 
 

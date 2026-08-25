@@ -311,12 +311,23 @@ async def test_service_replaces_with_new_same_or_old_version_without_touching_us
     expected_operation: str,
 ) -> None:
     source = _write_plugin(tmp_path / "source", "demo", target_version)
+    (source / "data").mkdir()
+    (source / "data" / "resource.json").write_text("new-package-resource\n", encoding="utf-8")
     packages_root = tmp_path / "packages"
     packages_root.mkdir()
     package_path = packages_root / f"demo-{target_version}.neko-plugin"
     build_plugin(source, package_path)
     plugins_root = tmp_path / "plugins"
-    _write_plugin(plugins_root, "demo", "1.0.0")
+    installed_plugin = _write_plugin(plugins_root, "demo", "1.0.0")
+    (installed_plugin / "data").mkdir()
+    (installed_plugin / "data" / "resource.json").write_text(
+        "old-package-resource\n",
+        encoding="utf-8",
+    )
+    (installed_plugin / "data" / "removed.json").write_text(
+        "removed-package-resource\n",
+        encoding="utf-8",
+    )
     profiles_root = tmp_path / "profiles"
     storage_root = tmp_path / "state"
     monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(storage_root))
@@ -351,6 +362,10 @@ async def test_service_replaces_with_new_same_or_old_version_without_touching_us
     assert result["operation"] == expected_operation
     installed_manifest = (plugins_root / "demo" / "plugin.toml").read_text(encoding="utf-8")
     assert f'version = "{target_version}"' in installed_manifest
+    assert (plugins_root / "demo" / "data" / "resource.json").read_text(
+        encoding="utf-8"
+    ) == "new-package-resource\n"
+    assert not (plugins_root / "demo" / "data" / "removed.json").exists()
     for path, content in expected_state.items():
         assert path.read_text(encoding="utf-8") == content
 
