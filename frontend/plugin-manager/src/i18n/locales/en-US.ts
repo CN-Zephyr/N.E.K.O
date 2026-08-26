@@ -276,6 +276,22 @@ export default {
     hideMetrics: 'Hide Metrics',
     showSourceDetail: 'Show Source Details',
     hideSourceDetail: 'Hide Source Details',
+    candidates: {
+      title: 'Installed versions',
+      hint: 'Only one version runs at a time. Switching a running plugin restarts it safely.',
+      running: 'Running',
+      current: 'Selected',
+      invalid: 'Unavailable',
+      switch: 'Use this version',
+      none: 'No installed versions found',
+      loadFailed: 'Failed to load installed versions',
+      switchSuccess: 'Plugin version switched',
+      switchFailed: 'Could not switch plugin version; the previous version was kept',
+      dataAccessRequired: 'Existing data access',
+      dataAccessTitle: 'Allow access to existing plugin data?',
+      dataAccessPrompt: 'This {source} version will be able to read and change this plugin\'s existing configuration, data, cache, and saved credentials.',
+      dataAccessConfirm: 'Allow and switch',
+    },
     installSource: {
       channel: {
         builtin: 'Built-in',

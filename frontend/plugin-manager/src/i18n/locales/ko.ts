@@ -276,6 +276,22 @@ export default {
     hideMetrics: '성능 지표 숨기기',
     showSourceDetail: '출처 상세 표시',
     hideSourceDetail: '출처 상세 숨기기',
+    candidates: {
+      title: '설치된 버전',
+      hint: '한 번에 하나의 버전만 실행됩니다. 실행 중 전환하면 안전하게 다시 시작합니다.',
+      running: '실행 중',
+      current: '선택됨',
+      invalid: '사용 불가',
+      switch: '이 버전 사용',
+      none: '설치된 버전이 없습니다',
+      loadFailed: '설치된 버전을 불러오지 못했습니다',
+      switchSuccess: '플러그인 버전을 전환했습니다',
+      switchFailed: '전환하지 못해 이전 버전을 유지했습니다',
+      dataAccessRequired: '기존 데이터 접근',
+      dataAccessTitle: '기존 플러그인 데이터 접근을 허용할까요?',
+      dataAccessPrompt: '이 {source} 버전은 기존 설정, 데이터, 캐시 및 저장된 자격 증명을 읽고 변경할 수 있습니다.',
+      dataAccessConfirm: '허용하고 전환',
+    },
     installSource: {
       channel: {
         builtin: '내장',

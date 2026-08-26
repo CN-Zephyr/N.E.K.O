@@ -42,6 +42,7 @@ from plugin.server.application.plugin_cli.source_resolver import (
     PluginSourceResolver,
     ResolvedPluginSource,
 )
+from plugin.server.domain.plugin_candidates import CandidateKey
 from plugin.server.domain.errors import ServerDomainError
 from plugin.settings import (
     BUILTIN_PLUGIN_CONFIG_ROOT,
@@ -739,12 +740,20 @@ class PluginCliService:
                     package_id=str(unpack_result.get("package_id") or ""),
                     profile_dir=str(unpack_result.get("profile_dir") or ""),
                 )
-                return self._compose_install_result(
+                response = self._compose_install_result(
                     saved=saved,
                     unpack_result=unpack_result,
                     install_dict=install_dict,
                     warnings=warnings,
                 )
+                if install_mode == "install":
+                    activated = await self._activate_fresh_install_candidate(
+                        plugin_id=package_plugin_id,
+                        target_dir=target_dir,
+                    )
+                    if not activated:
+                        response["candidate_selection_required"] = True
+                return response
 
             # Step 4b — plugin identity consistency check.
             # When Market tells us "this is plugin X" by passing
@@ -857,12 +866,20 @@ class PluginCliService:
                     }
                 )
 
-            return self._compose_install_result(
+            response = self._compose_install_result(
                 saved=saved,
                 unpack_result=unpack_result,
                 install_dict=install_dict,
                 warnings=warnings,
             )
+            if install_mode == "install":
+                activated = await self._activate_fresh_install_candidate(
+                    plugin_id=package_plugin_id,
+                    target_dir=target_dir,
+                )
+                if not activated:
+                    response["candidate_selection_required"] = True
+            return response
 
         except InstallSourceError:
             # Lock write failed — fs cleanup still runs, but propagate the
@@ -980,6 +997,105 @@ class PluginCliService:
             result["install_source_warning"] = "; ".join(warnings)
         return result
 
+    async def _activate_fresh_install_candidate(
+        self,
+        *,
+        plugin_id: str,
+        target_dir: Path,
+    ) -> bool:
+        """Activate a fresh Market candidate through the lifecycle transaction."""
+
+        manager = self._require_install_source_manager()
+        root_id, directory_name = classify_plugin_path(
+            target_dir,
+            builtin_root=manager.builtin_root,
+            user_root=manager.user_root,
+        )
+        from plugin.server.application.plugins.lifecycle_service import (
+            PluginLifecycleService,
+        )
+        from plugin.server.application.plugins.registry_service import (
+            PluginRegistryService,
+        )
+
+        candidate_state = await PluginRegistryService().list_plugin_candidates(
+            plugin_id
+        )
+        candidates = candidate_state.get("candidates")
+
+        target_key = CandidateKey(root_id=root_id, directory_name=directory_name)
+        target_item = next(
+            (
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and item.get("key")
+                == {
+                    "root_id": target_key.root_id,
+                    "directory_name": target_key.directory_name,
+                }
+            ),
+            None,
+        ) if isinstance(candidates, list) else None
+        if (
+            isinstance(target_item, dict)
+            and target_item.get("requires_shared_state_authorization") is True
+        ):
+            # Keep the installed candidate, but do not silently grant it the
+            # existing logical plugin's config/data/cache.  The candidates UI
+            # performs the explicit, audited selection transaction.
+            return False
+
+        registered_candidate = candidate_state.get("registered_candidate")
+        if (
+            isinstance(candidates, list)
+            and len(candidates) == 1
+            and registered_candidate is None
+        ):
+            from plugin.server.infrastructure import plugin_selections
+
+            state_owner = await asyncio.to_thread(
+                plugin_selections.get_plugin_state_owner,
+                plugin_id,
+            )
+            shared_state_exists = await asyncio.to_thread(
+                plugin_selections.legacy_shared_state_exists,
+                plugin_id,
+            )
+            if state_owner is None and not shared_state_exists:
+                source = target_item.get("source") if isinstance(target_item, dict) else None
+                release_chain_id = (
+                    target_item.get("release_chain_id")
+                    if isinstance(target_item, dict)
+                    else None
+                )
+                if source in {"manual", "imported", "market"} and (
+                    source != "market"
+                    or isinstance(release_chain_id, str)
+                    and bool(release_chain_id)
+                ):
+                    # The installer has proven that this logical id had no
+                    # prior state before committing its first ownership receipt.
+                    # No plugin import/start is needed merely to establish that
+                    # durable boundary.
+                    await asyncio.to_thread(
+                        plugin_selections.set_plugin_selection,
+                        plugin_id,
+                        target_key,
+                        candidate_source=source,
+                        state_access_grant="initial_identity",
+                        release_chain_id=(
+                            release_chain_id if isinstance(release_chain_id, str) else None
+                        ),
+                    )
+                    return True
+
+        await PluginLifecycleService().switch_plugin_candidate(
+            plugin_id,
+            target_key,
+        )
+        return True
+
     async def _record_imported_for_unpack(
         self,
         *,
@@ -1036,6 +1152,7 @@ class PluginCliService:
         """
 
         for unpacked_target_dir in unpacked_target_dirs or []:
+            self._rollback_install_source_best_effort(unpacked_target_dir)
             self._cleanup_failed_unpack(unpacked_target_dir)
         for unpacked_profile_dir in unpacked_profile_dirs or []:
             self._cleanup_failed_unpack(unpacked_profile_dir)
@@ -1066,6 +1183,23 @@ class PluginCliService:
         except OSError as exc:  # pragma: no cover — ignore_errors=True suppresses
             logger.warning(
                 "upload_and_install: _cleanup_failed_unpack({}) failed: {}",
+                target_dir,
+                exc,
+            )
+
+    @staticmethod
+    def _rollback_install_source_best_effort(target_dir: Path) -> None:
+        manager = get_install_source_manager()
+        if manager is None:
+            return
+        try:
+            manager.mark_removed(
+                directory_path=target_dir,
+                reason="install_rollback",
+            )
+        except Exception as exc:
+            logger.warning(
+                "upload_and_install: failed to roll back install source for {}: {}",
                 target_dir,
                 exc,
             )

@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
+import { ElMessageBox } from 'element-plus'
 import PluginDetail from './PluginDetail.vue'
 import type { PluginUiSurface } from '@/types/api'
 import { usePluginStore } from '@/stores/plugin'
@@ -12,6 +13,8 @@ const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
   getPlugins: vi.fn(),
   getPluginStatus: vi.fn(),
+  getPluginCandidates: vi.fn(),
+  selectPluginCandidate: vi.fn(),
 }))
 const routerMocks = vi.hoisted(() => ({
   push: vi.fn(),
@@ -24,6 +27,8 @@ vi.mock('@/api/plugins', () => ({
   getPluginUiSurfaceInfo: apiMocks.getPluginUiSurfaceInfo,
   getPlugins: apiMocks.getPlugins,
   getPluginStatus: apiMocks.getPluginStatus,
+  getPluginCandidates: apiMocks.getPluginCandidates,
+  selectPluginCandidate: apiMocks.selectPluginCandidate,
 }))
 vi.mock('@/api', () => ({ get: apiMocks.get }))
 vi.mock('@/i18n', () => ({ getLocale: () => 'en-US' }))
@@ -118,7 +123,10 @@ function surface(overrides: Partial<PluginUiSurface>): PluginUiSurface {
   }
 }
 
-async function mountDetail(surfaces: PluginUiSurface[]): Promise<MountedDetail> {
+async function mountDetail(
+  surfaces: PluginUiSurface[],
+  candidateInventory?: Record<string, unknown>,
+): Promise<MountedDetail> {
   apiMocks.getPluginUiSurfaceInfo.mockResolvedValue({ surfaces, warnings: [] })
   apiMocks.get.mockResolvedValue({ has_ui: true })
   const plugin = {
@@ -130,6 +138,28 @@ async function mountDetail(surfaces: PluginUiSurface[]): Promise<MountedDetail> 
   }
   apiMocks.getPlugins.mockResolvedValue({ plugins: [plugin] })
   apiMocks.getPluginStatus.mockResolvedValue({ plugin_id: plugin.id, status: { status: 'running' } })
+  apiMocks.getPluginCandidates.mockResolvedValue(candidateInventory ?? {
+    plugin_id: plugin.id,
+    desired_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    effective_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    registered_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    running_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    selection_reason: 'explicit_selection',
+    candidates: [{
+      key: { root_id: 'builtin', directory_name: plugin.id },
+      source: 'builtin',
+      version: '1.0.0',
+      release_chain_id: null,
+      state_scope: 'legacy_shared',
+      requires_shared_state_authorization: false,
+      valid: true,
+      error: null,
+      selected: true,
+      effective: true,
+      registered: true,
+      running: true,
+    }],
+  })
   const container = document.createElement('div')
   document.body.appendChild(container)
   const pinia = createPinia()
@@ -164,6 +194,7 @@ async function mountDetail(surfaces: PluginUiSurface[]): Promise<MountedDetail> 
   app.component('el-tag', passthrough)
   app.component('el-icon', passthrough)
   app.component('el-button', passthrough)
+  app.component('el-empty', passthrough)
   app.mount(container)
   for (let index = 0; index < 10; index += 1) {
     await Promise.resolve()
@@ -179,6 +210,8 @@ describe('PluginDetail surface selection', () => {
     apiMocks.get.mockReset()
     apiMocks.getPlugins.mockReset()
     apiMocks.getPluginStatus.mockReset()
+    apiMocks.getPluginCandidates.mockReset()
+    apiMocks.selectPluginCandidate.mockReset()
     routerMocks.push.mockReset()
     routerMocks.replace.mockReset()
     hostedFrameMocks.refreshContext.mockReset()
@@ -194,6 +227,100 @@ describe('PluginDetail surface selection', () => {
     expect(mounted.container.querySelector('[data-surface-id="legacy-main"]')).not.toBeNull()
     expect(mounted.container.querySelector('[data-tab-name="ui"]')).toBeNull()
     expect(mounted.container.querySelector('[data-testid="plugin-actions"]')).not.toBeNull()
+    mounted.unmount()
+  })
+
+  it('shows every installed candidate and exposes an explicit switch action', async () => {
+    const mounted = await mountDetail([], {
+      plugin_id: 'study_companion',
+      desired_candidate: { root_id: 'user', directory_name: 'study-market' },
+      effective_candidate: { root_id: 'user', directory_name: 'study-market' },
+      registered_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      running_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      selection_reason: 'explicit_selection',
+      candidates: [
+        {
+          key: { root_id: 'builtin', directory_name: 'study_companion' },
+          source: 'builtin',
+          version: '1.0.0',
+          release_chain_id: null,
+          state_scope: 'legacy_shared',
+          requires_shared_state_authorization: false,
+          valid: true,
+          error: null,
+          selected: false,
+          effective: false,
+          registered: true,
+          running: true,
+        },
+        {
+          key: { root_id: 'user', directory_name: 'study-market' },
+          source: 'market',
+          version: '2.0.0',
+          release_chain_id: 'study_companion',
+          state_scope: 'legacy_shared',
+          requires_shared_state_authorization: false,
+          valid: true,
+          error: null,
+          selected: true,
+          effective: true,
+          registered: false,
+          running: false,
+        },
+      ],
+    })
+
+    expect(mounted.container.querySelectorAll('[data-candidate-key]')).toHaveLength(2)
+    expect(mounted.container.querySelector('[data-candidate-key="builtin:study_companion"]')?.textContent).toContain('1.0.0')
+    expect(mounted.container.querySelector('[data-candidate-key="user:study-market"]')?.textContent).toContain('2.0.0')
+    const marketAction = mounted.container.querySelector('[data-candidate-action="user:study-market"]')
+    expect(marketAction).not.toBeNull()
+    expect(marketAction?.textContent).toContain('plugins.candidates.switch')
+    mounted.unmount()
+  })
+
+  it('requires explicit confirmation before an imported candidate can inherit plugin data', async () => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
+    apiMocks.selectPluginCandidate.mockResolvedValue({ success: true })
+    const mounted = await mountDetail([], {
+      plugin_id: 'study_companion',
+      desired_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      effective_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      registered_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      running_candidate: { root_id: 'builtin', directory_name: 'study_companion' },
+      selection_reason: 'explicit_selection',
+      candidates: [{
+        key: { root_id: 'user', directory_name: 'study-local' },
+        source: 'imported',
+        version: '2.0.0-dev',
+        release_chain_id: null,
+        state_scope: 'legacy_shared',
+        requires_shared_state_authorization: true,
+        valid: true,
+        error: null,
+        selected: false,
+        effective: false,
+        registered: false,
+        running: false,
+      }],
+    })
+
+    const action = mounted.container.querySelector('[data-candidate-action="user:study-local"]') as HTMLElement
+    expect(action).not.toBeNull()
+    expect(mounted.container.textContent).toContain('plugins.candidates.dataAccessRequired')
+    action.click()
+    for (let index = 0; index < 10; index += 1) {
+      await Promise.resolve()
+      await nextTick()
+    }
+
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(apiMocks.selectPluginCandidate).toHaveBeenCalledWith(
+      'study_companion',
+      { root_id: 'user', directory_name: 'study-local' },
+      true,
+    )
+    confirm.mockRestore()
     mounted.unmount()
   })
 

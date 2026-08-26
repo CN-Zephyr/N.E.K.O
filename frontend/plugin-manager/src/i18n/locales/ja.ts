@@ -276,6 +276,22 @@ export default {
     hideMetrics: 'パフォーマンスを非表示',
     showSourceDetail: 'ソース詳細を表示',
     hideSourceDetail: 'ソース詳細を隠す',
+    candidates: {
+      title: 'インストール済みバージョン',
+      hint: '同時に実行されるのは1つのバージョンだけです。実行中の切り替えは安全に再起動されます。',
+      running: '実行中',
+      current: '選択中',
+      invalid: '利用不可',
+      switch: 'このバージョンを使用',
+      none: 'インストール済みバージョンがありません',
+      loadFailed: 'インストール済みバージョンの読み込みに失敗しました',
+      switchSuccess: 'プラグインのバージョンを切り替えました',
+      switchFailed: '切り替えに失敗したため、以前のバージョンを維持しました',
+      dataAccessRequired: '既存データへのアクセス',
+      dataAccessTitle: '既存のプラグインデータへのアクセスを許可しますか？',
+      dataAccessPrompt: 'この{source}バージョンは、既存の設定、データ、キャッシュ、保存済み認証情報を読み取り・変更できるようになります。',
+      dataAccessConfirm: '許可して切り替え',
+    },
     installSource: {
       channel: {
         builtin: '組み込み',

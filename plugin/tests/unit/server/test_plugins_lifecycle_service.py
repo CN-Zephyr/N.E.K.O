@@ -13,7 +13,10 @@ from plugin._types.exceptions import PluginLifecycleError
 from plugin.core import registry as registry_module
 from plugin.server.application.plugins import query_service as query_module
 from plugin.server.application.plugins import lifecycle_service as module
+from plugin.server.application.plugins import registry_service as selection_registry_module
+from plugin.server.domain.plugin_candidates import CandidateKey
 from plugin.server.domain.errors import ServerDomainError
+from plugin.server.infrastructure import plugin_selections as plugin_selections_module
 from plugin.server.infrastructure import runtime_overrides as runtime_overrides_module
 from plugin.sdk.plugin.decorators import plugin_entry
 
@@ -41,6 +44,21 @@ class _FakeProcessHost:
 
     def is_alive(self) -> bool:
         return True
+
+
+class _CandidateHost:
+    def __init__(self, candidate: CandidateKey) -> None:
+        self.candidate = candidate
+        self.alive = True
+
+    async def start(self, *_args, **_kwargs) -> None:
+        self.alive = True
+
+    async def shutdown(self, *_args, **_kwargs) -> None:
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        return self.alive
 
 
 class _FakeAdapterPlugin:
@@ -2078,6 +2096,7 @@ def test_parse_single_plugin_config_uses_resolver_effective_config_and_logs_warn
 async def test_delete_plugin_removes_directory_and_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    _isolate_plugin_candidate_selections: dict[str, object],
 ) -> None:
     plugin_dir = tmp_path / "demo_plugin"
     config_path = plugin_dir / "plugin.toml"
@@ -2105,6 +2124,10 @@ async def test_delete_plugin_removes_directory_and_metadata(
                 "type": "plugin",
                 "config_path": str(config_path),
                 "entry_point": "tests.fake:Plugin",
+                "selected_candidate": {
+                    "root_id": "user",
+                    "directory_name": "demo_plugin",
+                },
             }
         with module.state.acquire_plugin_hosts_write_lock():
             module.state.plugin_hosts.clear()
@@ -2121,6 +2144,13 @@ async def test_delete_plugin_removes_directory_and_metadata(
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: events.append(dict(event)))
         monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
         monkeypatch.setattr(module, "get_user_package_profiles_root", lambda: profiles_root)
+        plugin_selections_module.set_plugin_selection(
+            "demo_plugin",
+            CandidateKey(root_id="user", directory_name="demo_plugin"),
+            candidate_source="manual",
+            state_access_grant="user_authorized",
+            authorized_at="2026-08-26T07:00:00Z",
+        )
 
         service = module.PluginLifecycleService()
         response = await service.delete_plugin("demo_plugin")
@@ -2132,11 +2162,77 @@ async def test_delete_plugin_removes_directory_and_metadata(
         assert plugin_dir.exists() is False
         assert profile_dir.exists() is False
         assert install_source_manager.marked_removed == [plugin_dir]
+        assert plugin_selections_module.get_plugin_selection("demo_plugin") is None
+        retained_owner = plugin_selections_module.get_plugin_state_owner("demo_plugin")
+        assert retained_owner is not None
+        assert retained_owner.candidate == CandidateKey(
+            root_id="user",
+            directory_name="demo_plugin",
+        )
         with module.state.acquire_plugins_read_lock():
             assert "demo_plugin" not in module.state.plugins
         with module.state.acquire_event_handlers_read_lock():
             assert "demo_plugin.plugin_entry:run" not in module.state.event_handlers
         assert any(event.get("type") == "plugin_deleted" for event in events)
+
+        # Reinstall unrelated bytes into the exact deleted slot.  The retained
+        # state owner must keep this candidate pending instead of treating the
+        # empty code inventory as a brand-new logical identity.
+        plugin_dir.mkdir(parents=True)
+        config_path.write_text(
+            "\n".join(
+                [
+                    "[plugin]",
+                    "id = 'demo_plugin'",
+                    "name = 'Replacement'",
+                    "type = 'plugin'",
+                    "entry = 'plugins.demo_plugin:Plugin'",
+                    "version = '9.9.9'",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(selection_registry_module, "get_install_source_manager", lambda: None)
+        monkeypatch.setattr(
+            selection_registry_module,
+            "BUILTIN_PLUGIN_CONFIG_ROOT",
+            tmp_path / "builtin",
+        )
+        monkeypatch.setattr(
+            selection_registry_module,
+            "PLUGIN_CONFIG_ROOTS",
+            (tmp_path / "builtin", tmp_path),
+        )
+        monkeypatch.setattr(
+            selection_registry_module,
+            "_get_registered_plugin_snapshot_sync",
+            lambda: {},
+        )
+        monkeypatch.setattr(
+            selection_registry_module,
+            "_list_running_plugin_ids_sync",
+            lambda: set(),
+        )
+        from plugin.server.application.plugin_cli.service import PluginCliService
+
+        cli_service = PluginCliService()
+        monkeypatch.setattr(
+            cli_service,
+            "_require_install_source_manager",
+            lambda: SimpleNamespace(
+                builtin_root=tmp_path / "builtin",
+                user_root=tmp_path,
+            ),
+        )
+
+        activated = await cli_service._activate_fresh_install_candidate(
+            plugin_id="demo_plugin",
+            target_dir=plugin_dir,
+        )
+
+        assert activated is False
+        assert plugin_selections_module.get_plugin_selection("demo_plugin") is None
+        assert plugin_selections_module.get_plugin_state_owner("demo_plugin") == retained_owner
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()
@@ -3080,6 +3176,674 @@ async def test_stop_plugin_returns_partial_success_on_preference_write_failure(
         }
         with module.state.acquire_plugin_hosts_read_lock():
             assert "demo_plugin" not in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+def _candidate_state_payload(
+    *,
+    plugin_id: str,
+    effective: CandidateKey,
+    running: CandidateKey | None,
+) -> dict[str, object]:
+    def _payload(candidate: CandidateKey | None) -> dict[str, str] | None:
+        if candidate is None:
+            return None
+        return {
+            "root_id": candidate.root_id,
+            "directory_name": candidate.directory_name,
+        }
+
+    return {
+        "plugin_id": plugin_id,
+        "effective_candidate": _payload(effective),
+        "registered_candidate": _payload(running or effective),
+        "running_candidate": _payload(running),
+        "candidates": [],
+    }
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_imported_same_id_requires_state_authorization_before_stopping_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "demo_plugin"
+    builtin = CandidateKey(root_id="builtin", directory_name=plugin_id)
+    imported = CandidateKey(root_id="user", directory_name="demo-imported")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    lifecycle_calls: list[str] = []
+
+    async def _list(_plugin_id: str) -> dict[str, object]:
+        payload = _candidate_state_payload(
+            plugin_id=plugin_id,
+            effective=builtin,
+            running=builtin,
+        )
+        payload["candidates"] = [
+            {"key": module._candidate_key_payload(builtin), "source": "builtin"},
+            {"key": module._candidate_key_payload(imported), "source": "imported"},
+        ]
+        return payload
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        return {"valid": True, "source": "imported"}
+
+    async def _unexpected(*_args, **_kwargs) -> dict[str, object]:
+        lifecycle_calls.append("called")
+        return {"success": True}
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _unexpected)
+    monkeypatch.setattr(service, "stop_plugin", _unexpected)
+    monkeypatch.setattr(service, "start_plugin", _unexpected)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    try:
+        plugin_selections_module.set_plugin_selection(plugin_id, builtin)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": "builtin/demo_plugin/plugin.toml",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(builtin)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await service.switch_plugin_candidate(plugin_id, imported)
+
+        assert exc_info.value.code == "PLUGIN_SHARED_STATE_AUTHORIZATION_REQUIRED"
+        assert exc_info.value.status_code == 409
+        assert lifecycle_calls == []
+        assert plugin_selections_module.get_plugin_selection(plugin_id) == builtin
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert module.state.plugin_hosts[plugin_id].candidate == builtin
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_market_same_release_chain_reuses_state_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "demo_plugin"
+    old = CandidateKey(root_id="user", directory_name="demo-market-old")
+    target = CandidateKey(root_id="user", directory_name="demo-market-new")
+
+    async def _list(_plugin_id: str) -> dict[str, object]:
+        return {
+            "plugin_id": plugin_id,
+            "effective_candidate": module._candidate_key_payload(old),
+            "registered_candidate": module._candidate_key_payload(old),
+            "running_candidate": None,
+            "candidates": [
+                {
+                    "key": module._candidate_key_payload(old),
+                    "source": "market",
+                    "release_chain_id": "market.demo",
+                },
+                {
+                    "key": module._candidate_key_payload(target),
+                    "source": "market",
+                    "release_chain_id": "market.demo",
+                },
+            ],
+        }
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        return {
+            "valid": True,
+            "source": "market",
+            "release_chain_id": "market.demo",
+        }
+
+    async def _refresh(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        return {"success": True, "plugin_id": plugin_id}
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _refresh)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+    plugin_selections_module.set_plugin_selection(
+        plugin_id,
+        old,
+        candidate_source="market",
+        state_access_grant="initial_identity",
+        release_chain_id="market.demo",
+    )
+
+    result = await service.switch_plugin_candidate(plugin_id, target)
+
+    assert result["state_access_grant"] == "trusted_market_chain"
+    record = plugin_selections_module.get_plugin_selection_record(plugin_id)
+    assert record is not None
+    assert record.candidate == target
+    assert record.release_chain_id == "market.demo"
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_missing_registered_metadata_does_not_erase_persisted_state_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "demo_plugin"
+    builtin = CandidateKey(root_id="builtin", directory_name=plugin_id)
+    imported = CandidateKey(root_id="user", directory_name="demo-imported")
+
+    async def _list(_plugin_id: str) -> dict[str, object]:
+        return {
+            "plugin_id": plugin_id,
+            "effective_candidate": None,
+            "registered_candidate": None,
+            "running_candidate": None,
+            "candidates": [
+                {"key": module._candidate_key_payload(imported), "source": "imported"}
+            ],
+        }
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        return {"valid": True, "source": "imported"}
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+    plugin_selections_module.set_plugin_selection(plugin_id, builtin)
+
+    with pytest.raises(ServerDomainError) as exc_info:
+        await service.switch_plugin_candidate(plugin_id, imported)
+
+    assert exc_info.value.code == "PLUGIN_SHARED_STATE_AUTHORIZATION_REQUIRED"
+    assert plugin_selections_module.get_plugin_selection(plugin_id) == builtin
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_legacy_shared_state_without_owner_requires_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "legacy_demo"
+    imported = CandidateKey(root_id="user", directory_name="legacy-imported")
+
+    async def _list(_plugin_id: str) -> dict[str, object]:
+        return {
+            "plugin_id": plugin_id,
+            "effective_candidate": module._candidate_key_payload(imported),
+            "registered_candidate": None,
+            "running_candidate": None,
+            "candidates": [
+                {"key": module._candidate_key_payload(imported), "source": "imported"}
+            ],
+        }
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        return {"valid": True, "source": "imported"}
+
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(
+        plugin_selections_module,
+        "legacy_shared_state_exists",
+        lambda candidate_plugin_id: candidate_plugin_id == plugin_id,
+    )
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    with pytest.raises(ServerDomainError) as exc_info:
+        await module.PluginLifecycleService().switch_plugin_candidate(
+            plugin_id,
+            imported,
+        )
+
+    assert exc_info.value.code == "PLUGIN_SHARED_STATE_AUTHORIZATION_REQUIRED"
+    assert plugin_selections_module.get_plugin_selection(plugin_id) is None
+    assert plugin_selections_module.get_plugin_state_owner(plugin_id) is None
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_switch_running_candidate_commits_only_after_target_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "demo_plugin"
+    builtin = CandidateKey(root_id="builtin", directory_name=plugin_id)
+    market = CandidateKey(root_id="user", directory_name="demo-market")
+    old_meta = {
+        "id": plugin_id,
+        "config_path": "builtin/demo_plugin/plugin.toml",
+        "selected_candidate": {
+            "root_id": builtin.root_id,
+            "directory_name": builtin.directory_name,
+        },
+    }
+    events: list[str] = []
+    selection_seen_at_start: list[CandidateKey | None] = []
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+
+    async def _list_candidates(_plugin_id: str) -> dict[str, object]:
+        return _candidate_state_payload(
+            plugin_id=plugin_id,
+            effective=builtin,
+            running=builtin,
+        )
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        events.append("validate")
+        return {"valid": True}
+
+    async def _refresh(
+        _plugin_id: str,
+        *,
+        transient_candidate: CandidateKey | None = None,
+    ) -> dict[str, object]:
+        assert transient_candidate == market
+        events.append("apply-target")
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": "user/demo-market/plugin.toml",
+                "selected_candidate": {
+                    "root_id": market.root_id,
+                    "directory_name": market.directory_name,
+                },
+                "selection_reason": "transient_selection",
+            }
+        return {"success": True, "plugin_id": plugin_id}
+
+    service = module.PluginLifecycleService()
+
+    async def _stop(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        events.append("stop-old")
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.pop(plugin_id, None)
+        return {"success": True, "plugin_id": plugin_id}
+
+    async def _start(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        events.append("start-target")
+        selection_seen_at_start.append(
+            plugin_selections_module.get_plugin_selection(plugin_id)
+        )
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(market)
+        return {"success": True, "plugin_id": plugin_id}
+
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list_candidates)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _refresh)
+    monkeypatch.setattr(service, "stop_plugin", _stop)
+    monkeypatch.setattr(service, "start_plugin", _start)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    try:
+        plugin_selections_module.set_plugin_selection(plugin_id, builtin)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = dict(old_meta)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(builtin)
+
+        result = await service.switch_plugin_candidate(
+            plugin_id,
+            market,
+            allow_legacy_shared_state=True,
+        )
+
+        assert events == ["validate", "stop-old", "apply-target", "start-target"]
+        assert selection_seen_at_start == [builtin]
+        assert plugin_selections_module.get_plugin_selection(plugin_id) == market
+        assert result["restarted"] is True
+        with module.state.acquire_plugin_hosts_read_lock():
+            hosts = dict(module.state.plugin_hosts)
+        assert list(hosts) == [plugin_id]
+        assert hosts[plugin_id].candidate == market
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_switch_candidate_start_failure_restores_previous_runtime_and_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "demo_plugin"
+    builtin = CandidateKey(root_id="builtin", directory_name=plugin_id)
+    imported = CandidateKey(root_id="user", directory_name="demo-local")
+    old_meta = {
+        "id": plugin_id,
+        "config_path": "builtin/demo_plugin/plugin.toml",
+        "selected_candidate": {
+            "root_id": builtin.root_id,
+            "directory_name": builtin.directory_name,
+        },
+    }
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    starts: list[CandidateKey] = []
+
+    async def _list_candidates(_plugin_id: str) -> dict[str, object]:
+        return _candidate_state_payload(
+            plugin_id=plugin_id,
+            effective=builtin,
+            running=builtin,
+        )
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        return {"valid": True}
+
+    async def _refresh(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": "user/demo-local/plugin.toml",
+                "selected_candidate": {
+                    "root_id": imported.root_id,
+                    "directory_name": imported.directory_name,
+                },
+            }
+        return {"success": True, "plugin_id": plugin_id}
+
+    service = module.PluginLifecycleService()
+
+    async def _stop(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.pop(plugin_id, None)
+        return {"success": True, "plugin_id": plugin_id}
+
+    async def _start(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        with module.state.acquire_plugins_read_lock():
+            selected = module._candidate_key_from_payload(
+                module.state.plugins[plugin_id].get("selected_candidate")
+            )
+        assert selected is not None
+        starts.append(selected)
+        if selected == imported:
+            raise ServerDomainError(
+                code="PLUGIN_START_FAILED",
+                message="target failed",
+                status_code=500,
+            )
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(selected)
+        return {"success": True, "plugin_id": plugin_id}
+
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list_candidates)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _refresh)
+    monkeypatch.setattr(service, "stop_plugin", _stop)
+    monkeypatch.setattr(service, "start_plugin", _start)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    try:
+        plugin_selections_module.set_plugin_selection(plugin_id, builtin)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = dict(old_meta)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(builtin)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await service.switch_plugin_candidate(
+                plugin_id,
+                imported,
+                allow_legacy_shared_state=True,
+            )
+
+        assert exc_info.value.code == "PLUGIN_CANDIDATE_SWITCH_FAILED"
+        assert exc_info.value.details["rollback_status"] == "completed"
+        assert starts == [imported, builtin]
+        assert plugin_selections_module.get_plugin_selection(plugin_id) == builtin
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins[plugin_id] == old_meta
+        with module.state.acquire_plugin_hosts_read_lock():
+            restored_host = module.state.plugin_hosts[plugin_id]
+        assert restored_host.candidate == builtin
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_selecting_unregistered_fresh_candidate_applies_metadata_without_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_id = "fresh_plugin"
+    target = CandidateKey(root_id="user", directory_name="fresh-market")
+    calls: list[str] = []
+
+    async def _list(_plugin_id: str) -> dict[str, object]:
+        return {
+            "plugin_id": plugin_id,
+            "effective_candidate": {
+                "root_id": target.root_id,
+                "directory_name": target.directory_name,
+            },
+            "registered_candidate": None,
+            "running_candidate": None,
+            "candidates": [],
+        }
+
+    async def _validate(_plugin_id: str, _candidate: CandidateKey) -> dict[str, object]:
+        calls.append("validate")
+        return {"valid": True}
+
+    async def _refresh(_plugin_id: str, **_kwargs) -> dict[str, object]:
+        calls.append("apply")
+        return {"success": True, "plugin_id": plugin_id}
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(module.plugin_registry_service, "list_plugin_candidates", _list)
+    monkeypatch.setattr(module.plugin_registry_service, "validate_plugin_candidate", _validate)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _refresh)
+    monkeypatch.setattr(
+        service,
+        "start_plugin",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a stopped fresh plugin must stay stopped")
+        ),
+    )
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    result = await service.switch_plugin_candidate(plugin_id, target)
+
+    assert calls == ["validate", "apply"]
+    assert result["restarted"] is False
+    assert result["state_access_grant"] == "initial_identity"
+    assert plugin_selections_module.get_plugin_selection(plugin_id) == target
+    owner = plugin_selections_module.get_plugin_state_owner(plugin_id)
+    assert owner is not None
+    assert owner.candidate == target
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_candidate_switch_end_to_end_keeps_one_id_and_survives_registry_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_id = "candidate_e2e"
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    builtin_config = builtin_root / plugin_id / "plugin.toml"
+    user_directory = "candidate_e2e_market"
+    user_config = user_root / user_directory / "plugin.toml"
+
+    def _write_candidate(config_path: Path, *, entry_package: str, version: str) -> None:
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            "\n".join(
+                [
+                    "[plugin]",
+                    f"id = '{plugin_id}'",
+                    f"name = '{plugin_id}'",
+                    "type = 'plugin'",
+                    f"entry = 'plugins.{entry_package}:Plugin'",
+                    f"version = '{version}'",
+                    "",
+                    "[plugin_runtime]",
+                    "enabled = true",
+                    "auto_start = false",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    _write_candidate(
+        builtin_config,
+        entry_package=plugin_id,
+        version="1.0.0",
+    )
+    _write_candidate(
+        user_config,
+        entry_package=user_directory,
+        version="2.0.0",
+    )
+
+    class _Plugin:
+        pass
+
+    class _Host:
+        def __init__(self, plugin_id: str, entry_point: str, config_path: Path) -> None:
+            self.plugin_id = plugin_id
+            self.entry_point = entry_point
+            self.config_path = config_path
+            self.alive = False
+            self.process = SimpleNamespace(
+                is_alive=lambda: self.alive,
+                exitcode=None,
+            )
+
+        async def start(
+            self,
+            message_target_queue: object,
+            startup_timeout: float | None = None,
+            startup_failure: str = "warn",
+        ) -> None:
+            del message_target_queue, startup_timeout, startup_failure
+            self.alive = True
+
+        async def shutdown(self, timeout: float = module.PLUGIN_SHUTDOWN_TIMEOUT) -> None:
+            del timeout
+            self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    async def _clear_tools(_plugin_id: str) -> None:
+        return None
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    monkeypatch.setattr(selection_registry_module, "get_install_source_manager", lambda: None)
+    monkeypatch.setattr(selection_registry_module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(
+        selection_registry_module,
+        "PLUGIN_CONFIG_ROOTS",
+        (builtin_root, user_root),
+    )
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    monkeypatch.setattr(
+        selection_registry_module,
+        "_import_plugin_module",
+        lambda *_args, **_kwargs: SimpleNamespace(Plugin=_Plugin),
+    )
+    monkeypatch.setattr(
+        module,
+        "_import_plugin_module",
+        lambda *_args, **_kwargs: SimpleNamespace(Plugin=_Plugin),
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_plugin_config_from_path",
+        lambda *_args, **kwargs: {
+            "effective_config": kwargs["base_config"],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(module, "PluginProcessHost", _Host)
+    monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **_kwargs: args[0])
+    monkeypatch.setattr(module, "clear_plugin_llm_tools", _clear_tools)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        registry = selection_registry_module.PluginRegistryService()
+        service = module.PluginLifecycleService()
+        await registry.refresh_registry()
+        await service.start_plugin(plugin_id)
+        target = CandidateKey(root_id="user", directory_name=user_directory)
+
+        switched = await service.switch_plugin_candidate(
+            plugin_id,
+            target,
+            allow_legacy_shared_state=True,
+        )
+
+        assert switched["restarted"] is True
+        assert plugin_selections_module.get_plugin_selection(plugin_id) == target
+        with module.state.acquire_plugin_hosts_read_lock():
+            hosts = dict(module.state.plugin_hosts)
+        assert set(hosts) == {plugin_id}
+        assert Path(hosts[plugin_id].config_path).resolve() == user_config.resolve()
+        with module.state.acquire_plugins_read_lock():
+            assert set(module.state.plugins) == {plugin_id}
+            assert Path(module.state.plugins[plugin_id]["config_path"]).resolve() == user_config.resolve()
+
+        await service.stop_plugin(plugin_id)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        plugin_selections_module.reset_cache_for_testing()
+
+        await registry.refresh_registry()
+
+        with module.state.acquire_plugins_read_lock():
+            restarted_meta = dict(module.state.plugins[plugin_id])
+        assert Path(restarted_meta["config_path"]).resolve() == user_config.resolve()
+        assert restarted_meta["selection_reason"] == "explicit_selection"
+        assert set(module.state.plugins) == {plugin_id}
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()

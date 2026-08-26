@@ -143,6 +143,67 @@
               </el-descriptions-item>
             </el-descriptions>
 
+            <section class="candidate-section" data-yui-guide-id="plugin-detail-candidates">
+              <div class="candidate-section__header">
+                <div>
+                  <h3>{{ $t('plugins.candidates.title') }}</h3>
+                  <p>{{ $t('plugins.candidates.hint') }}</p>
+                </div>
+                <el-icon v-if="candidateLoading" class="is-loading"><Loading /></el-icon>
+              </div>
+              <el-alert
+                v-if="candidateError"
+                type="warning"
+                show-icon
+                :closable="false"
+                :title="candidateError"
+              />
+              <div v-else-if="candidateState?.candidates.length" class="candidate-list">
+                <div
+                  v-for="candidate in candidateState.candidates"
+                  :key="candidateKey(candidate.key)"
+                  class="candidate-row"
+                  :data-candidate-key="candidateKey(candidate.key)"
+                >
+                  <div class="candidate-row__identity">
+                    <div class="candidate-row__title">
+                      <el-tag size="small" :type="candidate.source === 'builtin' ? 'info' : 'primary'">
+                        {{ $t(`plugins.installSource.channel.${candidate.source}`) }}
+                      </el-tag>
+                      <strong>{{ candidate.version || $t('common.nA') }}</strong>
+                    </div>
+                    <code>{{ candidate.key.root_id }}/{{ candidate.key.directory_name }}</code>
+                    <span v-if="candidate.error" class="candidate-row__error">{{ candidate.error }}</span>
+                  </div>
+                  <div class="candidate-row__status">
+                    <el-tag v-if="candidate.running" size="small" type="success">
+                      {{ $t('plugins.candidates.running') }}
+                    </el-tag>
+                    <el-tag v-if="candidate.effective" size="small">
+                      {{ $t('plugins.candidates.current') }}
+                    </el-tag>
+                    <el-tag v-if="!candidate.valid" size="small" type="danger">
+                      {{ $t('plugins.candidates.invalid') }}
+                    </el-tag>
+                    <el-tag v-if="candidate.requires_shared_state_authorization" size="small" type="warning">
+                      {{ $t('plugins.candidates.dataAccessRequired') }}
+                    </el-tag>
+                    <el-button
+                      size="small"
+                      type="primary"
+                      :data-candidate-action="candidateKey(candidate.key)"
+                      :disabled="(candidate.registered && candidate.selected) || !candidate.valid"
+                      :loading="switchingCandidateKey === candidateKey(candidate.key)"
+                      @click="switchCandidate(candidate)"
+                    >
+                      {{ candidate.registered && candidate.selected ? $t('plugins.candidates.current') : $t('plugins.candidates.switch') }}
+                    </el-button>
+                  </div>
+                </div>
+              </div>
+              <el-empty v-else-if="!candidateLoading" :description="$t('plugins.candidates.none')" />
+            </section>
+
           </div>
         </el-tab-pane>
 
@@ -181,6 +242,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, Loading } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { usePluginStore } from '@/stores/plugin'
 import StatusIndicator from '@/components/common/StatusIndicator.vue'
 import PluginActions from '@/components/plugin/PluginActions.vue'
@@ -190,21 +252,31 @@ import PluginConfigEditor from '@/components/plugin/PluginConfigEditor.vue'
 import LogViewer from '@/components/logs/LogViewer.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
 import HostedSurfaceFrame from '@/components/plugin/HostedSurfaceFrame.vue'
-import { getPluginUiSurfaceInfo } from '@/api/plugins'
+import { getPluginCandidates, getPluginUiSurfaceInfo, selectPluginCandidate } from '@/api/plugins'
 import { resolvePluginDisplayText, type PluginDisplayText } from '@/utils/pluginDisplay'
 import { useI18n } from 'vue-i18n'
-import type { PluginUiSurface, PluginUiWarning } from '@/types/api'
+import type {
+  PluginCandidateInventory,
+  PluginCandidateItem,
+  PluginCandidateKey,
+  PluginUiSurface,
+  PluginUiWarning,
+} from '@/types/api'
 
 const route = useRoute()
 const router = useRouter()
 const pluginStore = usePluginStore()
-const { locale } = useI18n()
+const { locale, t } = useI18n()
 
 const pluginId = computed(() => route.params.id as string)
 const activeTab = ref('info')
 const loading = ref(true)
 const surfaces = ref<PluginUiSurface[]>([])
 const surfaceWarnings = ref<PluginUiWarning[]>([])
+const candidateState = ref<PluginCandidateInventory | null>(null)
+const candidateLoading = ref(false)
+const candidateError = ref('')
+const switchingCandidateKey = ref('')
 const activePanelSurfaceId = ref('')
 const activeGuideSurfaceId = ref('')
 type SurfaceMessageReceiver = {
@@ -216,6 +288,7 @@ const surfaceActivationRevisions = ref<Record<string, number>>({})
 const hostedSurfaceFrameHeight = 'clamp(560px, calc(100vh - 220px), 1200px)'
 const allowedTabs = new Set(['panel', 'guide', 'ui', 'info', 'entries', 'metrics', 'config', 'logs'])
 let currentSurfaceLoadId = 0
+let currentCandidateLoadId = 0
 
 const plugin = computed(() => {
   return pluginStore.pluginsWithStatus.find(p => p.id === pluginId.value)
@@ -285,6 +358,67 @@ const pluginStatus = computed(() => {
 
 function goBack() {
   router.push('/plugins')
+}
+
+function candidateKey(candidate: PluginCandidateKey): string {
+  return `${candidate.root_id}:${candidate.directory_name}`
+}
+
+async function fetchCandidates(): Promise<void> {
+  const loadId = ++currentCandidateLoadId
+  const currentPluginId = pluginId.value
+  candidateLoading.value = true
+  candidateError.value = ''
+  try {
+    const result = await getPluginCandidates(currentPluginId)
+    if (loadId !== currentCandidateLoadId || currentPluginId !== pluginId.value) return
+    candidateState.value = result
+  } catch (caught: any) {
+    if (loadId !== currentCandidateLoadId || currentPluginId !== pluginId.value) return
+    candidateState.value = null
+    candidateError.value = caught?.response?.data?.detail || caught?.message || t('plugins.candidates.loadFailed')
+  } finally {
+    if (loadId === currentCandidateLoadId) candidateLoading.value = false
+  }
+}
+
+async function switchCandidate(candidate: PluginCandidateItem): Promise<void> {
+  const key = candidateKey(candidate.key)
+  if (candidate.requires_shared_state_authorization) {
+    try {
+      await ElMessageBox.confirm(
+        t('plugins.candidates.dataAccessPrompt', {
+          source: t(`plugins.installSource.channel.${candidate.source}`),
+        }),
+        t('plugins.candidates.dataAccessTitle'),
+        {
+          confirmButtonText: t('plugins.candidates.dataAccessConfirm'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning',
+        },
+      )
+    } catch {
+      return
+    }
+  }
+  switchingCandidateKey.value = key
+  try {
+    await selectPluginCandidate(
+      pluginId.value,
+      candidate.key,
+      candidate.requires_shared_state_authorization,
+    )
+    await Promise.all([
+      pluginStore.fetchPlugins(),
+      pluginStore.fetchPluginStatus(pluginId.value),
+      fetchCandidates(),
+    ])
+    ElMessage.success(t('plugins.candidates.switchSuccess'))
+  } catch {
+    ElMessage.error(t('plugins.candidates.switchFailed'))
+  } finally {
+    switchingCandidateKey.value = ''
+  }
 }
 
 function resolveActiveTab(value: unknown): string {
@@ -478,6 +612,7 @@ onMounted(async () => {
   try {
     await pluginStore.fetchPlugins()
     await pluginStore.fetchPluginStatus(pluginId.value)
+    await fetchCandidates()
     if (await refreshPluginUi()) syncActiveTab(route.query.tab)
     pluginStore.setSelectedPlugin(pluginId.value)
   } finally {
@@ -497,6 +632,7 @@ watch(pluginId, async () => {
   loading.value = true
   try {
     await pluginStore.fetchPluginStatus(pluginId.value)
+    await fetchCandidates()
     if (await refreshPluginUi()) syncActiveTab(route.query.tab)
     pluginStore.setSelectedPlugin(pluginId.value)
   } finally {
@@ -555,6 +691,74 @@ watch(locale, () => {
 
 .info-section {
   padding: 20px 0;
+}
+
+.candidate-section {
+  margin-top: 20px;
+  padding: 18px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+}
+
+.candidate-section__header,
+.candidate-row,
+.candidate-row__title,
+.candidate-row__status {
+  display: flex;
+  align-items: center;
+}
+
+.candidate-section__header,
+.candidate-row {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.candidate-section__header h3 {
+  margin: 0;
+}
+
+.candidate-section__header p {
+  margin: 6px 0 0;
+  color: var(--el-text-color-secondary);
+}
+
+.candidate-list {
+  margin-top: 14px;
+}
+
+.candidate-row {
+  padding: 14px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.candidate-row__identity {
+  min-width: 0;
+}
+
+.candidate-row__title,
+.candidate-row__status {
+  gap: 8px;
+}
+
+.candidate-row code {
+  display: block;
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  overflow-wrap: anywhere;
+}
+
+.candidate-row__error {
+  display: block;
+  margin-top: 6px;
+  color: var(--el-color-danger);
+}
+
+@media (max-width: 720px) {
+  .candidate-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 
 .surface-section {

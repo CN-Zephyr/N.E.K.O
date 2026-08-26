@@ -99,6 +99,57 @@ def _isolate_runtime_overrides(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_plugin_candidate_selections(monkeypatch: pytest.MonkeyPatch):
+    """Keep candidate-selection tests away from the user's real config."""
+
+    from plugin.server.infrastructure import plugin_selections as _selections
+
+    fake_store: dict[str, object] = {
+        "schema_version": _selections.SELECTIONS_SCHEMA_VERSION,
+        "selections": {},
+        "state_owners": {},
+    }
+
+    def _load():
+        store, invalid = _selections._coerce_selections_with_status(fake_store)
+        _selections._cache_write_blocked_by_invalid_content = invalid
+        return store
+
+    def _records_payload(records):
+        return {
+            plugin_id: {
+                "root_id": selection.candidate.root_id,
+                "directory_name": selection.candidate.directory_name,
+                "candidate_source": selection.candidate_source,
+                "state_scope": selection.state_scope,
+                "state_access_grant": selection.state_access_grant,
+                "release_chain_id": selection.release_chain_id,
+                "authorized_at": selection.authorized_at,
+            }
+            for plugin_id, selection in records.items()
+        }
+
+    def _save(store):
+        fake_store.clear()
+        fake_store.update(
+            {
+                "schema_version": _selections.SELECTIONS_SCHEMA_VERSION,
+                "selections": _records_payload(store.selections),
+                "state_owners": _records_payload(store.state_owners),
+            }
+        )
+
+    monkeypatch.setattr(_selections, "_load_from_disk", _load)
+    monkeypatch.setattr(_selections, "_save_to_disk", _save)
+    monkeypatch.setattr(_selections, "legacy_shared_state_exists", lambda _plugin_id: False)
+    _selections.reset_cache_for_testing()
+    try:
+        yield fake_store
+    finally:
+        _selections.reset_cache_for_testing()
+
+
+@pytest.fixture(autouse=True)
 def _clear_leaked_running_loop(request: pytest.FixtureRequest):
     """Temporarily clear any running event loop leaked by Playwright's greenlet
     so that sync tests see a clean ``asyncio.get_running_loop() → RuntimeError``

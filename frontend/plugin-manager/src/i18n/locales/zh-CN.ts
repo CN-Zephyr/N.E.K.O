@@ -276,6 +276,22 @@ export default {
     hideMetrics: '隐藏性能指标',
     showSourceDetail: '显示来源详情',
     hideSourceDetail: '隐藏来源详情',
+    candidates: {
+      title: '已安装版本',
+      hint: '同一时间只运行一个版本；切换运行中的插件时会安全重启。',
+      running: '正在运行',
+      current: '当前选中',
+      invalid: '不可用',
+      switch: '使用此版本',
+      none: '没有找到已安装版本',
+      loadFailed: '加载已安装版本失败',
+      switchSuccess: '插件版本已切换',
+      switchFailed: '插件版本切换失败，已保留原版本',
+      dataAccessRequired: '需要访问已有数据',
+      dataAccessTitle: '允许访问插件已有数据？',
+      dataAccessPrompt: '这个{source}版本将能够读取和修改该插件已有的配置、数据、缓存及保存的凭据。',
+      dataAccessConfirm: '允许并切换',
+    },
     installSource: {
       channel: {
         builtin: '内置',

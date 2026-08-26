@@ -276,6 +276,22 @@ export default {
     hideMetrics: '隱藏效能指標',
     showSourceDetail: '顯示來源詳情',
     hideSourceDetail: '隱藏來源詳情',
+    candidates: {
+      title: '已安裝版本',
+      hint: '同一時間只執行一個版本；切換執行中的外掛時會安全重新啟動。',
+      running: '正在執行',
+      current: '目前選取',
+      invalid: '無法使用',
+      switch: '使用此版本',
+      none: '找不到已安裝版本',
+      loadFailed: '載入已安裝版本失敗',
+      switchSuccess: '外掛版本已切換',
+      switchFailed: '外掛版本切換失敗，已保留原版本',
+      dataAccessRequired: '需要存取既有資料',
+      dataAccessTitle: '允許存取外掛既有資料？',
+      dataAccessPrompt: '這個{source}版本將能夠讀取和修改該外掛既有的設定、資料、快取及儲存的憑證。',
+      dataAccessConfirm: '允許並切換',
+    },
     installSource: {
       channel: {
         builtin: '內建',

@@ -16,6 +16,60 @@ from plugin.sdk.shared.i18n import PluginI18n
 pytestmark = pytest.mark.plugin_unit
 
 
+def test_install_source_uses_the_selected_candidate_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builtin_entry = query_module.LockEntry(
+        root_id="builtin",
+        directory_name="demo",
+        plugin_id="demo",
+        channel="builtin",
+        reason="user_requested",
+        installed_at="2026-01-01T00:00:00.000000Z",
+        updated_at="2026-01-01T00:00:00.000000Z",
+        last_seen_at="2026-01-01T00:00:00.000000Z",
+    )
+    market_entry = query_module.LockEntry(
+        root_id="user",
+        directory_name="demo",
+        plugin_id="demo",
+        channel="market",
+        reason="user_requested",
+        installed_at="2026-02-01T00:00:00.000000Z",
+        updated_at="2026-02-01T00:00:00.000000Z",
+        last_seen_at="2026-02-01T00:00:00.000000Z",
+    )
+    manager = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(entries=(builtin_entry, market_entry))
+    )
+    monkeypatch.setattr(query_module, "get_install_source_manager", lambda: manager)
+    by_plugin_id, by_directory_name, by_candidate_key = (
+        query_module._install_source_index()
+    )
+    plugin_info: dict[str, object] = {
+        "selected_candidate": {
+            "root_id": "builtin",
+            "directory_name": "demo",
+            "source": "builtin",
+        }
+    }
+
+    query_module._attach_install_source(
+        plugin_info,
+        plugin_id="demo",
+        by_plugin_id=by_plugin_id,
+        by_directory_name=by_directory_name,
+        by_candidate_key=by_candidate_key,
+    )
+
+    assert plugin_info["install_source"] == {
+        "source": "builtin",
+        "reason": "user_requested",
+        "installed_at": "2026-01-01T00:00:00.000000Z",
+        "source_detail": None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_list_plugins_reports_registry_lock_timeout_as_unavailable(
     monkeypatch: pytest.MonkeyPatch,

@@ -12,6 +12,8 @@ import type {
   PluginUiContext,
   PluginUiSurface,
   PluginUiWarning,
+  PluginCandidateInventory,
+  PluginCandidateKey,
 } from '@/types/api'
 
 /**
@@ -62,6 +64,32 @@ export function refreshPluginsRegistry(config?: AxiosRequestConfig & { preserveM
 export function getPluginStatus(pluginId?: string): Promise<PluginStatusData | { plugins: Record<string, PluginStatusData> }> {
   const url = pluginId ? `/plugin/status?plugin_id=${encodeURIComponent(pluginId)}` : '/plugin/status'
   return get(url)
+}
+
+export function getPluginCandidates(pluginId: string): Promise<PluginCandidateInventory> {
+  const safeId = encodeURIComponent(pluginId)
+  return get(`/plugin/${safeId}/candidates`)
+}
+
+export function selectPluginCandidate(
+  pluginId: string,
+  candidate: PluginCandidateKey,
+  allowLegacySharedState = false,
+): Promise<{
+  success: boolean
+  plugin_id: string
+  candidate: PluginCandidateKey
+  previous_candidate: PluginCandidateKey | null
+  restarted: boolean
+  changed: boolean
+  state_scope: 'legacy_shared'
+  state_access_grant: string
+}> {
+  const safeId = encodeURIComponent(pluginId)
+  return post(`/plugin/${safeId}/candidate`, {
+    ...candidate,
+    allow_legacy_shared_state: allowLegacySharedState,
+  })
 }
 
 /**

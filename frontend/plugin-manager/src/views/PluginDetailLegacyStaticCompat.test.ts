@@ -12,6 +12,8 @@ const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
   getPlugins: vi.fn(),
   getPluginStatus: vi.fn(),
+  getPluginCandidates: vi.fn(),
+  selectPluginCandidate: vi.fn(),
 }))
 const routerMocks = vi.hoisted(() => ({
   push: vi.fn(),
@@ -23,6 +25,8 @@ vi.mock('@/api/plugins', () => ({
   getPluginUiSurfaceInfo: apiMocks.getPluginUiSurfaceInfo,
   getPlugins: apiMocks.getPlugins,
   getPluginStatus: apiMocks.getPluginStatus,
+  getPluginCandidates: apiMocks.getPluginCandidates,
+  selectPluginCandidate: apiMocks.selectPluginCandidate,
 }))
 vi.mock('@/api', () => ({ get: apiMocks.get }))
 vi.mock('@/i18n', () => ({ getLocale: () => 'en-US' }))
@@ -82,6 +86,25 @@ async function mountDetail(surfaces: PluginUiSurface[]) {
   }
   apiMocks.getPlugins.mockResolvedValue({ plugins: [plugin] })
   apiMocks.getPluginStatus.mockResolvedValue({ plugin_id: plugin.id, status: { status: 'running' } })
+  apiMocks.getPluginCandidates.mockResolvedValue({
+    plugin_id: plugin.id,
+    desired_candidate: null,
+    effective_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    registered_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    running_candidate: { root_id: 'builtin', directory_name: plugin.id },
+    selection_reason: 'auto_single',
+    candidates: [{
+      key: { root_id: 'builtin', directory_name: plugin.id },
+      source: 'builtin',
+      version: '1.0.0',
+      valid: true,
+      error: null,
+      selected: false,
+      effective: true,
+      registered: true,
+      running: true,
+    }],
+  })
 
   const container = document.createElement('div')
   document.body.appendChild(container)
@@ -116,6 +139,7 @@ async function mountDetail(surfaces: PluginUiSurface[]) {
   app.component('el-tag', passthrough)
   app.component('el-icon', passthrough)
   app.component('el-button', passthrough)
+  app.component('el-empty', passthrough)
   app.mount(container)
   for (let index = 0; index < 10; index += 1) {
     await Promise.resolve()

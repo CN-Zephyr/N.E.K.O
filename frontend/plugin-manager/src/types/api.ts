@@ -203,6 +203,38 @@ export interface PluginInstallSource {
   source_detail: PluginInstallSourceDetail
 }
 
+export type PluginCandidateRootId = 'builtin' | 'user'
+
+export interface PluginCandidateKey {
+  root_id: PluginCandidateRootId
+  directory_name: string
+}
+
+export interface PluginCandidateItem {
+  key: PluginCandidateKey
+  source: Exclude<PluginInstallSourceChannel, 'unknown'>
+  version: string
+  release_chain_id: string | null
+  state_scope: 'legacy_shared'
+  requires_shared_state_authorization: boolean
+  valid: boolean
+  error: string | null
+  selected: boolean
+  effective: boolean
+  registered: boolean
+  running: boolean
+}
+
+export interface PluginCandidateInventory {
+  plugin_id: string
+  desired_candidate: PluginCandidateKey | null
+  effective_candidate: PluginCandidateKey | null
+  registered_candidate: PluginCandidateKey | null
+  running_candidate: PluginCandidateKey | null
+  selection_reason: string
+  candidates: PluginCandidateItem[]
+}
+
 // JSON Schema（简化版），用于描述插件入口参数
 export interface JSONSchemaProperty {
   type?: string

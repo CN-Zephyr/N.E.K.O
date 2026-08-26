@@ -276,6 +276,22 @@ export default {
     hideMetrics: 'Ocultar métricas',
     showSourceDetail: 'Mostrar detalles de origen',
     hideSourceDetail: 'Ocultar detalles de origen',
+    candidates: {
+      title: 'Versiones instaladas',
+      hint: 'Solo se ejecuta una versión a la vez. Al cambiar, el plugin se reinicia de forma segura.',
+      running: 'En ejecución',
+      current: 'Seleccionada',
+      invalid: 'No disponible',
+      switch: 'Usar esta versión',
+      none: 'No se encontraron versiones instaladas',
+      loadFailed: 'No se pudieron cargar las versiones instaladas',
+      switchSuccess: 'Se cambió la versión del plugin',
+      switchFailed: 'No se pudo cambiar; se conservó la versión anterior',
+      dataAccessRequired: 'Acceso a datos existentes',
+      dataAccessTitle: '¿Permitir acceso a los datos existentes del plugin?',
+      dataAccessPrompt: 'Esta versión de origen {source} podrá leer y modificar la configuración, los datos, la caché y las credenciales guardadas del plugin.',
+      dataAccessConfirm: 'Permitir y cambiar',
+    },
     installSource: {
       channel: {
         builtin: 'Integrado',

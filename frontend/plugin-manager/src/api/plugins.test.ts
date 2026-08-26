@@ -48,6 +48,33 @@ describe('plugin hosted UI API', () => {
     ])
   })
 
+  it('uses controlled candidate endpoints for inventory and selection', async () => {
+    const { getPluginCandidates, selectPluginCandidate } = await import('./plugins')
+
+    getPluginCandidates('demo plugin')
+    selectPluginCandidate('demo plugin', {
+      root_id: 'user',
+      directory_name: 'demo-market',
+    })
+
+    expect(getMock).toHaveBeenCalledWith('/plugin/demo%20plugin/candidates')
+    expect(postMock).toHaveBeenCalledWith('/plugin/demo%20plugin/candidate', {
+      root_id: 'user',
+      directory_name: 'demo-market',
+      allow_legacy_shared_state: false,
+    })
+
+    selectPluginCandidate('demo plugin', {
+      root_id: 'user',
+      directory_name: 'demo-imported',
+    }, true)
+    expect(postMock).toHaveBeenLastCalledWith('/plugin/demo%20plugin/candidate', {
+      root_id: 'user',
+      directory_name: 'demo-imported',
+      allow_legacy_shared_state: true,
+    })
+  })
+
   it('silences initial hosted action errors while passing its timeout', async () => {
     postMock.mockResolvedValue({ ok: true })
     const { callPluginHostedSurfaceAction } = await import('./plugins')

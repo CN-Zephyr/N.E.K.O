@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -42,6 +43,12 @@ from plugin.logging_config import get_logger
 from plugin.server.domain import IO_RUNTIME_ERRORS, RUNTIME_ERRORS
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
+from plugin.server.domain.plugin_candidates import (
+    CandidateKey,
+    PluginCandidate,
+    requires_legacy_shared_state_authorization,
+    state_access_grant_for_switch,
+)
 from plugin.server.application.plugins.registry_service import PluginRegistryService
 from plugin.server.application.install_source import (
     InstallSourceError,
@@ -56,6 +63,15 @@ from plugin.server.infrastructure.runtime_overrides import (
     migrate_runtime_override,
     set_runtime_override,
 )
+from plugin.server.infrastructure.plugin_selections import (
+    PluginSelectionPersistenceError,
+    clear_plugin_selection_if_matches,
+    get_plugin_selection,
+    get_plugin_selection_record,
+    get_plugin_state_owner,
+    set_plugin_selection,
+)
+from plugin.server.infrastructure import plugin_selections as plugin_selection_store
 from plugin.server.messaging.lifecycle_events import emit_lifecycle_event
 from plugin.server.messaging.llm_tool_registry import (
     clear_plugin_tools as clear_plugin_llm_tools,
@@ -320,6 +336,152 @@ def _set_plugin_runtime_metadata_sync(
         raw_meta.pop("runtime_source_missing", None)
         state.plugins[plugin_id] = raw_meta
     state.invalidate_snapshot_cache("plugins")
+
+
+def _restore_plugin_metadata_sync(
+    plugin_id: str,
+    metadata: dict[str, object] | None,
+) -> None:
+    with state.acquire_plugins_write_lock():
+        if metadata is None:
+            state.plugins.pop(plugin_id, None)
+        else:
+            state.plugins[plugin_id] = dict(metadata)
+    state.invalidate_snapshot_cache("plugins")
+
+
+def _mark_candidate_selection_sync(
+    plugin_id: str,
+    candidate: CandidateKey,
+) -> None:
+    with state.acquire_plugins_write_lock():
+        raw_meta = state.plugins.get(plugin_id)
+        if not isinstance(raw_meta, dict):
+            return
+        selected = raw_meta.get("selected_candidate")
+        selected_payload = dict(selected) if isinstance(selected, dict) else {}
+        selected_payload["root_id"] = candidate.root_id
+        selected_payload["directory_name"] = candidate.directory_name
+        raw_meta["selected_candidate"] = selected_payload
+        raw_meta["selection_reason"] = "explicit_selection"
+        state.plugins[plugin_id] = raw_meta
+    state.invalidate_snapshot_cache("plugins")
+
+
+def _candidate_key_from_payload(raw: object) -> CandidateKey | None:
+    if not isinstance(raw, Mapping):
+        return None
+    root_id = raw.get("root_id")
+    directory_name = raw.get("directory_name")
+    if root_id not in {"builtin", "user"} or not isinstance(directory_name, str):
+        return None
+    if not directory_name or directory_name in {".", ".."}:
+        return None
+    if "/" in directory_name or "\\" in directory_name:
+        return None
+    return CandidateKey(root_id=root_id, directory_name=directory_name)
+
+
+def _candidate_key_payload(candidate: CandidateKey | None) -> dict[str, str] | None:
+    if candidate is None:
+        return None
+    return {
+        "root_id": candidate.root_id,
+        "directory_name": candidate.directory_name,
+    }
+
+
+def _candidate_identity_from_payload(
+    plugin_id: str,
+    candidate: CandidateKey,
+    payload: Mapping[str, object],
+) -> PluginCandidate:
+    raw_source = payload.get("source")
+    source = (
+        raw_source
+        if raw_source in {"builtin", "manual", "imported", "market"}
+        else ("builtin" if candidate.root_id == "builtin" else "manual")
+    )
+    raw_release_chain_id = payload.get("release_chain_id")
+    release_chain_id = (
+        raw_release_chain_id.strip()
+        if isinstance(raw_release_chain_id, str) and raw_release_chain_id.strip()
+        else None
+    )
+    return PluginCandidate(
+        key=candidate,
+        plugin_id=plugin_id,
+        config_path=Path("."),
+        version=str(payload.get("version") or ""),
+        source=source,
+        release_chain_id=release_chain_id,
+    )
+
+
+def _candidate_identity_from_state(
+    plugin_id: str,
+    candidate: CandidateKey | None,
+    candidate_state: Mapping[str, object],
+) -> PluginCandidate | None:
+    if candidate is None:
+        return None
+    raw_candidates = candidate_state.get("candidates")
+    if isinstance(raw_candidates, list):
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, Mapping):
+                continue
+            if _candidate_key_from_payload(raw_candidate.get("key")) == candidate:
+                return _candidate_identity_from_payload(
+                    plugin_id,
+                    candidate,
+                    raw_candidate,
+                )
+    return _candidate_identity_from_payload(plugin_id, candidate, {})
+
+
+def _candidate_identity_from_selection_record(
+    plugin_id: str,
+    selection: object,
+) -> PluginCandidate | None:
+    candidate = getattr(selection, "candidate", None)
+    if not isinstance(candidate, CandidateKey):
+        return None
+    source = getattr(selection, "candidate_source", None)
+    if source not in {"builtin", "manual", "imported", "market"}:
+        source = "builtin" if candidate.root_id == "builtin" else "manual"
+    release_chain_id = getattr(selection, "release_chain_id", None)
+    return _candidate_identity_from_payload(
+        plugin_id,
+        candidate,
+        {
+            "source": source,
+            "release_chain_id": release_chain_id,
+        },
+    )
+
+
+def _candidate_switch_error(
+    *,
+    plugin_id: str,
+    candidate: CandidateKey,
+    cause: BaseException,
+    rollback_status: str,
+    rollback_errors: list[str] | None = None,
+) -> ServerDomainError:
+    cause_code = cause.code if isinstance(cause, ServerDomainError) else None
+    return ServerDomainError(
+        code="PLUGIN_CANDIDATE_SWITCH_FAILED",
+        message=f"Plugin '{plugin_id}' could not switch to the selected candidate",
+        status_code=500,
+        details={
+            "plugin_id": plugin_id,
+            "candidate": _candidate_key_payload(candidate),
+            "cause_code": cause_code,
+            "error_type": type(cause).__name__,
+            "rollback_status": rollback_status,
+            "rollback_errors": list(rollback_errors or ()),
+        },
+    )
 
 
 def _get_plugin_config_path(plugin_id: str) -> Path | None:
@@ -978,6 +1140,325 @@ async def _start_host_with_timeout(
 
 
 class PluginLifecycleService:
+    @serialized_plugin_operation
+    async def switch_plugin_candidate(
+        self,
+        plugin_id: str,
+        candidate: CandidateKey,
+        *,
+        allow_legacy_shared_state: bool = False,
+    ) -> dict[str, object]:
+        """Atomically move one logical plugin to another installed candidate.
+
+        The old process remains available during target validation.  Durable
+        selection is the commit record and is therefore written only after the
+        target metadata has been applied and, when needed, its process has
+        started successfully.
+        """
+
+        candidate_state = await plugin_registry_service.list_plugin_candidates(
+            plugin_id
+        )
+        normalized_plugin_id = str(candidate_state["plugin_id"])
+        registered_candidate = _candidate_key_from_payload(
+            candidate_state.get("registered_candidate")
+        )
+        running_candidate = _candidate_key_from_payload(
+            candidate_state.get("running_candidate")
+        )
+        previous_selection = await asyncio.to_thread(
+            get_plugin_selection,
+            normalized_plugin_id,
+        )
+        previous_selection_record = await asyncio.to_thread(
+            get_plugin_selection_record,
+            normalized_plugin_id,
+        )
+        state_owner_record = await asyncio.to_thread(
+            get_plugin_state_owner,
+            normalized_plugin_id,
+        )
+        previous_metadata = await asyncio.to_thread(
+            _get_plugin_meta_sync,
+            normalized_plugin_id,
+        )
+        previous_host = await asyncio.to_thread(
+            _get_plugin_host_sync,
+            normalized_plugin_id,
+        )
+        was_running = (
+            isinstance(previous_host, PluginHostContract)
+            and previous_host.is_alive()
+        )
+        previous_candidate = (
+            running_candidate
+            if was_running and running_candidate is not None
+            else registered_candidate
+        )
+
+        _emit_lifecycle_event(
+            event_type="plugin_candidate_switch_requested",
+            plugin_id=normalized_plugin_id,
+        )
+        validation = await plugin_registry_service.validate_plugin_candidate(
+            normalized_plugin_id,
+            candidate,
+        )
+        target_identity = _candidate_identity_from_payload(
+            normalized_plugin_id,
+            candidate,
+            validation,
+        )
+        previous_identity = _candidate_identity_from_selection_record(
+            normalized_plugin_id,
+            state_owner_record,
+        )
+        if previous_identity is None:
+            previous_identity = _candidate_identity_from_selection_record(
+                normalized_plugin_id,
+                previous_selection_record,
+            )
+        if previous_identity is None:
+            registered_identity = _candidate_identity_from_state(
+                normalized_plugin_id,
+                previous_candidate,
+                candidate_state,
+            )
+            if registered_identity is not None and registered_identity.source == "builtin":
+                previous_identity = registered_identity
+        shared_state_exists = bool(
+            previous_identity is None
+            and target_identity.source != "builtin"
+            and await asyncio.to_thread(
+                plugin_selection_store.legacy_shared_state_exists,
+                normalized_plugin_id,
+            )
+        )
+        current_selection_grant_applies = (
+            previous_selection_record is not None
+            and previous_selection_record.candidate == candidate
+            and previous_selection_record.has_state_access_grant
+            and previous_selection_record.candidate_source == target_identity.source
+            and (
+                target_identity.source != "market"
+                or (
+                    bool(target_identity.release_chain_id)
+                    and previous_selection_record.release_chain_id
+                    == target_identity.release_chain_id
+                )
+            )
+        )
+        trusted_owner_chain_applies = bool(
+            state_owner_record is not None
+            and state_owner_record.has_state_access_grant
+            and state_owner_record.candidate_source == "market"
+            and target_identity.source == "market"
+            and target_identity.release_chain_id
+            and state_owner_record.release_chain_id
+            == target_identity.release_chain_id
+        )
+        existing_grant_applies = (
+            current_selection_grant_applies or trusted_owner_chain_applies
+        )
+        authorization_required = (
+            not existing_grant_applies
+            and target_identity.source != "builtin"
+            and (
+                (
+                    previous_identity is None
+                    and shared_state_exists
+                )
+                or requires_legacy_shared_state_authorization(
+                    previous_identity,
+                    target_identity,
+                )
+            )
+        )
+        if authorization_required and not allow_legacy_shared_state:
+            raise ServerDomainError(
+                code="PLUGIN_SHARED_STATE_AUTHORIZATION_REQUIRED",
+                message=(
+                    f"Candidate for plugin '{normalized_plugin_id}' needs explicit "
+                    "permission to use this plugin's existing config, data, and cache"
+                ),
+                status_code=409,
+                details={
+                    "plugin_id": normalized_plugin_id,
+                    "candidate": _candidate_key_payload(candidate),
+                    "source": target_identity.source,
+                    "state_scope": "legacy_shared",
+                },
+            )
+        if current_selection_grant_applies:
+            state_access_grant = previous_selection_record.state_access_grant
+            authorized_at = previous_selection_record.authorized_at
+        elif trusted_owner_chain_applies:
+            state_access_grant = "trusted_market_chain"
+            authorized_at = None
+        elif previous_identity is None and shared_state_exists:
+            state_access_grant = "user_authorized"
+            authorized_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        else:
+            state_access_grant = state_access_grant_for_switch(
+                previous_identity,
+                target_identity,
+                user_authorized=allow_legacy_shared_state,
+            )
+            authorized_at = (
+                datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                if state_access_grant == "user_authorized"
+                else None
+            )
+        if was_running and validation.get("runtime_enabled") is False:
+            raise ServerDomainError(
+                code="PLUGIN_CANDIDATE_NOT_STARTABLE",
+                message=(
+                    f"Candidate for plugin '{normalized_plugin_id}' is disabled and "
+                    "cannot replace a running candidate"
+                ),
+                status_code=409,
+                details={
+                    "plugin_id": normalized_plugin_id,
+                    "candidate": _candidate_key_payload(candidate),
+                },
+            )
+
+        if previous_candidate == candidate:
+            try:
+                await asyncio.to_thread(
+                    set_plugin_selection,
+                    normalized_plugin_id,
+                    candidate,
+                    candidate_source=target_identity.source,
+                    state_access_grant=state_access_grant,
+                    release_chain_id=target_identity.release_chain_id,
+                    authorized_at=authorized_at,
+                )
+            except PluginSelectionPersistenceError as exc:
+                raise _candidate_switch_error(
+                    plugin_id=normalized_plugin_id,
+                    candidate=candidate,
+                    cause=exc,
+                    rollback_status="not_needed",
+                ) from exc
+            await asyncio.to_thread(
+                _mark_candidate_selection_sync,
+                normalized_plugin_id,
+                candidate,
+            )
+            _emit_lifecycle_event(
+                event_type="plugin_candidate_switched",
+                plugin_id=normalized_plugin_id,
+            )
+            return {
+                "success": True,
+                "plugin_id": normalized_plugin_id,
+                "candidate": _candidate_key_payload(candidate),
+                "previous_candidate": _candidate_key_payload(previous_candidate),
+                "restarted": False,
+                "changed": previous_selection != candidate,
+                "state_scope": "legacy_shared",
+                "state_access_grant": state_access_grant,
+            }
+
+        old_process_stopped = False
+        target_metadata_applied = False
+        try:
+            if was_running:
+                await self.stop_plugin(normalized_plugin_id)
+                old_process_stopped = True
+
+            await plugin_registry_service.refresh_plugin(
+                normalized_plugin_id,
+                transient_candidate=candidate,
+            )
+            target_metadata_applied = True
+            if was_running:
+                await self.start_plugin(
+                    normalized_plugin_id,
+                    refresh_registry=False,
+                )
+
+            await asyncio.to_thread(
+                set_plugin_selection,
+                normalized_plugin_id,
+                candidate,
+                candidate_source=target_identity.source,
+                state_access_grant=state_access_grant,
+                release_chain_id=target_identity.release_chain_id,
+                authorized_at=authorized_at,
+            )
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            if target_metadata_applied:
+                current_host = await asyncio.to_thread(
+                    _get_plugin_host_sync,
+                    normalized_plugin_id,
+                )
+                if current_host is not None:
+                    try:
+                        await self.stop_plugin(normalized_plugin_id)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(
+                            f"stop_target:{type(rollback_exc).__name__}"
+                        )
+
+            try:
+                await asyncio.to_thread(
+                    _restore_plugin_metadata_sync,
+                    normalized_plugin_id,
+                    previous_metadata,
+                )
+            except Exception as rollback_exc:
+                rollback_errors.append(
+                    f"restore_metadata:{type(rollback_exc).__name__}"
+                )
+
+            if was_running and old_process_stopped:
+                try:
+                    await self.start_plugin(
+                        normalized_plugin_id,
+                        refresh_registry=False,
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        f"restart_previous:{type(rollback_exc).__name__}"
+                    )
+
+            rollback_status = "completed" if not rollback_errors else "incomplete"
+            _emit_lifecycle_event(
+                event_type="plugin_candidate_switch_failed",
+                plugin_id=normalized_plugin_id,
+                data={"rollback_status": rollback_status},
+            )
+            raise _candidate_switch_error(
+                plugin_id=normalized_plugin_id,
+                candidate=candidate,
+                cause=exc,
+                rollback_status=rollback_status,
+                rollback_errors=rollback_errors,
+            ) from exc
+
+        await asyncio.to_thread(
+            _mark_candidate_selection_sync,
+            normalized_plugin_id,
+            candidate,
+        )
+        _emit_lifecycle_event(
+            event_type="plugin_candidate_switched",
+            plugin_id=normalized_plugin_id,
+        )
+        return {
+            "success": True,
+            "plugin_id": normalized_plugin_id,
+            "candidate": _candidate_key_payload(candidate),
+            "previous_candidate": _candidate_key_payload(previous_candidate),
+            "restarted": was_running,
+            "changed": True,
+            "state_scope": "legacy_shared",
+            "state_access_grant": state_access_grant,
+        }
+
     async def start_plugin(
         self,
         plugin_id: str,
@@ -1640,6 +2121,7 @@ class PluginLifecycleService:
             await self.stop_plugin(plugin_id)
 
         staged_profile: _StagedPackageProfile | None = None
+        selection_warning: str | None = None
         try:
             staged_profile = await asyncio.to_thread(
                 _stage_orphaned_package_profile_sync,
@@ -1672,6 +2154,33 @@ class PluginLifecycleService:
             await asyncio.to_thread(_remove_event_handlers_sync, plugin_id)
             await asyncio.to_thread(_remove_plugin_metadata_sync, plugin_id)
             await asyncio.to_thread(clear_runtime_override, plugin_id)
+            selected_candidate = plugin_meta.get("selected_candidate")
+            if isinstance(selected_candidate, Mapping):
+                root_id = selected_candidate.get("root_id")
+                directory_name = selected_candidate.get("directory_name")
+                if (
+                    root_id in {"builtin", "user"}
+                    and isinstance(directory_name, str)
+                    and directory_name
+                ):
+                    try:
+                        await asyncio.to_thread(
+                            clear_plugin_selection_if_matches,
+                            plugin_id,
+                            CandidateKey(
+                                root_id=root_id,
+                                directory_name=directory_name,
+                            ),
+                        )
+                    except PluginSelectionPersistenceError as exc:
+                        selection_warning = (
+                            "plugin deleted, but its candidate selection could not be cleared"
+                        )
+                        logger.warning(
+                            "delete_plugin: candidate selection cleanup failed for plugin_id={}: {}",
+                            plugin_id,
+                            exc,
+                        )
             await plugin_registry_service.refresh_registry()
         except ServerDomainError:
             raise
@@ -1726,6 +2235,8 @@ class PluginLifecycleService:
             "deleted_from_disk": deleted_from_disk,
             "message": "Plugin deleted successfully",
         }
+        if selection_warning is not None:
+            response["selection_warning"] = selection_warning
         return response
 
     async def retry_deferred_profile_cleanup(self) -> int:

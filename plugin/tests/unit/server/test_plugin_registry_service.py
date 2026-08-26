@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from plugin.server.application.plugins import registry_service as module
-from plugin.server.infrastructure import runtime_overrides
+from plugin.server.domain.plugin_candidates import CandidateKey
+from plugin.server.infrastructure import plugin_selections, runtime_overrides
 
 
 pytestmark = pytest.mark.plugin_unit
@@ -649,7 +650,7 @@ async def test_refresh_plugin_marks_missing_simple_plugin_dependency_failed(
 
 
 @pytest.mark.asyncio
-async def test_refresh_registry_registers_duplicate_declared_plugin_ids_with_runtime_suffix(
+async def test_refresh_registry_groups_duplicate_declared_ids_and_registers_one_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -701,30 +702,241 @@ async def test_refresh_registry_registers_duplicate_declared_plugin_ids_with_run
         service = module.PluginRegistryService()
         result = await service.refresh_registry()
         second_result = await service.refresh_registry()
-        refreshed_duplicate = await service.refresh_plugin("demo_1")
+        refreshed = await service.refresh_plugin("demo")
 
         assert result["success"] is True
         assert result["failed"] == []
-        assert result["added"] == ["demo", "demo_1"]
+        assert result["added"] == ["demo"]
+        assert result["scanned_count"] == 2
+        assert result["selected_count"] == 1
         assert second_result["success"] is True
         assert second_result["failed"] == []
         assert second_result["added"] == []
-        assert second_result["unchanged"] == ["demo", "demo_1"]
-        assert refreshed_duplicate["success"] is True
-        assert refreshed_duplicate["plugin_id"] == "demo_1"
-        assert refreshed_duplicate["status"] == "unchanged"
+        assert second_result["unchanged"] == ["demo"]
+        assert refreshed["success"] is True
+        assert refreshed["plugin_id"] == "demo"
+        assert refreshed["status"] == "unchanged"
 
         with module.state.acquire_plugins_read_lock():
-            first_meta = dict(module.state.plugins["demo"])
-            second_meta = dict(module.state.plugins["demo_1"])
+            plugin_meta = dict(module.state.plugins["demo"])
 
-        assert Path(first_meta["config_path"]).parent.name == "demo"
-        assert Path(second_meta["config_path"]).parent.name == "demo_1"
-        assert first_meta["id"] == "demo"
-        assert second_meta["id"] == "demo_1"
+        assert set(module.state.plugins) == {"demo"}
+        assert Path(plugin_meta["config_path"]).parent.name == "demo"
+        assert plugin_meta["id"] == "demo"
+        assert plugin_meta["available_candidate_count"] == 2
+        assert plugin_meta["selection_reason"] == "auto_canonical_directory"
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()
             module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.asyncio
+async def test_refresh_registry_imports_only_the_resolved_candidate_and_persists_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    builtin_config = _write_package_plugin_fixture(
+        builtin_root,
+        "demo",
+    )
+    user_config = _write_package_plugin_fixture(
+        user_root,
+        "demo",
+    )
+    imported_paths: list[Path] = []
+
+    class _DemoPlugin:
+        pass
+
+    def _fake_import(_module_path: str, config_path: Path, _logger):
+        imported_paths.append(config_path.resolve())
+        return type("_Module", (), {"DemoPlugin": _DemoPlugin})
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+        monkeypatch.setattr(
+            module,
+            "PLUGIN_CONFIG_ROOTS",
+            (builtin_root, user_root),
+        )
+        monkeypatch.setattr(module, "_import_plugin_module", _fake_import)
+
+        first = await module.PluginRegistryService().refresh_registry()
+
+        assert first["success"] is True
+        assert first["scanned_count"] == 2
+        assert first["selected_count"] == 1
+        assert imported_paths == [builtin_config.resolve()]
+        with module.state.acquire_plugins_read_lock():
+            builtin_meta = dict(module.state.plugins["demo"])
+        assert builtin_meta["selected_candidate"]["root_id"] == "builtin"
+        assert builtin_meta["selected_candidate"]["source"] == "builtin"
+
+        plugin_selections.set_plugin_selection(
+            "demo",
+            CandidateKey(root_id="user", directory_name="demo"),
+            candidate_source="manual",
+            state_access_grant="user_authorized",
+            authorized_at="2026-08-26T07:00:00Z",
+        )
+        plugin_selections.reset_cache_for_testing()
+        imported_paths.clear()
+
+        second = await module.PluginRegistryService().refresh_registry()
+
+        assert second["success"] is True
+        assert imported_paths == [user_config.resolve()]
+        with module.state.acquire_plugins_read_lock():
+            user_meta = dict(module.state.plugins["demo"])
+        assert Path(user_meta["config_path"]).resolve() == user_config.resolve()
+        assert user_meta["selection_reason"] == "explicit_selection"
+        assert user_meta["selected_candidate"]["root_id"] == "user"
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_legacy_external_selection_without_state_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_plugin_candidate_selections: dict[str, object],
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    builtin_config = _write_package_plugin_fixture(builtin_root, "demo")
+    _write_package_plugin_fixture(user_root, "demo")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    class _DemoPlugin:
+        pass
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    monkeypatch.setattr(
+        module,
+        "_import_plugin_module",
+        lambda *_args, **_kwargs: type("_Module", (), {"DemoPlugin": _DemoPlugin}),
+    )
+    _isolate_plugin_candidate_selections.clear()
+    _isolate_plugin_candidate_selections.update(
+        {
+            "schema_version": 1,
+            "selections": {
+                "demo": {"root_id": "user", "directory_name": "demo"}
+            },
+        }
+    )
+    plugin_selections.reset_cache_for_testing()
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+
+        result = await module.PluginRegistryService().refresh_registry()
+
+        assert result["success"] is True
+        with module.state.acquire_plugins_read_lock():
+            metadata = dict(module.state.plugins["demo"])
+        assert Path(metadata["config_path"]).resolve() == builtin_config.resolve()
+        assert metadata["selection_reason"] == "state_authorization_required"
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.asyncio
+async def test_refresh_registry_does_not_treat_running_candidate_as_override_or_switch_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    builtin_config = _write_package_plugin_fixture(builtin_root, "demo")
+    user_config = _write_package_plugin_fixture(user_root, "demo")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    class _DemoPlugin:
+        pass
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    monkeypatch.setattr(
+        module,
+        "_import_plugin_module",
+        lambda *_args, **_kwargs: type("_Module", (), {"DemoPlugin": _DemoPlugin}),
+    )
+
+    try:
+        plugin_selections.set_plugin_selection(
+            "demo",
+            CandidateKey(root_id="user", directory_name="demo"),
+            candidate_source="manual",
+            state_access_grant="user_authorized",
+            authorized_at="2026-08-26T07:00:00Z",
+        )
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["demo"] = {
+                "id": "demo",
+                "config_path": str(builtin_config.resolve()),
+                "selected_candidate": {
+                    "root_id": "builtin",
+                    "directory_name": "demo",
+                },
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["demo"] = _AliveHost()
+
+        candidates = await module.PluginRegistryService().list_plugin_candidates("demo")
+        result = await module.PluginRegistryService().refresh_registry()
+
+        assert candidates["effective_candidate"] == {
+            "root_id": "user",
+            "directory_name": "demo",
+        }
+        assert candidates["running_candidate"] == {
+            "root_id": "builtin",
+            "directory_name": "demo",
+        }
+        assert result["success"] is False
+        assert result["failed"] == [
+            {
+                "plugin_id": "demo",
+                "config_path": str(user_config.resolve()),
+                "error": (
+                    "running plugin candidate can only change through "
+                    "the lifecycle switch operation"
+                ),
+            }
+        ]
+        with module.state.acquire_plugins_read_lock():
+            assert Path(module.state.plugins["demo"]["config_path"]).resolve() == builtin_config.resolve()
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup

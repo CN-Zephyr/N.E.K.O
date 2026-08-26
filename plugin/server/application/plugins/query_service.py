@@ -82,20 +82,23 @@ def _install_source_api_view(entry: LockEntry | None) -> dict[str, object | None
 def _install_source_index() -> tuple[
     dict[str, LockEntry],
     dict[str, LockEntry],
+    dict[tuple[str, str], LockEntry],
 ]:
     mgr = get_install_source_manager()
     if mgr is None:
-        return {}, {}
+        return {}, {}, {}
     snapshot = mgr.snapshot()
     by_plugin_id: dict[str, LockEntry] = {}
     by_directory_name: dict[str, LockEntry] = {}
+    by_candidate_key: dict[tuple[str, str], LockEntry] = {}
     for entry in snapshot.entries:
         if entry.removed:
             continue
         by_directory_name[entry.directory_name] = entry
+        by_candidate_key[(entry.root_id, entry.directory_name)] = entry
         if entry.plugin_id:
             by_plugin_id[entry.plugin_id] = entry
-    return by_plugin_id, by_directory_name
+    return by_plugin_id, by_directory_name, by_candidate_key
 
 
 def _attach_install_source(
@@ -104,7 +107,21 @@ def _attach_install_source(
     plugin_id: str,
     by_plugin_id: Mapping[str, LockEntry],
     by_directory_name: Mapping[str, LockEntry],
+    by_candidate_key: Mapping[tuple[str, str], LockEntry],
 ) -> None:
+    selected_candidate = plugin_info.get("selected_candidate")
+    if isinstance(selected_candidate, Mapping):
+        root_id = selected_candidate.get("root_id")
+        directory_name = selected_candidate.get("directory_name")
+        if isinstance(root_id, str) and isinstance(directory_name, str):
+            entry = by_candidate_key.get((root_id, directory_name))
+            source_view = _install_source_api_view(entry)
+            selected_source = selected_candidate.get("source")
+            if entry is None and isinstance(selected_source, str):
+                source_view["source"] = selected_source
+            plugin_info["install_source"] = source_view
+            return
+
     entry = by_plugin_id.get(plugin_id) or by_directory_name.get(plugin_id)
     plugin_info["install_source"] = _install_source_api_view(entry)
 
@@ -486,7 +503,11 @@ def _build_plugin_list_sync(locale: str | None = None) -> list[dict[str, object]
         except Exception:
             pass
 
-    install_source_by_plugin_id, install_source_by_directory_name = _install_source_index()
+    (
+        install_source_by_plugin_id,
+        install_source_by_directory_name,
+        install_source_by_candidate_key,
+    ) = _install_source_index()
 
     for plugin_id_obj, plugin_meta_obj in plugins_snapshot.items():
         if not isinstance(plugin_id_obj, str):
@@ -538,6 +559,7 @@ def _build_plugin_list_sync(locale: str | None = None) -> list[dict[str, object]
                 plugin_id=plugin_id,
                 by_plugin_id=install_source_by_plugin_id,
                 by_directory_name=install_source_by_directory_name,
+                by_candidate_key=install_source_by_candidate_key,
             )
             result.append(plugin_info)
         except ServerDomainError as exc:

@@ -628,6 +628,70 @@ async def test_install_happy_path_writes_v2_lock_entry(
 
 
 @pytest.mark.asyncio
+async def test_fresh_install_with_legacy_state_stays_pending_for_data_consent(
+    bridge_e2e_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A code-free legacy state directory is not a brand-new identity."""
+
+    from plugin.server.infrastructure import plugin_selections
+
+    plugin_id = "e2e_legacy_state"
+    version = "1.0.0"
+    state_root = tmp_path / "runtime-state" / "plugins"
+    (state_root / plugin_id / "data").mkdir(parents=True)
+    monkeypatch.setattr(
+        plugin_selections,
+        "legacy_shared_state_exists",
+        lambda candidate_plugin_id: (state_root / candidate_plugin_id).exists(),
+    )
+    zip_bytes, payload_hash = _build_neko_plugin_zip(
+        plugin_id=plugin_id,
+        version=version,
+    )
+    package_sha256 = hashlib.sha256(zip_bytes).hexdigest()
+    client: AsyncClient = bridge_e2e_env["client"]
+    token: str = bridge_e2e_env["token"]
+
+    with _serve_bytes(
+        filename=f"{plugin_id}-{version}.neko-plugin",
+        content=zip_bytes,
+    ) as package_url:
+        response = await client.post(
+            f"/market/install?token={token}",
+            json={
+                "package_url": package_url,
+                "package_sha256": package_sha256,
+                "payload_hash": payload_hash,
+                "plugin_id": plugin_id,
+                "version": version,
+                "channel": "stable",
+                "mode": "install",
+                "on_conflict": "fail",
+            },
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+
+        deadline = time.monotonic() + 30
+        final_status: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            poll = await client.get(f"/market/tasks/{task_id}?token={token}")
+            body = poll.json()
+            if body["status"] in ("completed", "failed"):
+                final_status = body
+                break
+            await asyncio.sleep(0.05)
+
+    assert final_status is not None
+    assert final_status["status"] == "completed", final_status
+    assert final_status["result"]["candidate_selection_required"] is True
+    assert plugin_selections.get_plugin_selection(plugin_id) is None
+    assert plugin_selections.get_plugin_state_owner(plugin_id) is None
+
+
+@pytest.mark.asyncio
 async def test_installed_endpoint_projects_latest_install_source(
     bridge_e2e_env: dict[str, Any],
 ) -> None:

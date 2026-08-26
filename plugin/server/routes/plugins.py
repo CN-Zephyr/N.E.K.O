@@ -1,9 +1,10 @@
 """
 插件管理路由
 """
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field, field_validator
 
 from plugin.logging_config import get_logger
 from plugin.server.application.plugins import (
@@ -12,6 +13,7 @@ from plugin.server.application.plugins import (
     PluginRegistryService,
 )
 from plugin.server.domain.errors import ServerDomainError
+from plugin.server.domain.plugin_candidates import CandidateKey
 from plugin.server.infrastructure.auth import require_admin
 from plugin.server.infrastructure.error_mapping import raise_http_from_domain
 from plugin.server.lifecycle import ensure_plugin_messaging_started
@@ -21,6 +23,22 @@ logger = get_logger("server.routes.plugins")
 query_service = PluginQueryService()
 lifecycle_service = PluginLifecycleService()
 registry_service = PluginRegistryService()
+
+
+class PluginCandidateSelectionRequest(BaseModel):
+    root_id: Literal["builtin", "user"]
+    directory_name: str = Field(
+        min_length=1,
+        pattern=r"^[^/\\]+$",
+    )
+    allow_legacy_shared_state: bool = False
+
+    @field_validator("directory_name")
+    @classmethod
+    def validate_directory_name(cls, value: str) -> str:
+        if value in {".", ".."}:
+            raise ValueError("directory_name must name one plugin directory")
+        return value
 
 
 @router.get("/plugin/status")
@@ -34,6 +52,33 @@ async def plugin_status(plugin_id: Optional[str] = Query(default=None)) -> dict[
 async def list_plugins(locale: Optional[str] = Query(default=None)) -> dict[str, object]:
     try:
         return await query_service.list_plugins(locale=locale)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.get("/plugin/{plugin_id}/candidates")
+async def list_plugin_candidates_endpoint(plugin_id: str) -> dict[str, object]:
+    try:
+        return await registry_service.list_plugin_candidates(plugin_id)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.post("/plugin/{plugin_id}/candidate")
+async def select_plugin_candidate_endpoint(
+    plugin_id: str,
+    payload: PluginCandidateSelectionRequest,
+    _: str = require_admin,
+) -> dict[str, object]:
+    try:
+        return await lifecycle_service.switch_plugin_candidate(
+            plugin_id,
+            CandidateKey(
+                root_id=payload.root_id,
+                directory_name=payload.directory_name,
+            ),
+            allow_legacy_shared_state=payload.allow_legacy_shared_state,
+        )
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 
