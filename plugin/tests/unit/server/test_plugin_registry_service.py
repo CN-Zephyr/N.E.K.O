@@ -809,6 +809,47 @@ async def test_refresh_registry_imports_only_the_resolved_candidate_and_persists
 
 
 @pytest.mark.asyncio
+async def test_plan_selected_candidate_removal_resolves_builtin_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    _write_package_plugin_fixture(builtin_root, "demo")
+    _write_package_plugin_fixture(user_root, "demo-market", plugin_id="demo")
+    selected = CandidateKey(root_id="user", directory_name="demo-market")
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    plugin_selections.set_plugin_selection(
+        "demo",
+        selected,
+        candidate_source="manual",
+        state_access_grant="user_authorized",
+        authorized_at="2026-08-26T07:00:00Z",
+    )
+
+    plan = await module.PluginRegistryService().plan_plugin_candidate_removal(
+        "demo",
+        selected,
+    )
+
+    assert plan == {
+        "plugin_id": "demo",
+        "removed_candidate": {
+            "root_id": "user",
+            "directory_name": "demo-market",
+        },
+        "fallback_candidate": {
+            "root_id": "builtin",
+            "directory_name": "demo",
+        },
+        "fallback_reason": "fallback_builtin",
+    }
+    assert plugin_selections.get_plugin_selection("demo") == selected
+
+
+@pytest.mark.asyncio
 async def test_restart_rejects_legacy_external_selection_without_state_grant(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

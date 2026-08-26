@@ -33,6 +33,7 @@ from plugin.server.domain.plugin_candidates import (
     PluginCandidate,
     PluginInventory,
     PluginResolution,
+    inventory_without_candidate,
     requires_legacy_shared_state_authorization,
     resolve_plugin_candidate,
 )
@@ -381,11 +382,17 @@ def _resolve_inventory_sync(
     inventory: PluginInventory,
     *,
     transient_candidates: Mapping[str, CandidateKey] | None = None,
+    desired_candidates: Mapping[str, CandidateKey] | None = None,
 ) -> dict[str, PluginResolution]:
     transient = transient_candidates or {}
+    desired_overrides = desired_candidates or {}
     resolutions: dict[str, PluginResolution] = {}
     for plugin_id in inventory.plugin_ids:
-        desired = get_plugin_selection(plugin_id)
+        desired = (
+            desired_overrides[plugin_id]
+            if plugin_id in desired_overrides
+            else get_plugin_selection(plugin_id)
+        )
         state_owner = get_plugin_state_owner(plugin_id)
         transient_candidate = transient.get(plugin_id)
         resolution = resolve_plugin_candidate(
@@ -895,6 +902,17 @@ class PluginRegistryService:
     ) -> dict[str, object]:
         return await asyncio.to_thread(
             self._validate_plugin_candidate_sync,
+            plugin_id,
+            candidate_key,
+        )
+
+    async def plan_plugin_candidate_removal(
+        self,
+        plugin_id: str,
+        candidate_key: CandidateKey,
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self._plan_plugin_candidate_removal_sync,
             plugin_id,
             candidate_key,
         )
@@ -1422,6 +1440,60 @@ class PluginRegistryService:
             "state_scope": "legacy_shared",
             "valid": True,
             "runtime_enabled": record.meta_payload.get("runtime_enabled") is not False,
+        }
+
+    def _plan_plugin_candidate_removal_sync(
+        self,
+        plugin_id: str,
+        candidate_key: CandidateKey,
+    ) -> dict[str, object]:
+        """Resolve the post-removal candidate without touching disk or runtime."""
+
+        normalized_plugin_id = _normalize_plugin_id(plugin_id)
+        scan = _scan_plugin_inventory_sync(_plugin_config_roots())
+        target = next(
+            (
+                candidate
+                for candidate in scan.inventory.for_plugin(normalized_plugin_id)
+                if candidate.key == candidate_key
+            ),
+            None,
+        )
+        if target is None:
+            raise ServerDomainError(
+                code="PLUGIN_CANDIDATE_NOT_FOUND",
+                message=f"Candidate for plugin '{normalized_plugin_id}' was not found",
+                status_code=404,
+                details={
+                    "plugin_id": normalized_plugin_id,
+                    "candidate": _candidate_key_payload(candidate_key),
+                },
+            )
+
+        remaining = inventory_without_candidate(
+            scan.inventory,
+            normalized_plugin_id,
+            candidate_key,
+        )
+        if normalized_plugin_id in remaining.plugin_ids:
+            resolution = _resolve_inventory_sync(
+                remaining,
+                desired_candidates={normalized_plugin_id: candidate_key},
+            )[normalized_plugin_id]
+        else:
+            resolution = resolve_plugin_candidate(
+                remaining,
+                normalized_plugin_id,
+                desired_candidate=candidate_key,
+            )
+
+        return {
+            "plugin_id": normalized_plugin_id,
+            "removed_candidate": _candidate_key_payload(candidate_key),
+            "fallback_candidate": _candidate_key_payload(
+                resolution.candidate.key if resolution.candidate is not None else None
+            ),
+            "fallback_reason": resolution.reason,
         }
 
     def _order_plugin_ids_sync(self, plugin_ids: list[str]) -> list[str]:

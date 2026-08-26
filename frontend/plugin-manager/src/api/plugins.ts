@@ -68,7 +68,7 @@ export function getPluginStatus(pluginId?: string): Promise<PluginStatusData | {
 
 export function getPluginCandidates(pluginId: string): Promise<PluginCandidateInventory> {
   const safeId = encodeURIComponent(pluginId)
-  return get(`/plugin/${safeId}/candidates`)
+  return get(`/plugin/${safeId}/candidates`, { suppressErrorMessage: true })
 }
 
 export function selectPluginCandidate(
@@ -89,7 +89,7 @@ export function selectPluginCandidate(
   return post(`/plugin/${safeId}/candidate`, {
     ...candidate,
     allow_legacy_shared_state: allowLegacySharedState,
-  })
+  }, { suppressErrorMessage: true })
 }
 
 /**
@@ -145,6 +145,8 @@ export function deletePlugin(pluginId: string): Promise<{
   plugin_id: string
   plugin_dir: string
   deleted_from_disk: boolean
+  fallback_candidate?: PluginCandidateKey | null
+  fallback_started?: boolean
   message: string
 }> {
   const safeId = encodeURIComponent(pluginId)

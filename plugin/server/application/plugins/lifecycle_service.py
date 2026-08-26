@@ -2117,7 +2117,43 @@ class PluginLifecycleService:
             )
 
         is_running = await asyncio.to_thread(_plugin_is_running_sync, plugin_id)
-        if is_running:
+        removed_candidate = _candidate_key_from_payload(
+            plugin_meta.get("selected_candidate")
+        )
+        fallback_candidate: CandidateKey | None = None
+        fallback_switched = False
+        available_candidate_count = plugin_meta.get("available_candidate_count")
+        if (
+            removed_candidate is not None
+            and isinstance(available_candidate_count, int)
+            and not isinstance(available_candidate_count, bool)
+            and available_candidate_count > 1
+        ):
+            removal_plan = await plugin_registry_service.plan_plugin_candidate_removal(
+                plugin_id,
+                removed_candidate,
+            )
+            fallback_candidate = _candidate_key_from_payload(
+                removal_plan.get("fallback_candidate")
+            )
+            if fallback_candidate is None:
+                raise _to_domain_error(
+                    code="PLUGIN_CANDIDATE_FALLBACK_UNAVAILABLE",
+                    message=(
+                        f"Plugin '{plugin_id}' has no eligible fallback candidate; "
+                        "the selected package was not removed"
+                    ),
+                    status_code=409,
+                    plugin_id=plugin_id,
+                    error_type="CandidateFallbackUnavailable",
+                )
+            # Candidate switching owns validation, stop/start, durable
+            # Selection commit, and rollback. The old package remains on disk
+            # until that transaction has committed successfully.
+            await self.switch_plugin_candidate(plugin_id, fallback_candidate)
+            fallback_switched = True
+
+        if is_running and not fallback_switched:
             await self.stop_plugin(plugin_id)
 
         staged_profile: _StagedPackageProfile | None = None
@@ -2150,37 +2186,38 @@ class PluginLifecycleService:
                         deferred_cleanup_recorded,
                     )
             await asyncio.to_thread(_mark_install_source_removed_sync, plugin_dir)
-            await asyncio.to_thread(_pop_plugin_host_sync, plugin_id)
-            await asyncio.to_thread(_remove_event_handlers_sync, plugin_id)
-            await asyncio.to_thread(_remove_plugin_metadata_sync, plugin_id)
-            await asyncio.to_thread(clear_runtime_override, plugin_id)
-            selected_candidate = plugin_meta.get("selected_candidate")
-            if isinstance(selected_candidate, Mapping):
-                root_id = selected_candidate.get("root_id")
-                directory_name = selected_candidate.get("directory_name")
-                if (
-                    root_id in {"builtin", "user"}
-                    and isinstance(directory_name, str)
-                    and directory_name
-                ):
-                    try:
-                        await asyncio.to_thread(
-                            clear_plugin_selection_if_matches,
-                            plugin_id,
-                            CandidateKey(
-                                root_id=root_id,
-                                directory_name=directory_name,
-                            ),
-                        )
-                    except PluginSelectionPersistenceError as exc:
-                        selection_warning = (
-                            "plugin deleted, but its candidate selection could not be cleared"
-                        )
-                        logger.warning(
-                            "delete_plugin: candidate selection cleanup failed for plugin_id={}: {}",
-                            plugin_id,
-                            exc,
-                        )
+            if not fallback_switched:
+                await asyncio.to_thread(_pop_plugin_host_sync, plugin_id)
+                await asyncio.to_thread(_remove_event_handlers_sync, plugin_id)
+                await asyncio.to_thread(_remove_plugin_metadata_sync, plugin_id)
+                await asyncio.to_thread(clear_runtime_override, plugin_id)
+                selected_candidate = plugin_meta.get("selected_candidate")
+                if isinstance(selected_candidate, Mapping):
+                    root_id = selected_candidate.get("root_id")
+                    directory_name = selected_candidate.get("directory_name")
+                    if (
+                        root_id in {"builtin", "user"}
+                        and isinstance(directory_name, str)
+                        and directory_name
+                    ):
+                        try:
+                            await asyncio.to_thread(
+                                clear_plugin_selection_if_matches,
+                                plugin_id,
+                                CandidateKey(
+                                    root_id=root_id,
+                                    directory_name=directory_name,
+                                ),
+                            )
+                        except PluginSelectionPersistenceError as exc:
+                            selection_warning = (
+                                "plugin deleted, but its candidate selection could not be cleared"
+                            )
+                            logger.warning(
+                                "delete_plugin: candidate selection cleanup failed for plugin_id={}: {}",
+                                plugin_id,
+                                exc,
+                            )
             await plugin_registry_service.refresh_registry()
         except ServerDomainError:
             raise
@@ -2194,7 +2231,7 @@ class PluginLifecycleService:
                         staged_profile.original_dir,
                         restore_exc,
                     )
-            if is_running:
+            if is_running and not fallback_switched:
                 try:
                     await self.start_plugin(plugin_id, refresh_registry=False)
                 except Exception as restart_exc:
@@ -2226,6 +2263,7 @@ class PluginLifecycleService:
                 "plugin_dir": str(plugin_dir),
                 "deleted_from_disk": deleted_from_disk,
                 "deleted_profile_dir": str(deleted_profile_dir) if deleted_profile_dir else None,
+                "fallback_candidate": _candidate_key_payload(fallback_candidate),
             },
         )
         response: dict[str, object] = {
@@ -2233,6 +2271,8 @@ class PluginLifecycleService:
             "plugin_id": plugin_id,
             "plugin_dir": str(plugin_dir),
             "deleted_from_disk": deleted_from_disk,
+            "fallback_candidate": _candidate_key_payload(fallback_candidate),
+            "fallback_started": fallback_switched and is_running,
             "message": "Plugin deleted successfully",
         }
         if selection_warning is not None:

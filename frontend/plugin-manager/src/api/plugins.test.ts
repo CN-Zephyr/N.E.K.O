@@ -57,12 +57,15 @@ describe('plugin hosted UI API', () => {
       directory_name: 'demo-market',
     })
 
-    expect(getMock).toHaveBeenCalledWith('/plugin/demo%20plugin/candidates')
+    expect(getMock).toHaveBeenCalledWith(
+      '/plugin/demo%20plugin/candidates',
+      { suppressErrorMessage: true },
+    )
     expect(postMock).toHaveBeenCalledWith('/plugin/demo%20plugin/candidate', {
       root_id: 'user',
       directory_name: 'demo-market',
       allow_legacy_shared_state: false,
-    })
+    }, { suppressErrorMessage: true })
 
     selectPluginCandidate('demo plugin', {
       root_id: 'user',
@@ -72,7 +75,7 @@ describe('plugin hosted UI API', () => {
       root_id: 'user',
       directory_name: 'demo-imported',
       allow_legacy_shared_state: true,
-    })
+    }, { suppressErrorMessage: true })
   })
 
   it('silences initial hosted action errors while passing its timeout', async () => {

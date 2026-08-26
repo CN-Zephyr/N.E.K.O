@@ -227,6 +227,28 @@ def resolve_plugin_candidate(
     )
 
 
+def inventory_without_candidate(
+    inventory: PluginInventory,
+    plugin_id: str,
+    candidate_key: CandidateKey,
+) -> PluginInventory:
+    """Return an inventory snapshot with one exact candidate removed.
+
+    Candidate removal planning must not mutate the live filesystem merely to
+    discover which fallback would be selected.  Keeping the operation here
+    makes the calculation deterministic and independently testable.
+    """
+
+    return PluginInventory.build(
+        candidate
+        for candidate in inventory.candidates
+        if not (
+            candidate.plugin_id == plugin_id
+            and candidate.key == candidate_key
+        )
+    )
+
+
 def requires_legacy_shared_state_authorization(
     previous: PluginCandidate | None,
     target: PluginCandidate,
@@ -350,6 +372,7 @@ __all__ = [
     "PluginInventory",
     "PluginResolution",
     "ResolutionReason",
+    "inventory_without_candidate",
     "requires_legacy_shared_state_authorization",
     "resolve_plugin_candidate",
     "state_access_grant_for_switch",

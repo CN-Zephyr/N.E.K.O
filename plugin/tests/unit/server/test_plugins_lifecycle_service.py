@@ -2249,6 +2249,212 @@ async def test_delete_plugin_removes_directory_and_metadata(
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
+async def test_delete_selected_running_candidate_switches_fallback_before_removing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_id = "demo_plugin"
+    market = CandidateKey(root_id="user", directory_name="demo-market")
+    builtin = CandidateKey(root_id="builtin", directory_name=plugin_id)
+    market_dir = tmp_path / market.directory_name
+    market_config = market_dir / "plugin.toml"
+    market_dir.mkdir(parents=True)
+    market_config.write_text(
+        "[plugin]\nid='demo_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    events: list[str] = []
+
+    async def _plan_removal(
+        requested_plugin_id: str,
+        removed: CandidateKey,
+    ) -> dict[str, object]:
+        assert requested_plugin_id == plugin_id
+        assert removed == market
+        events.append("plan")
+        return {
+            "plugin_id": plugin_id,
+            "removed_candidate": module._candidate_key_payload(market),
+            "fallback_candidate": module._candidate_key_payload(builtin),
+            "fallback_reason": "fallback_builtin",
+        }
+
+    async def _switch(
+        requested_plugin_id: str,
+        candidate: CandidateKey,
+    ) -> dict[str, object]:
+        assert requested_plugin_id == plugin_id
+        assert candidate == builtin
+        assert market_dir.is_dir()
+        events.append("switch")
+        plugin_selections_module.set_plugin_selection(plugin_id, builtin)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": str(tmp_path / "builtin" / plugin_id / "plugin.toml"),
+                "selected_candidate": module._candidate_key_payload(builtin),
+                "available_candidate_count": 2,
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(builtin)
+        return {"success": True, "restarted": True}
+
+    def _delete_exact_candidate(path: Path) -> bool:
+        assert path == market_dir
+        with module.state.acquire_plugin_hosts_read_lock():
+            running_host = module.state.plugin_hosts[plugin_id]
+        assert isinstance(running_host, _CandidateHost)
+        assert running_host.candidate == builtin
+        events.append("delete")
+        market_config.unlink()
+        market_dir.rmdir()
+        return True
+
+    async def _refresh_registry() -> dict[str, object]:
+        events.append("refresh")
+        return {"success": True}
+
+    def _unexpected_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("fallback runtime metadata and intent must be retained")
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(
+        module.plugin_registry_service,
+        "plan_plugin_candidate_removal",
+        _plan_removal,
+    )
+    monkeypatch.setattr(
+        module.plugin_registry_service,
+        "refresh_registry",
+        _refresh_registry,
+    )
+    monkeypatch.setattr(service, "switch_plugin_candidate", _switch)
+    monkeypatch.setattr(module, "_delete_plugin_directory_sync", _delete_exact_candidate)
+    monkeypatch.setattr(module, "_pop_plugin_host_sync", _unexpected_cleanup)
+    monkeypatch.setattr(module, "_remove_event_handlers_sync", _unexpected_cleanup)
+    monkeypatch.setattr(module, "_remove_plugin_metadata_sync", _unexpected_cleanup)
+    monkeypatch.setattr(module, "clear_runtime_override", _unexpected_cleanup)
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: None)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+    try:
+        plugin_selections_module.set_plugin_selection(
+            plugin_id,
+            market,
+            candidate_source="market",
+            state_access_grant="initial_identity",
+            release_chain_id="market.demo",
+        )
+        original_owner = plugin_selections_module.get_plugin_state_owner(plugin_id)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": str(market_config),
+                "selected_candidate": module._candidate_key_payload(market),
+                "available_candidate_count": 2,
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(market)
+
+        result = await service.delete_plugin(plugin_id)
+
+        assert events == ["plan", "switch", "delete", "refresh"]
+        assert result["fallback_candidate"] == module._candidate_key_payload(builtin)
+        assert result["fallback_started"] is True
+        assert plugin_selections_module.get_plugin_selection(plugin_id) == builtin
+        assert plugin_selections_module.get_plugin_state_owner(plugin_id) != original_owner
+        assert plugin_selections_module.get_plugin_state_owner(plugin_id).candidate == builtin
+        with module.state.acquire_plugin_hosts_read_lock():
+            running_host = module.state.plugin_hosts[plugin_id]
+        assert isinstance(running_host, _CandidateHost)
+        assert running_host.candidate == builtin
+        assert market_dir.exists() is False
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_selected_candidate_rejects_when_no_eligible_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_id = "demo_plugin"
+    selected = CandidateKey(root_id="user", directory_name="demo-market")
+    plugin_dir = tmp_path / selected.directory_name
+    config_path = plugin_dir / "plugin.toml"
+    plugin_dir.mkdir(parents=True)
+    config_path.write_text(
+        "[plugin]\nid='demo_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+
+    async def _plan_removal(
+        _plugin_id: str,
+        _candidate: CandidateKey,
+    ) -> dict[str, object]:
+        return {
+            "plugin_id": plugin_id,
+            "removed_candidate": module._candidate_key_payload(selected),
+            "fallback_candidate": None,
+            "fallback_reason": "no_valid_candidate",
+        }
+
+    def _unexpected_mutation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("candidate code must remain before fallback validation")
+
+    service = module.PluginLifecycleService()
+    monkeypatch.setattr(
+        module.plugin_registry_service,
+        "plan_plugin_candidate_removal",
+        _plan_removal,
+    )
+    monkeypatch.setattr(module, "_delete_plugin_directory_sync", _unexpected_mutation)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins[plugin_id] = {
+                "id": plugin_id,
+                "config_path": str(config_path),
+                "selected_candidate": module._candidate_key_payload(selected),
+                "available_candidate_count": 2,
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = _CandidateHost(selected)
+
+        with pytest.raises(module.ServerDomainError) as caught:
+            await service.delete_plugin(plugin_id)
+
+        assert caught.value.code == "PLUGIN_CANDIDATE_FALLBACK_UNAVAILABLE"
+        assert plugin_dir.is_dir()
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert module.state.plugin_hosts[plugin_id].is_alive()
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
 async def test_delete_plugin_restores_profile_and_restarts_after_directory_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

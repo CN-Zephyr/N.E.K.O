@@ -10,6 +10,7 @@ from plugin.server.domain.plugin_candidates import (
     CandidateSource,
     PluginCandidate,
     PluginInventory,
+    inventory_without_candidate,
     requires_legacy_shared_state_authorization,
     resolve_plugin_candidate,
 )
@@ -175,3 +176,21 @@ def test_market_release_chain_can_reuse_its_own_state() -> None:
 
     assert requires_legacy_shared_state_authorization(previous, target) is False
     assert requires_legacy_shared_state_authorization(previous, unrelated) is True
+
+
+def test_candidate_removal_planning_does_not_mutate_the_source_inventory() -> None:
+    builtin = _candidate("builtin", "demo", source="builtin")
+    market = _candidate("user", "demo-market", source="market")
+    inventory = PluginInventory.build((builtin, market))
+
+    remaining = inventory_without_candidate(inventory, "demo", market.key)
+    resolved = resolve_plugin_candidate(
+        remaining,
+        "demo",
+        desired_candidate=market.key,
+    )
+
+    assert inventory.candidates == (builtin, market)
+    assert remaining.candidates == (builtin,)
+    assert resolved.candidate == builtin
+    assert resolved.reason == "fallback_builtin"
