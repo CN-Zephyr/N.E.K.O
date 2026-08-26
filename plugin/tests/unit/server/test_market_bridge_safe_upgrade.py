@@ -419,7 +419,7 @@ async def test_market_upgrade_exposes_rollback_while_files_are_being_restored(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from plugin.server.application.plugins import upgrade_support
+    from plugin.server.application.package_management import filesystem
 
     plugins_root = tmp_path / "plugins"
     profiles_root = tmp_path / "profiles"
@@ -444,14 +444,14 @@ async def test_market_upgrade_exposes_rollback_while_files_are_being_restored(
 
     rollback_started = asyncio.Event()
     allow_rollback = asyncio.Event()
-    remove_directory = upgrade_support.remove_directory
+    remove_directory = filesystem.remove_directory
 
     async def pause_during_rollback(path: Path) -> None:
         rollback_started.set()
         await allow_rollback.wait()
         await remove_directory(path)
 
-    monkeypatch.setattr(upgrade_support, "remove_directory", pause_during_rollback)
+    monkeypatch.setattr(filesystem, "remove_directory", pause_during_rollback)
 
     task: dict[str, Any] = {}
     operation = asyncio.create_task(market_bridge._do_upgrade(task, _payload(), {}))

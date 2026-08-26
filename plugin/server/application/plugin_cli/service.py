@@ -4,24 +4,17 @@ import asyncio
 from dataclasses import asdict, replace
 import hashlib
 import shutil
-import stat
-import tomllib
-import uuid
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
 from plugin.core.plugin_layout import resolve_plugin_layout
 from plugin.logging_config import get_logger
-from plugin.neko_plugin_cli.core.install import PackageInstaller
-from plugin.neko_plugin_cli.core.models import InstalledPlugin, InstallResult
+from plugin.neko_plugin_cli.core.models import InstallResult
 from plugin.neko_plugin_cli.public import (
     analyze_bundle_plugins,
-    inspect_package,
     build_bundle,
     build_plugin,
-    install_package,
 )
 from plugin.server.application.install_source import (
     InstallSourceError,
@@ -30,12 +23,17 @@ from plugin.server.application.install_source import (
     get_install_source_manager,
 )
 from plugin.server.application.plugin_cli.paths import PluginCliPathPolicy
-from plugin.server.application.plugin_cli.install_plan import (
+from plugin.server.application.package_management.install_plan import (
     REPLACEMENT_ACTIONS,
     PluginInstallPlan,
-    build_install_plan,
     is_manifestless_state_directory,
 )
+from plugin.server.application.package_management.package_service import (
+    PluginPackageService,
+)
+from plugin.server.application.package_management.artifacts import PackageArtifactStore
+from plugin.server.application.package_management import replacement as package_replacement
+from plugin.server.application.package_management import filesystem as package_filesystem
 from plugin.server.application.plugins import upgrade_support
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
 from plugin.server.application.plugin_cli.source_resolver import (
@@ -98,17 +96,6 @@ _PACKAGE_ERROR_PATTERNS = (
 )
 
 
-def _is_link_or_reparse(path: Path) -> bool:
-    """Return whether ``path`` is a symlink or Windows reparse point."""
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return False
-    file_attributes = getattr(metadata, "st_file_attributes", 0)
-    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return path.is_symlink() or bool(file_attributes & reparse_attribute)
-
-
 def _validate_existing_profile_ownership(
     *,
     profile_dir: Path,
@@ -116,57 +103,13 @@ def _validate_existing_profile_ownership(
     package_id: str,
     plugin_ids: set[str],
 ) -> None:
-    """Fail closed unless install-source history owns an existing profile.
+    """Compatibility facade for the extracted package ownership guard."""
 
-    A profile directory name is selected by the package manifest and is not
-    proof that the directory belongs to the incoming package. Removed entries
-    remain in the source ledger, so a legitimate reinstall can reuse its
-    retained profile without letting an unrelated package claim orphaned state.
-    """
-
-    manager = get_install_source_manager()
-    if manager is None:
-        raise ServerDomainError(
-            code="INSTALL_SOURCE_NOT_READY",
-            message="install source manager is not initialised",
-            status_code=503,
-            details={"hint": "wait for FastAPI lifespan startup to complete"},
-        )
-    owners = []
-    resolved_profile = profile_dir.resolve(strict=False)
-    for entry in manager.list_entries(include_removed=True):
-        # Only an explicit modern ownership record is proof. ``None`` is
-        # a legacy row whose profile ownership was never recorded.
-        if entry.profile_installed is not True:
-            continue
-        recorded_key = entry.package_id
-        if entry.profile_dir:
-            recorded_profile = Path(entry.profile_dir).expanduser()
-        elif recorded_key:
-            recorded_profile = profiles_root / recorded_key
-        else:
-            continue
-        if recorded_profile.resolve(strict=False) == resolved_profile:
-            owners.append(entry)
-
-    ownership_matches = bool(owners) and all(
-        owner.plugin_id in plugin_ids and owner.package_id == package_id
-        for owner in owners
-    )
-    if ownership_matches:
-        return
-
-    raise ServerDomainError(
-        code="PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT",
-        message="existing package profile ownership does not match the incoming package",
-        status_code=409,
-        details={
-            "package_id": package_id,
-            "plugin_ids": sorted(plugin_ids),
-            "recorded_plugin_ids": sorted(
-                {owner.plugin_id for owner in owners if owner.plugin_id}
-            ),
-        },
+    PluginPackageService().validate_existing_profile_ownership(
+        profile_dir=profile_dir,
+        profiles_root=profiles_root,
+        package_id=package_id,
+        plugin_ids=plugin_ids,
     )
 
 
@@ -200,7 +143,7 @@ def _classify_package_error(exc: Exception) -> str | None:
 
 
 def _replacement_error_details(
-    exc: upgrade_support.ReplacePluginError,
+    exc: package_replacement.ReplacePluginError,
 ) -> dict[str, object]:
     details: dict[str, object] = {
         "stage": exc.stage,
@@ -393,7 +336,7 @@ class PluginCliService:
         )
         profile_dir = profiles_root_path / installed_package_id
         plan = self._apply_installed_package_identity(
-            build_install_plan(
+            self._package_service().plan_install(
                 package_path=self._resolve_package_path(package),
                 plugins_root=target_root,
             ),
@@ -436,14 +379,14 @@ class PluginCliService:
             await upgrade_support.start_plugin_after_replace(plugin_id, strict=True)
 
         try:
-            result = await upgrade_support.replace_plugin(
+            result = await package_replacement.replace_plugin(
                 layout=resolve_plugin_layout(plan.plugin_id, target_dir),
                 install_new=install_new,
                 validate_new=validate_new,
                 is_running=upgrade_support.plugin_is_running,
                 stop=upgrade_support.stop_plugin_for_replace,
                 start=start,
-                cleanup_backup=upgrade_support.remove_directory,
+                cleanup_backup=package_filesystem.remove_directory,
                 additional_targets=(profile_dir,),
                 preserve_targets=(
                     (target_dir, profile_dir)
@@ -457,7 +400,7 @@ class PluginCliService:
                     else None
                 ),
             )
-        except upgrade_support.ReplacePluginError as exc:
+        except package_replacement.ReplacePluginError as exc:
             raise ServerDomainError(
                 code="PLUGIN_UPGRADE_ROLLED_BACK",
                 message="plugin upgrade failed and rollback was attempted",
@@ -964,21 +907,7 @@ class PluginCliService:
 
     @staticmethod
     def _read_installed_plugin_toml_id(target_dir: Path) -> str:
-        plugin_toml = target_dir / "plugin.toml"
-        try:
-            data = tomllib.loads(plugin_toml.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise ValueError(f"installed plugin.toml not found: {plugin_toml}") from exc
-        except tomllib.TOMLDecodeError as exc:
-            raise ValueError(f"installed plugin.toml is invalid TOML: {plugin_toml}") from exc
-
-        plugin_table = data.get("plugin")
-        if not isinstance(plugin_table, dict):
-            raise ValueError(f"installed plugin.toml missing [plugin] table: {plugin_toml}")
-        plugin_id = plugin_table.get("id")
-        if not isinstance(plugin_id, str) or not plugin_id.strip():
-            raise ValueError(f"installed plugin.toml missing [plugin].id: {plugin_toml}")
-        return plugin_id.strip()
+        return PluginPackageService().read_installed_plugin_id(target_dir)
 
     def _compose_install_result(
         self,
@@ -1241,6 +1170,18 @@ class PluginCliService:
     def _path_policy() -> PluginCliPathPolicy:
         return PluginCliPathPolicy.from_settings()
 
+    @staticmethod
+    def _package_service() -> PluginPackageService:
+        return PluginPackageService()
+
+    def _artifact_store(self) -> PackageArtifactStore:
+        return PackageArtifactStore(
+            self._path_policy().package_artifacts_root,
+            allowed_suffixes=_ALLOWED_UPLOAD_SUFFIXES,
+            max_bytes=_UPLOAD_MAX_BYTES,
+            copy_chunk_bytes=_UPLOAD_COPY_CHUNK_BYTES,
+        )
+
     def _resolver(self) -> PluginSourceResolver:
         return PluginSourceResolver(self._path_policy())
 
@@ -1267,29 +1208,11 @@ class PluginCliService:
 
     def _list_local_packages_sync(self) -> dict[str, object]:
         try:
-            target_root = self._path_policy().package_artifacts_root
-            items: list[dict[str, object]] = []
-            package_paths = [
-                path
-                for path in target_root.glob("*")
-                if path.is_file() and self._has_allowed_upload_suffix(path.name)
-            ]
-            for path in sorted(
-                package_paths,
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            ):
-                stat = path.stat()
-                items.append(
-                    {
-                        "name": path.name,
-                        "path": str(path.resolve()),
-                        "suffix": path.suffix,
-                        "size_bytes": stat.st_size,
-                        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                    }
-                )
-            return {"packages": items, "count": len(items), "target_dir": str(target_root)}
+            result = self._artifact_store().list()
+            for item in result["packages"]:
+                if isinstance(item, dict):
+                    item["suffix"] = Path(str(item["name"])).suffix
+            return result
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="list_packages") from exc
 
@@ -1387,14 +1310,18 @@ class PluginCliService:
 
     def _inspect_sync(self, *, package: str) -> dict[str, object]:
         try:
-            result = inspect_package(self._resolve_package_path(package))
+            result = self._package_service().inspect(
+                self._resolve_package_path(package)
+            )
             return result.model_dump(mode="json")
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="inspect") from exc
 
     def _verify_sync(self, *, package: str) -> dict[str, object]:
         try:
-            result = inspect_package(self._resolve_package_path(package))
+            result = self._package_service().verify(
+                self._resolve_package_path(package)
+            )
             payload_hash_verified = result.payload_hash_verified
             return {
                 **result.model_dump(mode="json"),
@@ -1436,7 +1363,7 @@ class PluginCliService:
                 )
             )
             plan = self._apply_installed_package_identity(
-                build_install_plan(
+                self._package_service().plan_install(
                     package_path=self._resolve_package_path(package),
                     plugins_root=target_root,
                 ),
@@ -1513,23 +1440,15 @@ class PluginCliService:
                 )
             )
             package_path = self._resolve_package_path(package)
-            if use_staging:
-                result = self._install_via_staging_sync(
-                    package=package_path,
-                    plugins_root=plugins_root_path,
-                    profiles_root=profiles_root_path,
-                    on_conflict=on_conflict,
-                    forced_directory_name=forced_directory_name,
-                )
-            elif forced_directory_name is not None:
-                raise ValueError("forced_directory_name requires use_staging=True")
-            else:
-                result = install_package(
-                    package_path,
-                    plugins_root=plugins_root_path,
-                    profiles_root=profiles_root_path,
-                    on_conflict=on_conflict,
-                )
+            result = self._package_service().install(
+                package_path=package_path,
+                plugins_root=plugins_root_path,
+                profiles_root=profiles_root_path,
+                on_conflict=on_conflict,
+                use_staging=use_staging,
+                forced_directory_name=forced_directory_name,
+                install_result_factory=InstallResult,
+            )
             return result.model_dump(mode="json")
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="install") from exc
@@ -1543,114 +1462,17 @@ class PluginCliService:
         on_conflict: str,
         forced_directory_name: str | None = None,
     ) -> InstallResult:
-        """Extract into a staging tree, then rename into place atomically."""
+        """Compatibility facade for the extracted package staging service."""
 
-        forced_directory_name = (
-            _require_safe_directory_name(forced_directory_name, field="forced_directory_name")
-            if forced_directory_name is not None
-            else None
+        return self._package_service().install(
+            package_path=package,
+            plugins_root=plugins_root,
+            profiles_root=profiles_root,
+            on_conflict=on_conflict,
+            use_staging=True,
+            forced_directory_name=forced_directory_name,
+            install_result_factory=InstallResult,
         )
-        staging_token = uuid.uuid4().hex
-        staging_plugins = plugins_root / f".neko_staging_{staging_token}"
-        staging_profiles = profiles_root / f".neko_staging_{staging_token}"
-        staging_plugins.mkdir(parents=True, exist_ok=True)
-        staging_profiles.mkdir(parents=True, exist_ok=True)
-        installer = PackageInstaller()
-        promoted_plugins: list[InstalledPlugin] = []
-        promoted_profile: Path | None = None
-        profile_reused = False
-
-        try:
-            staged = install_package(
-                package,
-                plugins_root=staging_plugins,
-                profiles_root=staging_profiles,
-                on_conflict="fail",
-            )
-
-            for item in staged.installed_plugins:
-                source_dir = Path(item.target_dir)
-                desired_name = forced_directory_name or item.target_plugin_id
-                desired = plugins_root / desired_name
-                final_dir = installer.resolve_plugin_target_dir(
-                    desired,
-                )
-                if source_dir.resolve() != final_dir.resolve():
-                    final_dir.parent.mkdir(parents=True, exist_ok=True)
-                    source_dir.rename(final_dir)
-                promoted_plugins.append(
-                    InstalledPlugin(
-                        source_folder=item.source_folder,
-                        target_plugin_id=final_dir.name,
-                        target_dir=final_dir,
-                        renamed=(final_dir.name != item.source_folder),
-                    )
-                )
-                if not (final_dir / "plugin.toml").is_file():
-                    raise ValueError(f"promoted plugin is missing plugin.toml: {final_dir}")
-
-            if staged.profile_dir is not None:
-                source_profile = Path(staged.profile_dir)
-                desired_profile = profiles_root / source_profile.name
-                if _is_link_or_reparse(desired_profile):
-                    raise ValueError(
-                        "existing package profile path is a link or reparse point: "
-                        f"{desired_profile.name}"
-                    )
-                if desired_profile.exists():
-                    if not desired_profile.is_dir():
-                        raise ValueError(
-                            "existing package profile path is not a directory: "
-                            f"{desired_profile.name}"
-                        )
-                    _validate_existing_profile_ownership(
-                        profile_dir=desired_profile,
-                        profiles_root=profiles_root,
-                        package_id=staged.package_id,
-                        plugin_ids={
-                            self._read_installed_plugin_toml_id(Path(item.target_dir))
-                            for item in promoted_plugins
-                        },
-                    )
-                    # A verified prior install can leave its package profile
-                    # behind after executable deletion. Reuse it byte-for-byte. The
-                    # staged defaults are intentionally not merged here, so a
-                    # failed fresh install never mutates legacy state.
-                    promoted_profile = desired_profile.resolve()
-                    profile_reused = True
-                else:
-                    desired_profile = installer.resolve_target_dir(
-                        desired_profile,
-                        on_conflict=on_conflict,
-                    )
-                    if source_profile.resolve() != desired_profile.resolve():
-                        desired_profile.parent.mkdir(parents=True, exist_ok=True)
-                        source_profile.rename(desired_profile)
-                    promoted_profile = desired_profile
-
-            return InstallResult(
-                package_path=staged.package_path,
-                package_type=staged.package_type,
-                package_id=staged.package_id,
-                plugins_root=plugins_root,
-                profiles_root=profiles_root,
-                installed_plugins=promoted_plugins,
-                profile_dir=promoted_profile,
-                profile_reused=profile_reused,
-                metadata_found=staged.metadata_found,
-                payload_hash=staged.payload_hash,
-                payload_hash_verified=staged.payload_hash_verified,
-                conflict_strategy=on_conflict,
-            )
-        except Exception:
-            for item in promoted_plugins:
-                shutil.rmtree(item.target_dir, ignore_errors=True)
-            if promoted_profile is not None and not profile_reused:
-                shutil.rmtree(promoted_profile, ignore_errors=True)
-            raise
-        finally:
-            shutil.rmtree(staging_plugins, ignore_errors=True)
-            shutil.rmtree(staging_profiles, ignore_errors=True)
 
     @staticmethod
     def _sha256_file(path: str | Path) -> str:
@@ -1696,145 +1518,59 @@ class PluginCliService:
 
     @staticmethod
     def _has_allowed_upload_suffix(filename: str) -> bool:
-        return filename.lower().endswith(tuple(_ALLOWED_UPLOAD_SUFFIXES))
+        return PackageArtifactStore(
+            Path("."),
+            allowed_suffixes=_ALLOWED_UPLOAD_SUFFIXES,
+            max_bytes=_UPLOAD_MAX_BYTES,
+            copy_chunk_bytes=_UPLOAD_COPY_CHUNK_BYTES,
+        ).has_allowed_suffix(filename)
 
     @staticmethod
     def _upload_filename_parts(filename: str) -> tuple[str, str, str]:
-        safe_name = Path(filename).name
-        if not safe_name:
-            raise ValueError("Invalid filename")
-
-        lower_name = safe_name.lower()
-        for allowed_suffix in sorted(_ALLOWED_UPLOAD_SUFFIXES, key=len, reverse=True):
-            if lower_name.endswith(allowed_suffix):
-                return safe_name, safe_name[: -len(allowed_suffix)], allowed_suffix
-
-        allowed = ", ".join(sorted(_ALLOWED_UPLOAD_SUFFIXES))
-        raise ValueError(f"Unsupported file type. Allowed: {allowed}")
+        return PackageArtifactStore(
+            Path("."),
+            allowed_suffixes=_ALLOWED_UPLOAD_SUFFIXES,
+            max_bytes=_UPLOAD_MAX_BYTES,
+            copy_chunk_bytes=_UPLOAD_COPY_CHUNK_BYTES,
+        ).filename_parts(filename)
 
     @staticmethod
     def _upload_metadata(path: Path) -> dict[str, object]:
-        stat = path.stat()
-        return {
-            "name": path.name,
-            "path": str(path.resolve()),
-            "size_bytes": stat.st_size,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-        }
+        return PackageArtifactStore.metadata(path)
 
     def _save_uploaded_package_sync(self, *, filename: str, content: bytes) -> dict[str, object]:
         try:
-            target_root = self._path_policy().package_artifacts_root
-            # Validate file size
-            if len(content) > _UPLOAD_MAX_BYTES:
-                raise ValueError(
-                    f"File too large: {len(content)} bytes "
-                    f"(max {_UPLOAD_MAX_BYTES // (1024 * 1024)} MiB)"
-                )
-
-            safe_name, stem, suffix = self._upload_filename_parts(filename)
-
-            # Ensure target directory exists
-            target_root.mkdir(parents=True, exist_ok=True)
-
-            # Exclusive create: if name collides (including concurrent uploads
-            # racing on the same filename), pick a UUID-suffixed dest and retry.
-            dest = target_root / safe_name
-            while True:
-                try:
-                    with dest.open("xb") as file:
-                        file.write(content)
-                    break
-                except FileExistsError:
-                    unique = uuid.uuid4().hex[:8]
-                    dest = target_root / f"{stem}_{unique}{suffix}"
-                except Exception:
-                    dest.unlink(missing_ok=True)
-                    raise
-
-            return self._upload_metadata(dest)
+            return self._artifact_store().save_bytes(
+                filename=filename,
+                content=content,
+            )
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="upload") from exc
 
     def _discard_uploaded_package_sync(self, *, package: str) -> dict[str, object]:
         """Remove one direct upload using the existing package-path policy."""
         try:
-            target_root = self._path_policy().package_artifacts_root.resolve()
-            target = self._resolve_package_path(package)
-            if target.parent != target_root:
-                raise ValueError("only a directly uploaded plugin package can be discarded")
-            target.unlink()
-            return {"success": True, "removed": True, "name": target.name}
+            return self._artifact_store().discard(package)
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="discard-upload") from exc
 
     def _save_uploaded_file_sync(self, *, filename: str, source_file: BinaryIO) -> dict[str, object]:
         """Copy an incoming upload in bounded chunks and enforce the size limit."""
         try:
-            target_root = self._path_policy().package_artifacts_root
-            safe_name, stem, suffix = self._upload_filename_parts(filename)
-            target_root.mkdir(parents=True, exist_ok=True)
-            source_file.seek(0)
-
-            dest = target_root / safe_name
-            while True:
-                try:
-                    total_bytes = 0
-                    with dest.open("xb") as target:
-                        while chunk := source_file.read(_UPLOAD_COPY_CHUNK_BYTES):
-                            total_bytes += len(chunk)
-                            if total_bytes > _UPLOAD_MAX_BYTES:
-                                raise ValueError(
-                                    f"File too large: {total_bytes} bytes "
-                                    f"(max {_UPLOAD_MAX_BYTES // (1024 * 1024)} MiB)"
-                                )
-                            target.write(chunk)
-                    break
-                except FileExistsError:
-                    unique = uuid.uuid4().hex[:8]
-                    dest = target_root / f"{stem}_{unique}{suffix}"
-                except Exception:
-                    dest.unlink(missing_ok=True)
-                    raise
-
-            return self._upload_metadata(dest)
+            return self._artifact_store().save_file(
+                filename=filename,
+                source_file=source_file,
+            )
         except Exception as exc:
             raise self._domain_error_from_exception(exc, action="upload") from exc
 
     def _save_package_file_sync(self, *, filename: str, package_path: str) -> dict[str, object]:
         """Copy an existing package into the managed package artifacts root."""
 
-        source = Path(package_path).expanduser().resolve()
-        if not source.is_file():
-            raise FileNotFoundError(f"package file not found: {package_path}")
-        if source.stat().st_size > _UPLOAD_MAX_BYTES:
-            raise ValueError(
-                f"File too large: {source.stat().st_size} bytes "
-                f"(max {_UPLOAD_MAX_BYTES // (1024 * 1024)} MiB)"
-            )
-
-        safe_name, stem, suffix = self._upload_filename_parts(filename or source.name)
-
-        target_root = self._path_policy().package_artifacts_root
-        target_root.mkdir(parents=True, exist_ok=True)
-
-        if source.parent == target_root.resolve() and source.name == safe_name:
-            return self._upload_metadata(source)
-
-        dest = target_root / safe_name
-        while True:
-            try:
-                with source.open("rb") as src, dest.open("xb") as dst:
-                    shutil.copyfileobj(src, dst)
-                break
-            except FileExistsError:
-                unique = uuid.uuid4().hex[:8]
-                dest = target_root / f"{stem}_{unique}{suffix}"
-            except Exception:
-                dest.unlink(missing_ok=True)
-                raise
-
-        return self._upload_metadata(dest)
+        return self._artifact_store().copy_from(
+            filename=filename,
+            package_path=package_path,
+        )
 
     def _resolve_plugin_sources(
         self,
@@ -1884,25 +1620,7 @@ class PluginCliService:
         }
 
     def _resolve_package_path(self, raw: str) -> Path:
-        target_root = self._path_policy().package_artifacts_root
-
-        def _accept(path: Path) -> bool:
-            return path.is_file() and self._has_allowed_upload_suffix(path.name)
-
-        candidate = Path(raw).expanduser()
-        if candidate.exists():
-            resolved = candidate.resolve()
-            _require_within(resolved, target_root, field=f"package '{raw}'")
-            if _accept(resolved):
-                return resolved
-
-        target_candidate = (target_root / raw).resolve()
-        if target_candidate.exists():
-            _require_within(target_candidate, target_root, field=f"package '{raw}'")
-            if _accept(target_candidate):
-                return target_candidate
-
-        raise FileNotFoundError(f"package file not found: {raw}")
+        return self._artifact_store().resolve(raw)
 
     async def _record_install_source_best_effort(
         self,

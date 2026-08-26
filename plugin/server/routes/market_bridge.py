@@ -41,12 +41,14 @@ from plugin.server.application.install_source import (
 )
 from plugin.server.application.plugin_cli import PluginCliService
 from plugin.server.application.plugin_cli.paths import PluginCliPathPolicy
+from plugin.server.application.package_management.filesystem import remove_directory
+from plugin.server.application.package_management.replacement import (
+    ReplacePluginError,
+    replace_plugin,
+)
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
 from plugin.server.application.plugins.upgrade_support import (
-    ReplacePluginError,
     plugin_is_running,
-    remove_directory,
-    replace_plugin,
     start_plugin_after_upgrade,
     stop_plugin_for_upgrade,
 )
