@@ -180,10 +180,24 @@ class IndependentAsrRuntime:
             cleanup = self._detach_independent_asr(
                 operation_generation=operation_generation,
             )
+            # Started HERE, not inside the joiner below. The resources this
+            # close just detached are its own and independent of any retired
+            # teardown; sequencing them behind a predecessor that never
+            # returns -- a retired provider stuck in session.close(), say --
+            # would keep this generation's detector and session physically
+            # open for as long as that lasts.
+            cleanup_task = (
+                self._schedule_owned_cleanup(
+                    cleanup,
+                    name="independent-asr-close-detached",
+                )
+                if cleanup is not None
+                else None
+            )
             close_task = self._schedule_owned_cleanup(
                 self._finish_explicit_asr_close(
                     predecessor_cleanups,
-                    cleanup,
+                    cleanup_task,
                 ),
                 name="independent-asr-close",
             )
@@ -193,15 +207,19 @@ class IndependentAsrRuntime:
     @staticmethod
     async def _finish_explicit_asr_close(
         predecessor_cleanups: tuple[asyncio.Task[Any], ...],
-        cleanup: Awaitable[Any] | None,
+        cleanup_task: "asyncio.Task[Any] | None",
     ) -> None:
+        """Join both teardowns; ``cleanup_task`` is already running."""
+
         if predecessor_cleanups:
             await asyncio.gather(
                 *predecessor_cleanups,
                 return_exceptions=True,
             )
-        if cleanup is not None:
-            await cleanup
+        if cleanup_task is not None:
+            # Awaited last but NOT started last, and awaited bare so its
+            # failure still reaches the owned-cleanup logger.
+            await cleanup_task
 
     async def set_speaker_verifier_factory(
         self,

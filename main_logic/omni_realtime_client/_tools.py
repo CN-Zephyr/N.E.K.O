@@ -282,32 +282,40 @@ class _ToolingMixin:
             # sibling's ``function_call_output`` hostage and stall the whole
             # provider turn. Re-check the cancelled set on the same bound the
             # close path already allows a tool to ignore cancellation for.
-            pending = list(zip(call_tasks, calls))
-            outcomes: Dict[str, ToolResult] = {}
+            # Keyed by POSITION, not call_id. Gemini may omit ids, and the
+            # ingestion path normalizes a missing one to "" -- so keying by
+            # call_id collapses an anonymous parallel batch into a single
+            # entry, sending the last result twice and dropping the other
+            # function's real response. The batch is positional; keep it that
+            # way, exactly as the blanket gather this replaced was.
+            pending = list(enumerate(call_tasks))
+            outcomes: Dict[int, ToolResult] = {}
             while pending:
                 still_pending = []
-                for task, call in pending:
+                for index, task in pending:
                     if task.done():
                         if not task.cancelled() and task.exception() is None:
                             value = task.result()
                             if isinstance(value, ToolResult):
-                                outcomes[call.call_id] = value
-                    elif not self._tool_call_was_cancelled(owner, call.call_id):
-                        still_pending.append((task, call))
+                                outcomes[index] = value
+                    elif not self._tool_call_was_cancelled(
+                        owner, calls[index].call_id
+                    ):
+                        still_pending.append((index, task))
                 pending = still_pending
                 if not pending:
                     break
                 await asyncio.wait(
-                    [task for task, _ in pending],
+                    [task for _, task in pending],
                     timeout=self._TOOL_TASK_CANCEL_TIMEOUT_S,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             if not self._tool_task_owner_is_current(owner):
                 return
             results = [
-                outcomes[call.call_id]
-                for call in calls
-                if call.call_id in outcomes
+                outcomes[index]
+                for index, call in enumerate(calls)
+                if index in outcomes
                 and not self._tool_call_was_cancelled(owner, call.call_id)
             ]
             if results:

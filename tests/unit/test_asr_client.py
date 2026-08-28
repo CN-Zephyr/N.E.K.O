@@ -2055,7 +2055,11 @@ async def test_runtime_close_detaches_before_owned_task_can_be_invalidated() -> 
 
     await runtime.close()
 
-    assert detached_at_schedule == [True]
+    # Every cleanup this close owns must be scheduled against fully detached
+    # state -- asserted as a property rather than a count, so the claim does
+    # not depend on how many tasks close() happens to split its teardown into.
+    assert detached_at_schedule
+    assert all(detached_at_schedule), detached_at_schedule
     assert runtime._asr_session is None
     assert runtime._asr_lifecycle is None
     assert runtime._asr_detector is None
@@ -2972,3 +2976,40 @@ def test_asr_connect_retry_budget_cannot_outlive_the_frontend_start_deadline():
     assert start_loop.index("_CONNECT_TOTAL_BUDGET_SECONDS") < start_loop.index(
         "await asyncio.sleep(backoff)"
     ), "the budget check must refuse the retry before sleeping for it"
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_queue_its_own_cleanup_behind_a_stuck_predecessor() -> None:
+    """A retired teardown that never returns must not keep this generation open."""
+
+    runtime = IndependentAsrRuntime(_runtime_callbacks())
+    detector = _RuntimeDetectorStub()
+    _install_active_runtime_state(runtime, detector)
+    session = runtime._asr_session
+
+    stuck_forever = asyncio.Event()
+
+    async def never_returns() -> None:
+        await stuck_forever.wait()
+
+    predecessor = runtime._schedule_owned_cleanup(
+        never_returns(),
+        name="retired-provider-close",
+    )
+
+    close = asyncio.create_task(runtime.close())
+    # The predecessor is still blocked, so close() cannot have returned -- but
+    # the resources IT detached are independent of that teardown and must
+    # already be released.
+    for _ in range(40):
+        if session.close.await_count and detector.close.await_count:
+            break
+        await asyncio.sleep(0.01)
+
+    detector.close.assert_awaited_once_with()
+    session.close.assert_awaited_once_with()
+    assert not close.done(), "close() joins the predecessor before returning"
+
+    stuck_forever.set()
+    await asyncio.wait_for(close, timeout=1)
+    await asyncio.wait_for(predecessor, timeout=1)

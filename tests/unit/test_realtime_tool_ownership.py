@@ -2314,3 +2314,43 @@ async def test_quarantine_does_not_exit_a_context_an_ordinary_close_finished(
     await asyncio.wait_for(quarantine, timeout=2)
 
     assert context.exit_calls == 1, "the one-shot SDK context was exited twice"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_anonymous_parallel_calls_keep_separate_results(monkeypatch) -> None:
+    """Gemini may omit ids; both are normalized to "" and must stay distinct."""
+
+    import main_logic.omni_realtime_client._gemini_support as gemini_support
+
+    monkeypatch.setattr(
+        gemini_support,
+        "types",
+        SimpleNamespace(FunctionResponse=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+
+    async def handler(call):
+        return ToolResult(call_id=call.call_id, name=call.name, output={"who": call.name})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("", "first"), ("", "second"))),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await _wait_for_tool_tasks(client)
+
+    assert len(session.tool_responses) == 1
+    outputs = [r.response["who"] for r in session.tool_responses[0]]
+    assert outputs == ["first", "second"]
