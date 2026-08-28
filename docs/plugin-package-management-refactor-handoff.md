@@ -1,7 +1,8 @@
 # Plugin 包管理重构交接文档
 
-> 状态：架构已冻结并完成完整 diff 验收（实现已提交；未执行真实用户配置 cutover）  
-> 更新时间：2026-08-28  
+> 状态：架构已冻结并完成完整 diff 验收（实现已提交；未执行真实用户配置 cutover）
+>
+> 更新时间：2026-08-28
 > 适用工作树：`D:\Users\zheng\Desktop\code\neko-core\N.E.K.O-plugin-lifecycle-rework`
 
 本文记录当前代码现场、已经验证的行为、已废弃的试验和下一阶段硬约束。
