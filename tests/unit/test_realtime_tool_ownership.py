@@ -126,10 +126,10 @@ class _SendGate:
         return None
 
 
-def _raw_tool_event(call_id: str = "call-1") -> dict:
+def _raw_tool_event(call_id: str = "call-1", response_id: str = "response-1") -> dict:
     return {
         "type": "response.function_call_arguments.done",
-        "response_id": "response-1",
+        "response_id": response_id,
         "call_id": call_id,
         "name": "lookup",
         "arguments": "{}",
@@ -797,6 +797,65 @@ async def test_parallel_raw_tool_results_survive_a_sibling_response_created() ->
     await client._response_arbiter.wait_until_idle(timeout=1)
     # Premise of this regression: the provider-turn snapshot really did move.
     assert client._current_turn_host_id == "turn-2"
+
+    release["call-2"].set()
+    await _wait_for_tool_tasks(client)
+
+    answered = [
+        event["item"]["call_id"]
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and event.get("item", {}).get("type") == "function_call_output"
+    ]
+    assert answered == ["call-1", "call-2"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sequential_tool_batches_in_one_user_turn_keep_answering() -> None:
+    """A later provider response owns the host id its own tool call sampled."""
+
+    host_turn = ["turn-1"]
+    started = {"call-1": asyncio.Event(), "call-2": asyncio.Event()}
+    release = {"call-1": asyncio.Event(), "call-2": asyncio.Event()}
+
+    async def handler(call):
+        started[call.call_id].set()
+        await release[call.call_id].wait()
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        get_host_turn_id=lambda: host_turn[0],
+        on_tool_call=handler,
+    )
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    client._current_turn_host_id = host_turn[0]
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed(_raw_tool_event("call-1"))
+    await asyncio.wait_for(started["call-1"].wait(), timeout=1)
+    release["call-1"].set()
+    await _wait_for_socket_sends(socket, 2)
+
+    # response.done rotated the host speech id; the response the tool result
+    # just created is the one that issues the NEXT call of the same user turn.
+    host_turn[0] = "turn-2"
+    socket.feed({"type": "response.created", "response": {"id": "tool-response-1"}})
+    await asyncio.sleep(0)
+    socket.feed(_raw_tool_event("call-2", response_id="tool-response-1"))
+    await asyncio.wait_for(started["call-2"].wait(), timeout=1)
+    assert client._current_turn_host_id == "turn-2"
+    socket.feed({"type": "response.done", "response": {"id": "tool-response-1"}})
+    await client._response_arbiter.wait_until_idle(timeout=1)
 
     release["call-2"].set()
     await _wait_for_tool_tasks(client)

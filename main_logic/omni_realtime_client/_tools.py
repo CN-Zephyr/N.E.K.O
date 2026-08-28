@@ -38,6 +38,7 @@ class _ToolTaskOwner:
     connection_generation: int
     scope_generation: int
     host_turn_id: str | None
+    provider_turn_host_id: str | None
     provider_session: Any
 
 
@@ -61,42 +62,12 @@ class _ToolingMixin:
     def has_tools(self) -> bool:
         return bool(self._tool_definitions) and self.on_tool_call is not None
 
-    def _pin_tool_scope_host_turn(self) -> str | None:
-        """Freeze the provider-turn host id this tool scope is compared against.
-
-        ``_current_turn_host_id`` is re-stamped by every ``response.created``,
-        including the one a tool result itself triggers. Reading it live at
-        result time therefore lets the FIRST completed call of a parallel
-        batch invalidate its siblings: with two function calls in one
-        response, the faster one's ``response.create`` produces a new
-        announcement, the snapshot moves to the host id the preceding
-        ``response.done`` rotated to, and the slower sibling's result is
-        dropped -- leaving the provider holding an unanswered
-        ``function_call``. A real new user turn advances
-        ``_tool_scope_generation``, which is the fence that owns that
-        decision, so pin the snapshot once per scope and let the generation
-        do the invalidating.
-        """
-
-        scope_generation = getattr(self, "_tool_scope_generation", 0)
-        pinned = getattr(self, "_tool_scope_host_turn", None)
-        if pinned is None or pinned[0] != scope_generation:
-            pinned = (
-                scope_generation,
-                getattr(self, "_current_turn_host_id", None),
-            )
-            self._tool_scope_host_turn = pinned
-        return pinned[1]
-
     def _capture_tool_task_owner(
         self,
         provider_session: Any,
         *,
         connection_generation: int | None = None,
     ) -> _ToolTaskOwner:
-        # Establish this scope's pin before the live read below, so every
-        # sibling call of one provider turn is judged against the same id.
-        self._pin_tool_scope_host_turn()
         return _ToolTaskOwner(
             connection_generation=(
                 self._connection_generation
@@ -105,6 +76,9 @@ class _ToolingMixin:
             ),
             scope_generation=getattr(self, "_tool_scope_generation", 0),
             host_turn_id=self._read_host_turn_id(),
+            # Snapshotted WITH the live read above, not re-read at result
+            # time: see ``_tool_task_owner_is_current``.
+            provider_turn_host_id=getattr(self, "_current_turn_host_id", None),
             provider_session=provider_session,
         )
 
@@ -121,20 +95,22 @@ class _ToolingMixin:
         # Providers without server VAD rotate the host speech id at the
         # function-calling response.done before the tool result is ready. That
         # ends a provider response, not the user turn that owns the tool. New
-        # user inputs advance ``scope_generation`` explicitly; compare the
-        # captured id only with this scope's pinned snapshot -- NOT with the
-        # live ``_current_turn_host_id``, which a sibling tool result's own
-        # response.created moves -- so neither a normal end-of-response
-        # rotation nor a parallel batch can discard a legal result.
-        pinned = getattr(self, "_tool_scope_host_turn", None)
-        provider_turn_host_id = (
-            pinned[1]
-            if pinned is not None and pinned[0] == owner.scope_generation
-            else getattr(self, "_current_turn_host_id", None)
-        )
+        # user inputs advance ``scope_generation`` explicitly; this clause only
+        # has to catch a host rotation that happened INSIDE the provider
+        # response that issued the call -- so it compares the two ids this
+        # owner sampled together and never re-reads the live snapshot.
+        #
+        # Re-reading it here is what made both directions wrong.
+        # ``_current_turn_host_id`` is re-stamped by every ``response.created``,
+        # including the one a tool result itself triggers: a parallel batch's
+        # faster sibling then moved the snapshot and orphaned the slower one.
+        # Pinning it for the whole tool scope traded that for the mirror-image
+        # bug, because sequential batches inside ONE user turn legitimately run
+        # under later, rotated snapshots. Only the owner's own pair is stable
+        # across both shapes.
         return (
-            provider_turn_host_id is None
-            or provider_turn_host_id == owner.host_turn_id
+            owner.provider_turn_host_id is None
+            or owner.provider_turn_host_id == owner.host_turn_id
         )
 
     def _tool_task_connection_is_current(self, owner: _ToolTaskOwner) -> bool:
