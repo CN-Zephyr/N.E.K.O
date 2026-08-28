@@ -2354,3 +2354,161 @@ async def test_gemini_anonymous_parallel_calls_keep_separate_results(monkeypatch
     assert len(session.tool_responses) == 1
     outputs = [r.response["who"] for r in session.tool_responses[0]]
     assert outputs == ["first", "second"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_waits_for_an_active_tool(monkeypatch) -> None:
+    """Gemini has no arbiter, so the ordering the raw path gets free is explicit."""
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 5.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def handler(call):
+        started.set()
+        await release.wait()
+        order.append("tool")
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    class _OrderedSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            order.append("proactive")
+
+        async def send_tool_response(self, *, function_responses) -> None:
+            order.append("tool_response")
+            await super().send_tool_response(function_responses=function_responses)
+
+    monkeypatch.setattr(
+        __import__(
+            "main_logic.omni_realtime_client._gemini_support",
+            fromlist=["types"],
+        ),
+        "types",
+        SimpleNamespace(FunctionResponse=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _OrderedSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    inject = asyncio.create_task(
+        client.inject_text_and_request_response("proactive body")
+    )
+    await asyncio.sleep(0.05)
+    assert order == [], "the inject must not overtake a running tool call"
+
+    release.set()
+    await asyncio.wait_for(inject, timeout=2)
+    await _wait_for_tool_tasks(client)
+
+    assert order[:2] == ["tool", "tool_response"]
+    assert "proactive" in order
+    assert order.index("tool_response") < order.index("proactive")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_is_not_blocked_forever_by_a_stuck_tool(monkeypatch) -> None:
+    """The removed gate had no TTL; this one must always let the message out."""
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 0.05)
+    started = asyncio.Event()
+    never = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(call):
+        started.set()
+        await never.wait()
+        return ToolResult(call_id=call.call_id, name=call.name, output={})
+
+    class _RecordingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            sent.append("proactive")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _RecordingSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await asyncio.wait_for(
+        client.inject_text_and_request_response("proactive body"), timeout=2
+    )
+
+    assert sent == ["proactive"]
+
+    never.set()
+    await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_tool_captured_after_a_mid_response_host_rotation_is_withheld() -> None:
+    """The host-id clause: a rotation INSIDE the owning provider response.
+
+    Not covered by scope_generation -- nothing here starts a new user turn.
+    The Gemini path resamples _current_turn_host_id after on_new_message
+    precisely so a legal call does not land in this state; without a test the
+    clause itself was dead code (deleting it broke nothing).
+    """
+
+    host_turn = ["turn-1"]
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        get_host_turn_id=lambda: host_turn[0],
+        on_tool_call=AsyncMock(),
+    )
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    client._current_turn_host_id = "turn-1"
+
+    aligned = client._capture_tool_task_owner(socket)
+    assert client._tool_task_owner_is_current(aligned) is True
+
+    # The host moved on mid-response without any new user input, so the
+    # provider turn's snapshot and the live id no longer agree.
+    host_turn[0] = "turn-2"
+    rotated = client._capture_tool_task_owner(socket)
+
+    assert client._tool_scope_generation == aligned.scope_generation, (
+        "premise: no new user turn -- scope_generation cannot be what rejects"
+    )
+    assert client._tool_task_owner_is_current(rotated) is False

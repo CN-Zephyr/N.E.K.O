@@ -43,6 +43,10 @@ from ._protocol_capabilities import STRICT_REALTIME_PROTOCOL_CAPABILITIES
 # from leaving the scheduler request open forever.
 _PROACTIVE_INJECT_DELIVERY_TIMEOUT_SECONDS = 30.0
 _GEMINI_PROACTIVE_CANCEL_GRACE_SECONDS = 3.0
+# How long a Gemini proactive inject waits for in-flight tool work to settle.
+# BOUNDED on purpose -- see ``_settle_tools_before_gemini_proactive``. Reuses
+# the cancel grace budget rather than inventing a second number.
+_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS = 3.0
 _PROACTIVE_TICKET_CANCEL_OBSERVE_TIMEOUT_SECONDS = 0.5
 
 
@@ -445,6 +449,10 @@ class _ResponseMixin:
             # SDK-send success alone is not response completion.
             if self._gemini_session is None:
                 raise RuntimeError("Gemini session not available for proactive inject")
+            await self._settle_tools_before_gemini_proactive()
+            if self._gemini_session is None:
+                # The settle above is an await; a teardown can land inside it.
+                raise RuntimeError("Gemini session not available for proactive inject")
             outcome_token = f"gemini_inject_{uuid.uuid4().hex}"
             if on_rejected is not None or on_completed is not None:
                 if getattr(self, "_gemini_proactive_outcome", None) is not None:
@@ -690,6 +698,51 @@ class _ResponseMixin:
             _close_outcome_window()
             raise
         return ticket
+
+    async def _settle_tools_before_gemini_proactive(self) -> bool:
+        """Let in-flight tool work finish first, within a bounded budget.
+
+        The raw providers get this ordering for free: their proactive inject
+        enqueues at priority 20 and a tool result at priority 5, so the
+        arbiter always sends the result first and the two never race. Gemini
+        has no arbiter on this path -- the inject is a direct
+        ``send_client_content`` -- and Gemini treats client content as an
+        interruption of the current generation, which is exactly how
+        ``cancel_response`` implements barge-in for it. An unhindered inject
+        can therefore abandon a function call whose side effect has already
+        run, leaving the provider without its output.
+
+        ``starts_user_turn=False`` does not cover this. That keeps the LOCAL
+        tool scope alive so a result is not discarded on arrival; it cannot
+        stop the provider from dropping the call.
+
+        Bounded, and that is the whole design. The tool-turn gate this branch
+        removed had no TTL and could block proactive messages forever; here a
+        tool that outlives the budget loses its ordering guarantee, never the
+        message. Returns whether everything settled -- for the log only.
+        """
+
+        current = asyncio.current_task()
+        pending = tuple(
+            task
+            for task in getattr(self, "_tool_tasks", ())
+            if not task.done() and task is not current
+        )
+        if not pending:
+            return True
+        _, still_running = await asyncio.wait(
+            pending,
+            timeout=_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS,
+        )
+        if still_running:
+            logger.warning(
+                "Gemini proactive inject proceeding with %d tool call(s) still "
+                "running after %.1fs; the provider may drop them",
+                len(still_running),
+                _GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS,
+            )
+            return False
+        return True
 
     def _settle_gemini_proactive_inject(
         self,
