@@ -10,8 +10,9 @@
 读取真实落盘目录（Documents/N.E.K.O/logs/），不再做相对路径推算。
 谁再加 loguru / cwd-based fallback —— 按维护者口径就把谁杀了。
 """
-import re
 import asyncio
+import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,6 +178,36 @@ def _is_error_log_file(name: str) -> bool:
     return "_error.log" in name
 
 
+def _plugin_log_file_matches(plugin_id: str, name: str) -> bool:
+    """Return whether *name* belongs to exactly this plugin's log stream.
+
+    Plugin ids may contain underscores, so a glob such as ``demo_*.log*``
+    would also match ``demo_other``. The writer's suffix is constrained to a
+    daily log or its dedicated error log, optionally followed by a rotation
+    suffix; use that format to keep plugins' logs isolated.
+    """
+    service_name = "PluginServer" if plugin_id == SERVER_LOG_ID else f"Plugin_{plugin_id}"
+    prefix = f"N.E.K.O_{service_name}_"
+    if not name.startswith(prefix):
+        return False
+    suffix = name.removeprefix(prefix)
+    return re.fullmatch(r"(?:\d{8}|error)\.log(?:\.[^.\\/]+)?", suffix) is not None
+
+
+def _list_plugin_log_files(log_dir: Path, plugin_id: str) -> list[Path]:
+    matched: list[tuple[float, Path]] = []
+    for path in log_dir.glob("N.E.K.O_*.log*"):
+        if not _plugin_log_file_matches(plugin_id, path.name):
+            continue
+        try:
+            matched.append((path.stat().st_mtime, path))
+        except OSError:
+            # Rotation may retire a file between the directory scan and stat.
+            continue
+    matched.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in matched]
+
+
 def _list_plugin_log_files_for_tail(log_dir: Path, plugin_id: str) -> list[Path]:
     """按 mtime 倒序返回该 plugin 的常规日志文件（已剔除 ``_error.log`` 系列）。
 
@@ -188,14 +219,11 @@ def _list_plugin_log_files_for_tail(log_dir: Path, plugin_id: str) -> list[Path]
     匹配 ``*.log`` 会在目录里只剩下轮转文件时返回空，让 tail / WebSocket 误报
     "无日志"。``_is_error_log_file`` 已经覆盖 ``_error.log.1`` 这类后缀。
     """
-    if plugin_id == SERVER_LOG_ID:
-        pattern = "N.E.K.O_PluginServer_*.log*"
-    else:
-        pattern = f"N.E.K.O_Plugin_{plugin_id}_*.log*"
-
-    files = [p for p in log_dir.glob(pattern) if not _is_error_log_file(p.name)]
-    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    return files
+    return [
+        path
+        for path in _list_plugin_log_files(log_dir, plugin_id)
+        if not _is_error_log_file(path.name)
+    ]
 
 
 def get_plugin_log_files(plugin_id: str) -> list[dict[str, object]]:
@@ -215,13 +243,7 @@ def get_plugin_log_files(plugin_id: str) -> list[dict[str, object]]:
     
     log_files = []
     
-    # 文件名由 RobustLoggerConfig 控制：N.E.K.O_{ServiceName}_YYYYMMDD.log
-    if plugin_id == SERVER_LOG_ID:
-        pattern = "N.E.K.O_PluginServer_*.log*"
-    else:
-        pattern = f"N.E.K.O_Plugin_{plugin_id}_*.log*"
-    
-    for log_file in log_dir.glob(pattern):
+    for log_file in _list_plugin_log_files(log_dir, plugin_id):
         try:
             stat = log_file.stat()
             log_files.append({
@@ -235,6 +257,70 @@ def get_plugin_log_files(plugin_id: str) -> list[dict[str, object]]:
     # 按修改时间排序（最新的在前）
     log_files.sort(key=lambda x: x["modified"], reverse=True)
     return log_files
+
+
+def clear_plugin_logs(plugin_id: str) -> dict[str, object]:
+    """Clear every persisted log file owned by one plugin.
+
+    Files are truncated in place rather than unlinked. Plugin processes can
+    keep their ``RotatingFileHandler`` handles open, particularly on Windows;
+    deleting an active file would either fail or detach that writer from the
+    path shown in the UI. Entries emitted concurrently after truncation are
+    intentionally retained as new logs.
+    """
+    _validate_plugin_id(plugin_id)
+    if plugin_id == SERVER_LOG_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="Server logs cannot be cleared from the plugin log viewer",
+        )
+
+    log_dir = get_plugin_log_dir(plugin_id)
+    if not log_dir.exists():
+        return {"plugin_id": plugin_id, "cleared_files": 0, "cleared_bytes": 0}
+
+    cleared_files = 0
+    cleared_bytes = 0
+    for log_file in _list_plugin_log_files(log_dir, plugin_id):
+        try:
+            # Do not follow a link planted in the log directory to an unrelated
+            # file. The logger never creates links, so skipping one is safe.
+            if log_file.is_symlink() or not log_file.is_file():
+                continue
+            size = log_file.stat().st_size
+            with log_file.open("r+b") as file_obj:
+                file_obj.truncate(0)
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
+            cleared_files += 1
+            cleared_bytes += size
+        except FileNotFoundError:
+            # Rotation may retire a snapshot entry while cleanup is running.
+            continue
+        except OSError as exc:
+            logger.warning(
+                "Failed to clear plugin log file: plugin_id={}, file={}, err_type={}",
+                plugin_id,
+                log_file.name,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to clear plugin logs",
+            ) from exc
+
+    # A tailer may otherwise keep an offset beyond the newly truncated file and
+    # miss the next records until the file grows past its previous size.
+    with _log_watchers_lock:
+        watcher = _log_watchers.get(plugin_id)
+        if watcher is not None:
+            watcher.last_position = 0
+
+    return {
+        "plugin_id": plugin_id,
+        "cleared_files": cleared_files,
+        "cleared_bytes": cleared_bytes,
+    }
 
 
 def parse_log_line(line: str) -> dict[str, object] | None:

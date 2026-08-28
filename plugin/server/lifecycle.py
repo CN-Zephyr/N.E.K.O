@@ -185,6 +185,22 @@ class ServerLifecycleService:
             )
 
         try:
+            cleaned_candidates = (
+                await self._plugin_lifecycle_service.retry_deferred_candidate_cleanup()
+            )
+            if cleaned_candidates:
+                logger.info(
+                    "retried deferred candidate package cleanup: cleaned={}",
+                    cleaned_candidates,
+                )
+        except Exception as exc:
+            logger.warning(
+                "deferred candidate package cleanup retry failed at startup: err_type={}, err={}",
+                type(exc).__name__,
+                str(exc),
+            )
+
+        try:
             await self._start_message_plane()
         except (RuntimeError, ValueError, TypeError, OSError, AttributeError, KeyError, TimeoutError) as exc:
             logger.warning(

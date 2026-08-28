@@ -1,7 +1,7 @@
 /**
  * 日志相关 API
  */
-import { get } from './index'
+import { del, get } from './index'
 import type { LogEntry, LogFile } from '@/types/api'
 
 /**
@@ -39,3 +39,11 @@ export function getPluginLogFiles(pluginId: string): Promise<{
   return get(`/plugin/${encodeURIComponent(pluginId)}/logs/files`)
 }
 
+/** 清空一个插件的所有落盘日志内容（不会影响服务器总日志）。 */
+export function clearPluginLogs(pluginId: string): Promise<{
+  plugin_id: string
+  cleared_files: number
+  cleared_bytes: number
+}> {
+  return del(`/plugin/${encodeURIComponent(pluginId)}/logs`, { suppressErrorMessage: true })
+}

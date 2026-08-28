@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from plugin.server.application.plugins import registry_service as module
+from plugin.server.application.install_source.models import (
+    CandidateRecord,
+    CandidateRef,
+    Channel,
+    PluginEntry,
+    PluginRegistrySnapshot,
+    RootId,
+    StateOwnership,
+)
 from plugin.server.domain.plugin_candidates import CandidateKey
 from plugin.server.infrastructure import plugin_selections, runtime_overrides
 
 
 pytestmark = pytest.mark.plugin_unit
+
+_REGISTRY_TS = "2026-08-27T00:00:00.000000Z"
 
 
 class _AliveHost:
@@ -129,6 +141,48 @@ def _write_package_plugin_fixture(
         encoding="utf-8",
     )
     return plugin_dir / "plugin.toml"
+
+
+def _registry_candidate(
+    root_id: RootId,
+    directory_name: str,
+    *,
+    channel: Channel,
+) -> CandidateRecord:
+    return CandidateRecord(
+        root_id=root_id,
+        directory_name=directory_name,
+        channel=channel,
+        reason="user_requested",
+        installed_at=_REGISTRY_TS,
+        updated_at=_REGISTRY_TS,
+        last_seen_at=_REGISTRY_TS,
+    )
+
+
+def test_registry_entry_with_only_retired_candidates_is_not_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    removed = replace(
+        _registry_candidate("user", "retired-demo", channel="manual"),
+        removed=True,
+        removed_at=_REGISTRY_TS,
+    )
+
+    scan = module._scan_registry_plugin_inventory_sync(
+        "demo",
+        PluginEntry(plugin_id="demo", candidates=(removed,)),
+        (builtin_root, user_root),
+    )
+
+    assert scan is not None
+    assert scan.inventory.candidates == ()
+    assert scan.failures == []
+    assert scan.config_paths == set()
 
 
 @pytest.mark.asyncio
@@ -847,6 +901,229 @@ async def test_plan_selected_candidate_removal_resolves_builtin_without_mutation
         "fallback_reason": "fallback_builtin",
     }
     assert plugin_selections.get_plugin_selection("demo") == selected
+
+
+@pytest.mark.asyncio
+async def test_registry_snapshot_fast_path_matches_legacy_candidate_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    _write_package_plugin_fixture(builtin_root, "demo")
+    _write_package_plugin_fixture(user_root, "demo-market", plugin_id="demo")
+    selected = CandidateKey(root_id="user", directory_name="demo-market")
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    plugin_selections.set_plugin_selection(
+        "demo",
+        selected,
+        candidate_source="manual",
+        state_access_grant="user_authorized",
+        authorized_at="2026-08-26T07:00:00Z",
+    )
+    legacy_service = module.PluginRegistryService()
+    expected_candidates = await legacy_service.list_plugin_candidates("demo")
+    expected_plan = await legacy_service.plan_plugin_candidate_removal(
+        "demo",
+        selected,
+    )
+
+    selected_ref = CandidateRef(root_id="user", directory_name="demo-market")
+    snapshot = PluginRegistrySnapshot.build(
+        {
+            "demo": PluginEntry(
+                plugin_id="demo",
+                candidates=(
+                    _registry_candidate("builtin", "demo", channel="builtin"),
+                    _registry_candidate("user", "demo-market", channel="manual"),
+                ),
+                selected_candidate=selected_ref,
+                candidate_source="manual",
+                state_owner=StateOwnership(
+                    candidate=selected_ref,
+                    state_scope="legacy_shared",
+                    state_access_grant="user_authorized",
+                    authorized_at="2026-08-26T07:00:00Z",
+                ),
+            )
+        },
+        revision=7,
+        updated_at=_REGISTRY_TS,
+    )
+    # Prove the injected Registry is the authority for the fast view rather
+    # than accidentally consulting the legacy selection cache.
+    plugin_selections.set_plugin_selection(
+        "demo",
+        CandidateKey(root_id="builtin", directory_name="demo"),
+    )
+
+    def reject_full_scan(_roots: tuple[Path, ...]) -> module.PluginInventoryScan:
+        raise AssertionError("Registry fast path unexpectedly performed a full scan")
+
+    monkeypatch.setattr(module, "_scan_plugin_inventory_sync", reject_full_scan)
+    registry_service = module.PluginRegistryService(
+        registry_snapshot_provider=lambda: snapshot
+    )
+
+    actual_candidates = await registry_service.list_plugin_candidates("demo")
+    actual_plan = await registry_service.plan_plugin_candidate_removal(
+        "demo",
+        selected,
+    )
+
+    assert actual_candidates == expected_candidates
+    assert actual_plan == expected_plan
+
+
+@pytest.mark.asyncio
+async def test_registry_snapshot_stale_candidate_fails_closed_without_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    _write_package_plugin_fixture(user_root, "demo")
+    snapshot = PluginRegistrySnapshot.build(
+        {
+            "demo": PluginEntry(
+                plugin_id="demo",
+                candidates=(
+                    _registry_candidate("user", "missing-demo", channel="manual"),
+                ),
+            )
+        },
+        revision=8,
+        updated_at=_REGISTRY_TS,
+    )
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    scan_calls = 0
+
+    def count_full_scan(_roots: tuple[Path, ...]) -> module.PluginInventoryScan:
+        nonlocal scan_calls
+        scan_calls += 1
+        raise AssertionError("authoritative Registry must not fall back to scanning")
+
+    monkeypatch.setattr(module, "_scan_plugin_inventory_sync", count_full_scan)
+    service = module.PluginRegistryService(registry_snapshot_provider=lambda: snapshot)
+
+    with pytest.raises(module.ServerDomainError) as exc_info:
+        await service.list_plugin_candidates("demo")
+
+    assert scan_calls == 0
+    assert exc_info.value.code == "PLUGIN_REGISTRY_STALE"
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_configured_registry_provider_must_be_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_full_scan(_roots: tuple[Path, ...]) -> module.PluginInventoryScan:
+        raise AssertionError("uninitialized Registry must not fall back to scanning")
+
+    monkeypatch.setattr(module, "_scan_plugin_inventory_sync", reject_full_scan)
+    service = module.PluginRegistryService(registry_snapshot_provider=lambda: None)
+
+    with pytest.raises(module.ServerDomainError) as exc_info:
+        await service.list_plugin_candidates("demo")
+
+    assert exc_info.value.code == "PLUGIN_REGISTRY_NOT_READY"
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_configured_registry_read_failure_fails_closed_without_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_full_scan(_roots: tuple[Path, ...]) -> module.PluginInventoryScan:
+        raise AssertionError("unreadable Registry must not fall back to scanning")
+
+    def fail_read() -> PluginRegistrySnapshot:
+        raise OSError("registry unavailable")
+
+    monkeypatch.setattr(module, "_scan_plugin_inventory_sync", reject_full_scan)
+    service = module.PluginRegistryService(registry_snapshot_provider=fail_read)
+
+    with pytest.raises(module.ServerDomainError) as exc_info:
+        await service.list_plugin_candidates("demo")
+
+    assert exc_info.value.code == "PLUGIN_REGISTRY_UNAVAILABLE"
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.details == {
+        "authority": "plugin_registry",
+        "error_type": "OSError",
+    }
+
+
+@pytest.mark.asyncio
+async def test_authoritative_registry_refresh_never_performs_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    _write_package_plugin_fixture(user_root, "demo")
+    snapshot = PluginRegistrySnapshot.build(
+        {
+            "demo": PluginEntry(
+                plugin_id="demo",
+                candidates=(
+                    _registry_candidate("user", "demo", channel="manual"),
+                ),
+            )
+        },
+        revision=9,
+        updated_at=_REGISTRY_TS,
+    )
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    class _DemoPlugin:
+        pass
+
+    def reject_full_scan(_roots: tuple[Path, ...]) -> module.PluginInventoryScan:
+        raise AssertionError("authoritative Registry refresh performed a full scan")
+
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (builtin_root, user_root))
+    monkeypatch.setattr(module, "_scan_plugin_inventory_sync", reject_full_scan)
+    monkeypatch.setattr(
+        module,
+        "_import_plugin_module",
+        lambda *_args, **_kwargs: type("_Module", (), {"DemoPlugin": _DemoPlugin}),
+    )
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        service = module.PluginRegistryService(
+            registry_snapshot_provider=lambda: snapshot
+        )
+        result = await service.refresh_registry()
+        refreshed = await service.refresh_plugin("demo")
+        validated = await service.validate_plugin_candidate(
+            "demo",
+            CandidateKey(root_id="user", directory_name="demo"),
+        )
+
+        assert result["success"] is True
+        assert result["scanned_count"] == 1
+        assert result["selected_count"] == 1
+        assert refreshed["plugin_id"] == "demo"
+        assert validated["candidate"] == {
+            "root_id": "user",
+            "directory_name": "demo",
+        }
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
 
 
 @pytest.mark.asyncio

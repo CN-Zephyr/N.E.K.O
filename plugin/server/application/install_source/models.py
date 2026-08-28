@@ -1,13 +1,12 @@
-"""Frozen dataclass types for the plugin install source lock.
+"""Frozen dataclass types for legacy install-source state and Registry v1.
 
 All timestamps are carried as already-normalized strings in the format
 ``%Y-%m-%dT%H:%M:%S.%fZ`` (UTC). Normalization happens in the Parser; the
 models themselves do not validate or coerce timestamps.
 
-``frozen=True`` lets writers publish new :class:`LockFile` snapshots via
-a single attribute assignment on the manager — readers always observe a
-fully consistent :class:`LockFile` whether they take the pre- or
-post-publish state.
+``frozen=True`` lets legacy and Registry writers publish complete snapshots via
+a single attribute assignment — readers always observe either the pre- or the
+post-publish value, never a partially mutated model.
 """
 
 from __future__ import annotations
@@ -120,16 +119,16 @@ class LockFile:
 
 
 # ---------------------------------------------------------------------------
-# Schema v3: unified inventory (candidates + selection + state ownership)
+# Registry schema v1: candidates + selection + runtime intent + state ownership
 # ---------------------------------------------------------------------------
-# v3 keeps every v1/v2 provenance field but regroups the flat ``entries``
+# Registry v1 keeps every v1/v2 provenance field but regroups flat ``entries``
 # list under its logical PluginId, and folds in the selection and
 # state-ownership receipts that v2 kept in a second file
 # (``plugin_candidate_selections.json``). Nothing here is a new product
 # concept: it is the same data with one owner and one revision.
 
 
-INVENTORY_SCHEMA_VERSION = 3
+REGISTRY_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -138,7 +137,7 @@ class CandidateRecord:
 
     Field-for-field equivalent to :class:`LockEntry` minus ``plugin_id``,
     which becomes the enclosing :class:`PluginEntry` key. Keeping the field
-    names identical lets the v2 → v3 conversion stay mechanical and lets the
+    names identical lets the legacy conversion stay mechanical and lets the
     serializer reuse :func:`_serialize_source_detail_for_json`.
     """
 
@@ -162,7 +161,7 @@ class CandidateRecord:
 
     @classmethod
     def from_lock_entry(cls, entry: LockEntry) -> "CandidateRecord":
-        """Project a v2 :class:`LockEntry` into a v3 candidate record."""
+        """Project a v2 :class:`LockEntry` into a Registry candidate record."""
 
         return cls(
             root_id=entry.root_id,
@@ -223,7 +222,7 @@ class StateOwnership:
 
     Mirrors the receipt v2 stored under ``state_owners`` in
     ``plugin_candidate_selections.json``. ``state_scope`` is currently always
-    ``"legacy_shared"`` or ``None`` — v3 does not introduce a new scope.
+    ``"legacy_shared"`` or ``None`` — Registry v1 does not add a new scope.
     """
 
     candidate: CandidateRef
@@ -243,7 +242,8 @@ class PluginEntry:
       member of ``candidates``;
     * ``state_owner`` may name a ``removed=True`` candidate — losing the code
       must not silently drop the data-ownership receipt;
-    * ``enabled`` is desired runtime intent only; actual process state never
+    * ``enabled`` / ``auto_start`` are sparse user overrides. ``None`` keeps
+      the candidate manifest's current default; actual process state never
       lands here.
     """
 
@@ -251,7 +251,8 @@ class PluginEntry:
     candidates: tuple[CandidateRecord, ...] = ()
     selected_candidate: CandidateRef | None = None
     candidate_source: Channel | None = None
-    enabled: bool = True
+    enabled: bool | None = None
+    auto_start: bool | None = None
     state_owner: StateOwnership | None = None
 
     def candidate_for(self, ref: CandidateRef) -> CandidateRecord | None:
@@ -265,8 +266,8 @@ class PluginEntry:
 
 
 @dataclass(frozen=True)
-class PluginInventory:
-    """Top-level v3 snapshot: the single durable desired-state authority.
+class PluginRegistrySnapshot:
+    """Top-level registry snapshot: the single durable desired-state authority.
 
     Replaces the ``plugins.lock.json`` + ``plugin_candidate_selections.json``
     pair. ``revision`` is a monotonic counter used for compare-and-set writes
@@ -277,7 +278,7 @@ class PluginInventory:
     the Windows registry.
     """
 
-    schema_version: int = INVENTORY_SCHEMA_VERSION
+    schema_version: int = REGISTRY_SCHEMA_VERSION
     plugins: Mapping[str, PluginEntry] = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -293,8 +294,8 @@ class PluginInventory:
         revision: int = 1,
         updated_at: str,
         created_at: str | None = None,
-        schema_version: int = INVENTORY_SCHEMA_VERSION,
-    ) -> "PluginInventory":
+        schema_version: int = REGISTRY_SCHEMA_VERSION,
+    ) -> "PluginRegistrySnapshot":
         """Freeze ``plugins`` so readers can share a snapshot without copying."""
 
         return cls(
@@ -308,7 +309,7 @@ class PluginInventory:
     def entry(self, plugin_id: str) -> PluginEntry | None:
         return self.plugins.get(plugin_id)
 
-    def with_entry(self, entry: PluginEntry) -> "PluginInventory":
+    def with_entry(self, entry: PluginEntry) -> "PluginRegistrySnapshot":
         """Return a snapshot with one PluginEntry replaced.
 
         ``revision`` and ``updated_at`` are deliberately untouched: bumping
@@ -318,7 +319,7 @@ class PluginInventory:
 
         merged = dict(self.plugins)
         merged[entry.plugin_id] = entry
-        return PluginInventory(
+        return PluginRegistrySnapshot(
             schema_version=self.schema_version,
             plugins=MappingProxyType(merged),
             revision=self.revision,

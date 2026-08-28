@@ -5,14 +5,15 @@ from pathlib import Path
 import pytest
 
 from plugin.core.plugin_layout import resolve_plugin_layout
-from plugin.server.application.plugins import upgrade_support
-from plugin.server.application.plugins.upgrade_support import (
+from plugin.server.application.package_management import filesystem as package_filesystem
+from plugin.server.application.package_management.filesystem import remove_directory
+from plugin.server.application.package_management.replacement import (
     ReplacePluginError,
-    plugin_is_running,
     replace_plugin,
-    remove_directory,
     run_rollback,
 )
+from plugin.server.application.plugins import upgrade_support
+from plugin.server.application.plugins.upgrade_support import plugin_is_running
 from plugin.server.infrastructure.config_profiles import load_profiles_cfg_from_file
 
 pytestmark = pytest.mark.plugin_unit
@@ -26,9 +27,24 @@ async def _async_false() -> bool:
     return False
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "backup_path_for",
+        "restore_directory",
+        "remove_directory",
+        "merge_directory_contents",
+        "replace_plugin",
+        "run_rollback",
+    ],
+)
+def test_upgrade_support_does_not_reexport_package_mutations(name: str) -> None:
+    assert not hasattr(upgrade_support, name)
+
+
 def test_legacy_profile_case_variants_cannot_share_one_canonical_target() -> None:
     with pytest.raises(OSError, match="multiple legacy profile paths map to profiles.toml"):
-        upgrade_support._canonical_profile_sources(
+        package_filesystem.canonical_profile_sources(
             [Path("profiles.toml"), Path("Profiles.toml")]
         )
 
@@ -499,8 +515,6 @@ async def test_remove_directory_propagates_cleanup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from plugin.server.application.plugins import upgrade_support
-
     target = tmp_path / "demo"
     target.mkdir()
     ignore_values: list[bool] = []
@@ -511,7 +525,11 @@ async def test_remove_directory_propagates_cleanup_failure(
         if not ignore_errors:
             raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(upgrade_support.shutil, "rmtree", fail_unless_errors_are_suppressed)
+    monkeypatch.setattr(
+        package_filesystem.shutil,
+        "rmtree",
+        fail_unless_errors_are_suppressed,
+    )
 
     with pytest.raises(PermissionError, match="cleanup denied"):
         await remove_directory(target)

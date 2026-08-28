@@ -2128,6 +2128,65 @@ class InstallSourceManager:
             self._current = new_lock
             self.save()
 
+    def mark_profile_removed(
+        self,
+        *,
+        directory_path: Path,
+    ) -> None:
+        """Clear package-profile ownership for one exact candidate.
+
+        This is the durable commit used *after* a package-owned profile has
+        been staged for deletion.  Candidate provenance and audit fields stay
+        intact, including for an already-soft-deleted candidate.  Repeating
+        the operation is an idempotent no-op.
+
+        The method does not delete files.  Filesystem staging, rollback and
+        deferred cleanup belong to the package-management coordinator.
+        """
+
+        root_id, directory_name = classify_plugin_path(
+            directory_path,
+            builtin_root=self.builtin_root,
+            user_root=self.user_root,
+        )
+        if root_id == "builtin":
+            raise InstallSourceError(
+                "BUILTIN_CHANNEL_LOCKED",
+                f"builtin plugin {directory_name} profile cannot be removed",
+                details={
+                    "directory_name": directory_name,
+                    "target_channel": "profile_removed",
+                },
+            )
+
+        with self._lock:
+            old_lock = self._current
+            existing = self._find_entry(old_lock, root_id, directory_name)
+            if existing is None:
+                logger.warning(
+                    "InstallSourceManager.mark_profile_removed: no lock entry for "
+                    "(root_id=%s, directory=%s), skipping",
+                    root_id,
+                    directory_name,
+                )
+                return
+            if not existing.profile_dir and existing.profile_installed is False:
+                return
+
+            now = self._now_iso()
+            updated = dataclasses.replace(
+                existing,
+                profile_dir="",
+                profile_installed=False,
+                updated_at=now,
+            )
+            self._current = self._replace_entry(old_lock, updated, updated_at=now)
+            try:
+                self.save()
+            except BaseException:
+                self._current = old_lock
+                raise
+
     # ------------------------------------------------------------------
     # Read path: list_entries / to_api_view (task 2.6 / design §11.3 / §12.3)
     # ------------------------------------------------------------------

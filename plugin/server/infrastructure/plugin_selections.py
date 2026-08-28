@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -13,6 +13,16 @@ from plugin.server.domain.plugin_candidates import (
     CandidateKey,
     CandidateSource,
     StateAccessGrant,
+)
+from plugin.server.application.install_source.models import (
+    CandidateRef,
+    PluginEntry,
+    StateOwnership,
+)
+from plugin.server.infrastructure.plugin_registry_authority import (
+    get_published_plugin_registry,
+    is_plugin_registry_authority_configured,
+    update_published_plugin_registry,
 )
 
 logger = get_logger("server.infrastructure.plugin_selections")
@@ -254,6 +264,11 @@ def _get_store() -> PluginSelectionStore:
 def load_plugin_selections() -> dict[str, CandidateKey]:
     """Return an immutable-value snapshot, loading it on first access."""
 
+    if is_plugin_registry_authority_configured():
+        return {
+            plugin_id: selection.candidate
+            for plugin_id, selection in load_plugin_selection_records().items()
+        }
     with _cache_lock:
         return {
             plugin_id: selection.candidate
@@ -262,6 +277,21 @@ def load_plugin_selections() -> dict[str, CandidateKey]:
 
 
 def load_plugin_selection_records() -> dict[str, PluginSelection]:
+    registry = get_published_plugin_registry()
+    if is_plugin_registry_authority_configured():
+        if registry is None:
+            raise PluginSelectionReadError("Plugin Registry authority is not available")
+        try:
+            snapshot = registry.load()
+            return {
+                plugin_id: selection
+                for plugin_id, entry in snapshot.plugins.items()
+                if (selection := _selection_from_registry_entry(entry)) is not None
+            }
+        except Exception as exc:
+            raise PluginSelectionReadError(
+                "Failed to read candidate selections from plugin Registry"
+            ) from exc
     with _cache_lock:
         return dict(_get_store().selections)
 
@@ -299,6 +329,24 @@ def get_plugin_state_owner(plugin_id: str) -> PluginSelection | None:
 
     if not plugin_id:
         return None
+    registry = get_published_plugin_registry()
+    if is_plugin_registry_authority_configured():
+        if registry is None:
+            logger.warning(
+                "Plugin Registry state owner is unavailable for plugin {}",
+                plugin_id,
+            )
+            return None
+        try:
+            entry = registry.load().entry(plugin_id)
+            return _state_owner_from_registry_entry(entry) if entry else None
+        except Exception as exc:
+            logger.warning(
+                "Ignoring unreadable plugin Registry state owner for plugin {}: {}",
+                plugin_id,
+                exc,
+            )
+            return None
     try:
         with _cache_lock:
             return _get_store().state_owners.get(plugin_id)
@@ -324,25 +372,66 @@ def set_plugin_selection(
 
     if not plugin_id:
         return
+    if candidate.root_id == "builtin":
+        candidate_source = "builtin"
+        state_access_grant = "builtin"
+        release_chain_id = None
+        authorized_at = None
+    if not _valid_state_receipt_fields(
+        root_id=candidate.root_id,
+        candidate_source=candidate_source,
+        state_scope="legacy_shared",
+        state_access_grant=state_access_grant,
+        release_chain_id=release_chain_id,
+        authorized_at=authorized_at,
+    ):
+        raise PluginSelectionWriteError(
+            "Refusing to persist a candidate without a valid shared-state grant"
+        )
+    registry = get_published_plugin_registry()
+    if is_plugin_registry_authority_configured():
+        if registry is None:
+            raise PluginSelectionWriteError("Plugin Registry authority is not available")
+        ref = CandidateRef(
+            root_id=candidate.root_id,
+            directory_name=candidate.directory_name,
+        )
+
+        def mutate(snapshot):
+            entry = snapshot.entry(plugin_id)
+            record = entry.candidate_for(ref) if entry is not None else None
+            if entry is None or record is None or record.removed:
+                raise PluginSelectionWriteError(
+                    "Refusing to select a candidate absent from plugin Registry"
+                )
+            owner = StateOwnership(
+                candidate=ref,
+                state_scope="legacy_shared",
+                state_access_grant=state_access_grant,
+                release_chain_id=release_chain_id or None,
+                authorized_at=authorized_at or None,
+            )
+            return snapshot.with_entry(
+                replace(
+                    entry,
+                    selected_candidate=ref,
+                    candidate_source=candidate_source,
+                    state_owner=owner,
+                )
+            )
+
+        try:
+            update_published_plugin_registry(mutate)
+        except PluginSelectionWriteError:
+            raise
+        except Exception as exc:
+            raise PluginSelectionWriteError(
+                "Failed to persist candidate selection to plugin Registry"
+            ) from exc
+        return
     global _cache
     with _cache_lock:
         store = _get_store()
-        if candidate.root_id == "builtin":
-            candidate_source = "builtin"
-            state_access_grant = "builtin"
-            release_chain_id = None
-            authorized_at = None
-        if not _valid_state_receipt_fields(
-            root_id=candidate.root_id,
-            candidate_source=candidate_source,
-            state_scope="legacy_shared",
-            state_access_grant=state_access_grant,
-            release_chain_id=release_chain_id,
-            authorized_at=authorized_at,
-        ):
-            raise PluginSelectionWriteError(
-                "Refusing to persist a candidate without a valid shared-state grant"
-            )
         selection = PluginSelection(
             candidate=candidate,
             candidate_source=candidate_source,
@@ -368,6 +457,24 @@ def set_plugin_selection(
 def clear_plugin_selection(plugin_id: str) -> None:
     if not plugin_id:
         return
+    if is_plugin_registry_authority_configured():
+        if get_published_plugin_registry() is None:
+            raise PluginSelectionWriteError("Plugin Registry authority is not available")
+        def mutate(snapshot):
+            entry = snapshot.entry(plugin_id)
+            if entry is None or entry.selected_candidate is None:
+                return snapshot
+            return snapshot.with_entry(
+                replace(entry, selected_candidate=None, candidate_source=None)
+            )
+
+        try:
+            update_published_plugin_registry(mutate)
+        except Exception as exc:
+            raise PluginSelectionWriteError(
+                "Failed to clear candidate selection in plugin Registry"
+            ) from exc
+        return
     global _cache
     with _cache_lock:
         store = _get_store()
@@ -389,6 +496,32 @@ def clear_plugin_selection_if_matches(
 
     if not plugin_id:
         return False
+    if is_plugin_registry_authority_configured():
+        if get_published_plugin_registry() is None:
+            raise PluginSelectionWriteError("Plugin Registry authority is not available")
+        matched = False
+
+        def mutate(snapshot):
+            nonlocal matched
+            entry = snapshot.entry(plugin_id)
+            selected = entry.selected_candidate if entry is not None else None
+            if selected is None or selected.primary_key != (
+                candidate.root_id,
+                candidate.directory_name,
+            ):
+                return snapshot
+            matched = True
+            return snapshot.with_entry(
+                replace(entry, selected_candidate=None, candidate_source=None)
+            )
+
+        try:
+            update_published_plugin_registry(mutate)
+        except Exception as exc:
+            raise PluginSelectionWriteError(
+                "Failed to clear candidate selection in plugin Registry"
+            ) from exc
+        return matched
     global _cache
     with _cache_lock:
         store = _get_store()
@@ -426,6 +559,63 @@ def _ensure_write_allowed() -> None:
         raise PluginSelectionWriteError(
             f"Refusing to overwrite {SELECTIONS_FILENAME} because it contains invalid content"
         )
+
+
+def _selection_from_registry_entry(entry: PluginEntry) -> PluginSelection | None:
+    selected = entry.selected_candidate
+    if selected is None:
+        return None
+    return PluginSelection(
+        candidate=CandidateKey(
+            root_id=selected.root_id,
+            directory_name=selected.directory_name,
+        ),
+        candidate_source=entry.candidate_source,
+        state_scope=(
+            entry.state_owner.state_scope
+            if entry.state_owner is not None
+            and entry.state_owner.candidate == selected
+            else None
+        ),
+        state_access_grant=(
+            entry.state_owner.state_access_grant
+            if entry.state_owner is not None
+            and entry.state_owner.candidate == selected
+            else None
+        ),
+        release_chain_id=(
+            entry.state_owner.release_chain_id
+            if entry.state_owner is not None
+            and entry.state_owner.candidate == selected
+            else None
+        ),
+        authorized_at=(
+            entry.state_owner.authorized_at
+            if entry.state_owner is not None
+            and entry.state_owner.candidate == selected
+            else None
+        ),
+    )
+
+
+def _state_owner_from_registry_entry(entry: PluginEntry) -> PluginSelection | None:
+    owner = entry.state_owner
+    if owner is None:
+        return None
+    record = entry.candidate_for(owner.candidate)
+    if record is None:
+        return None
+    return PluginSelection(
+        candidate=CandidateKey(
+            root_id=owner.candidate.root_id,
+            directory_name=owner.candidate.directory_name,
+        ),
+        candidate_source=record.channel,
+        state_scope=owner.state_scope,
+        state_access_grant=owner.state_access_grant,
+        release_chain_id=owner.release_chain_id,
+        authorized_at=owner.authorized_at,
+    )
 
 
 def _valid_state_receipt_fields(

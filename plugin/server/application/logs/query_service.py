@@ -8,7 +8,7 @@ from plugin.logging_config import get_logger
 from plugin.server.domain import IO_RUNTIME_ERRORS
 from plugin.server.domain.errors import ServerDomainError
 from plugin.utils.time_utils import now_iso
-from plugin.server.logs import get_plugin_log_files, get_plugin_logs
+from plugin.server.logs import clear_plugin_logs, get_plugin_log_files, get_plugin_logs
 
 logger = get_logger("server.application.logs.query")
 
@@ -48,6 +48,40 @@ def _detail_to_message(detail: object, *, default_message: str) -> str:
 
 
 class LogQueryService:
+    def clear_plugin_logs(self, plugin_id: str) -> dict[str, object]:
+        try:
+            raw_result = clear_plugin_logs(plugin_id)
+            if not isinstance(raw_result, Mapping):
+                raise ServerDomainError(
+                    code="INVALID_DATA_SHAPE",
+                    message="plugin log cleanup result is not an object",
+                    status_code=500,
+                    details={"plugin_id": plugin_id, "result_type": type(raw_result).__name__},
+                )
+            return _normalize_mapping(raw_result, context=f"plugin_log_cleanup[{plugin_id}]")
+        except ServerDomainError:
+            raise
+        except HTTPException as exc:
+            raise ServerDomainError(
+                code="PLUGIN_LOG_CLEAR_FAILED",
+                message=_detail_to_message(exc.detail, default_message="Failed to clear plugin logs"),
+                status_code=exc.status_code,
+                details={"plugin_id": plugin_id, "error_type": "HTTPException"},
+            ) from exc
+        except IO_RUNTIME_ERRORS as exc:
+            logger.error(
+                "clear_plugin_logs failed: plugin_id={}, err_type={}, err={}",
+                plugin_id,
+                type(exc).__name__,
+                str(exc),
+            )
+            raise ServerDomainError(
+                code="PLUGIN_LOG_CLEAR_FAILED",
+                message="Failed to clear plugin logs",
+                status_code=500,
+                details={"plugin_id": plugin_id, "error_type": type(exc).__name__},
+            ) from exc
+
     def get_plugin_logs(
         self,
         *,

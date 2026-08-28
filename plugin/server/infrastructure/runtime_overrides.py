@@ -19,9 +19,16 @@ Legacy boolean entries remain valid and represent an ``enabled`` override only.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from typing import Iterable, Mapping
 
 from plugin.logging_config import get_logger
+from plugin.server.application.install_source.models import PluginEntry
+from plugin.server.infrastructure.plugin_registry_authority import (
+    get_published_plugin_registry,
+    is_plugin_registry_authority_configured,
+    update_published_plugin_registry,
+)
 
 logger = get_logger("server.infrastructure.runtime_overrides")
 
@@ -48,6 +55,8 @@ class RuntimeOverrideWriteError(RuntimeOverridePersistenceError):
 
 def _coerce_overrides_with_status(
     raw: object,
+    *,
+    log_invalid: bool = True,
 ) -> tuple[dict[str, RuntimeOverride], bool]:
     if not isinstance(raw, Mapping):
         raise RuntimeOverrideReadError(
@@ -58,10 +67,11 @@ def _coerce_overrides_with_status(
     for key, value in raw.items():
         if not isinstance(key, str):
             invalid_content_found = True
-            logger.warning(
-                "Ignoring runtime override with invalid plugin id in {}",
-                OVERRIDES_FILENAME,
-            )
+            if log_invalid:
+                logger.warning(
+                    "Ignoring runtime override with invalid plugin id in {}",
+                    OVERRIDES_FILENAME,
+                )
             continue
         if isinstance(value, bool):
             result[key] = value
@@ -75,20 +85,22 @@ def _coerce_overrides_with_status(
             }
             if unknown_fields:
                 invalid_content_found = True
-                logger.warning(
-                    "Ignoring unknown runtime override fields for plugin {} in {}: {}",
-                    key,
-                    OVERRIDES_FILENAME,
-                    sorted(str(field) for field in unknown_fields),
-                )
+                if log_invalid:
+                    logger.warning(
+                        "Ignoring unknown runtime override fields for plugin {} in {}: {}",
+                        key,
+                        OVERRIDES_FILENAME,
+                        sorted(str(field) for field in unknown_fields),
+                    )
             if invalid_fields:
                 invalid_content_found = True
-                logger.warning(
-                    "Ignoring runtime override entry with invalid fields for plugin {} in {}: {}",
-                    key,
-                    OVERRIDES_FILENAME,
-                    sorted(invalid_fields),
-                )
+                if log_invalid:
+                    logger.warning(
+                        "Ignoring runtime override entry with invalid fields for plugin {} in {}: {}",
+                        key,
+                        OVERRIDES_FILENAME,
+                        sorted(invalid_fields),
+                    )
                 continue
             normalized = {
                 field: field_value
@@ -99,18 +111,20 @@ def _coerce_overrides_with_status(
                 result[key] = normalized
             else:
                 invalid_content_found = True
-                logger.warning(
-                    "Ignoring invalid runtime override entry for plugin {} in {}",
-                    key,
-                    OVERRIDES_FILENAME,
-                )
+                if log_invalid:
+                    logger.warning(
+                        "Ignoring invalid runtime override entry for plugin {} in {}",
+                        key,
+                        OVERRIDES_FILENAME,
+                    )
             continue
         invalid_content_found = True
-        logger.warning(
-            "Ignoring invalid runtime override entry for plugin {} in {}",
-            key,
-            OVERRIDES_FILENAME,
-        )
+        if log_invalid:
+            logger.warning(
+                "Ignoring invalid runtime override entry for plugin {} in {}",
+                key,
+                OVERRIDES_FILENAME,
+            )
     return result, invalid_content_found
 
 
@@ -169,6 +183,20 @@ def _save_to_disk(overrides: dict[str, RuntimeOverride]) -> None:
 
 def load_runtime_overrides() -> dict[str, RuntimeOverride]:
     """Return a snapshot of the persisted overrides; loads on first access."""
+    registry = get_published_plugin_registry()
+    if is_plugin_registry_authority_configured():
+        if registry is None:
+            raise RuntimeOverrideReadError("Plugin Registry authority is not available")
+        try:
+            return {
+                plugin_id: _runtime_override_from_registry_entry(entry)
+                for plugin_id, entry in registry.load().plugins.items()
+                if entry.enabled is not None or entry.auto_start is not None
+            }
+        except Exception as exc:
+            raise RuntimeOverrideReadError(
+                "Failed to read runtime preferences from plugin Registry"
+            ) from exc
     global _cache
     with _cache_lock:
         if _cache is None:
@@ -235,6 +263,20 @@ def set_runtime_override(
     """
     if not plugin_id:
         return
+    if is_plugin_registry_authority_configured():
+        if get_published_plugin_registry() is None:
+            raise RuntimeOverrideWriteError("Plugin Registry authority is not available")
+        def mutate(snapshot):
+            entry = snapshot.entry(plugin_id) or PluginEntry(plugin_id=plugin_id)
+            next_auto_start = (
+                entry.auto_start if auto_start is None else auto_start
+            )
+            return snapshot.with_entry(
+                replace(entry, enabled=enabled, auto_start=next_auto_start)
+            )
+
+        _update_registry_runtime_intent(mutate)
+        return
     global _cache
     with _cache_lock:
         if _cache is None:
@@ -284,6 +326,44 @@ def migrate_runtime_override(
         set_runtime_override(target_plugin_id, enabled, auto_start=auto_start)
         return
 
+    if is_plugin_registry_authority_configured():
+        if get_published_plugin_registry() is None:
+            raise RuntimeOverrideWriteError("Plugin Registry authority is not available")
+        def mutate(snapshot):
+            existing_entry = next(
+                (
+                    snapshot.entry(plugin_id)
+                    for plugin_id in reversed(stale_ids)
+                    if snapshot.entry(plugin_id) is not None
+                    and (
+                        snapshot.entry(plugin_id).enabled is not None
+                        or snapshot.entry(plugin_id).auto_start is not None
+                    )
+                ),
+                snapshot.entry(target_plugin_id),
+            )
+            target = snapshot.entry(target_plugin_id) or PluginEntry(
+                plugin_id=target_plugin_id
+            )
+            next_auto_start = (
+                existing_entry.auto_start
+                if auto_start is None and existing_entry is not None
+                else auto_start
+            )
+            updated = snapshot.with_entry(
+                replace(target, enabled=enabled, auto_start=next_auto_start)
+            )
+            for stale_plugin_id in stale_ids:
+                stale = updated.entry(stale_plugin_id)
+                if stale is not None:
+                    updated = updated.with_entry(
+                        replace(stale, enabled=None, auto_start=None)
+                    )
+            return updated
+
+        _update_registry_runtime_intent(mutate)
+        return
+
     global _cache
     with _cache_lock:
         if _cache is None:
@@ -325,6 +405,21 @@ def clear_runtime_override(plugin_id: str) -> None:
     """
     if not plugin_id:
         return
+    if is_plugin_registry_authority_configured():
+        if get_published_plugin_registry() is None:
+            raise RuntimeOverrideWriteError("Plugin Registry authority is not available")
+        def mutate(snapshot):
+            entry = snapshot.entry(plugin_id)
+            if entry is None or (
+                entry.enabled is None and entry.auto_start is None
+            ):
+                return snapshot
+            return snapshot.with_entry(
+                replace(entry, enabled=None, auto_start=None)
+            )
+
+        _update_registry_runtime_intent(mutate)
+        return
     global _cache
     with _cache_lock:
         if _cache is None:
@@ -344,3 +439,23 @@ def reset_cache_for_testing() -> None:
     with _cache_lock:
         _cache = None
         _cache_write_blocked_by_invalid_content = False
+
+
+def _runtime_override_from_registry_entry(entry: PluginEntry) -> RuntimeOverride:
+    if entry.auto_start is None and entry.enabled is not None:
+        return entry.enabled
+    result: dict[str, bool] = {}
+    if entry.enabled is not None:
+        result["enabled"] = entry.enabled
+    if entry.auto_start is not None:
+        result["auto_start"] = entry.auto_start
+    return result
+
+
+def _update_registry_runtime_intent(mutate) -> None:
+    try:
+        update_published_plugin_registry(mutate)
+    except Exception as exc:
+        raise RuntimeOverrideWriteError(
+            "Failed to persist runtime preferences to plugin Registry"
+        ) from exc

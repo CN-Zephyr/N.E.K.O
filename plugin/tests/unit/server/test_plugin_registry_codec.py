@@ -1,10 +1,10 @@
-"""Schema v3 inventory: codec round-trip, determinism, and v2 → v3 migration.
+"""Registry v1: codec round-trip, determinism, and legacy-state migration.
 
-The v3 inventory is the single durable authority that replaces the
-``plugins.lock.json`` + ``plugin_candidate_selections.json`` pair. These tests
+The Registry is the future single durable authority replacing provenance,
+selection/state-owner, and runtime-override files. These tests
 pin the contracts the later cutover depends on:
 
-* parse ∘ serialize is the identity on a v3 snapshot, and serialization is
+* parse ∘ serialize is the identity on a Registry snapshot, and serialization is
   byte-deterministic for an unchanged snapshot;
 * every representable v2 field survives migration (checked both by explicit
   assertions and by ``describe_migration_losses``);
@@ -22,13 +22,13 @@ import json
 import pytest
 from hypothesis import given, settings, strategies as st
 
-from plugin.server.application.install_source.inventory_codec import (
-    parse_inventory,
-    serialize_inventory,
+from plugin.server.application.install_source.registry_codec import (
+    parse_registry,
+    serialize_registry,
 )
-from plugin.server.application.install_source.migration import (
+from plugin.server.application.install_source.registry_migration import (
     describe_migration_losses,
-    migrate_lock_to_inventory,
+    migrate_legacy_state_to_registry,
 )
 from plugin.server.application.install_source.models import (
     CandidateRecord,
@@ -36,7 +36,7 @@ from plugin.server.application.install_source.models import (
     LockEntry,
     LockFile,
     PluginEntry,
-    PluginInventory,
+    PluginRegistrySnapshot,
     SourceDetailImported,
     SourceDetailMarket,
     StateOwnership,
@@ -97,9 +97,9 @@ def _selection(root_id: str, directory_name: str, **kwargs) -> PluginSelection:
     )
 
 
-def _roundtrip(inventory: PluginInventory) -> PluginInventory:
-    return parse_inventory(
-        json.loads(serialize_inventory(inventory)), now=TS, schema_version=3
+def _roundtrip(inventory: PluginRegistrySnapshot) -> PluginRegistrySnapshot:
+    return parse_registry(
+        json.loads(serialize_registry(inventory)), now=TS, schema_version=1
     )
 
 
@@ -120,7 +120,7 @@ def test_codec_roundtrip_preserves_a_full_snapshot() -> None:
         _lock_entry(plugin_id="demo", source_detail=_market_detail())
     )
     ref = CandidateRef(root_id="user", directory_name="demo")
-    inventory = PluginInventory.build(
+    inventory = PluginRegistrySnapshot.build(
         {
             "demo": PluginEntry(
                 plugin_id="demo",
@@ -128,6 +128,7 @@ def test_codec_roundtrip_preserves_a_full_snapshot() -> None:
                 selected_candidate=ref,
                 candidate_source="market",
                 enabled=True,
+                auto_start=False,
                 state_owner=StateOwnership(
                     candidate=ref,
                     state_scope="legacy_shared",
@@ -157,39 +158,83 @@ def test_codec_serialization_is_byte_deterministic() -> None:
             ),
         ),
     )
-    inventory = PluginInventory.build({"demo": entry}, updated_at=TS)
+    inventory = PluginRegistrySnapshot.build({"demo": entry}, updated_at=TS)
 
-    first = serialize_inventory(inventory)
-    assert first == serialize_inventory(_roundtrip(inventory))
+    first = serialize_registry(inventory)
+    assert first == serialize_registry(_roundtrip(inventory))
 
 
 def test_codec_rejects_a_non_object_plugins_field() -> None:
     from plugin.server.application.install_source import InstallSourceError
 
     with pytest.raises(InstallSourceError) as excinfo:
-        parse_inventory({"plugins": []}, now=TS, schema_version=3)
+        parse_registry({"plugins": []}, now=TS, schema_version=1)
     assert excinfo.value.code == "LOCK_FILE_CORRUPT"
 
 
-def test_codec_tolerates_a_missing_plugins_field() -> None:
-    inventory = parse_inventory({"revision": 3}, now=TS, schema_version=3)
-    assert inventory.plugins == {}
-    assert inventory.revision == 3
+def test_codec_rejects_a_missing_plugins_field() -> None:
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(
+            {"revision": 3, "updated_at": TS}, now=TS, schema_version=1
+        )
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
+
+
+def test_codec_rejects_a_future_schema_before_best_effort_parsing() -> None:
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(
+            {"schema_version": 2, "revision": 4, "plugins": {}},
+            now=TS,
+            schema_version=2,
+        )
+    assert exc_info.value.code == "UNSUPPORTED_REGISTRY_SCHEMA"
+
+
+def test_codec_refuses_to_downgrade_serialize_a_future_snapshot() -> None:
+    from plugin.server.application.install_source import InstallSourceError
+
+    future = PluginRegistrySnapshot.build(
+        {},
+        revision=4,
+        updated_at=TS,
+        schema_version=2,
+    )
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        serialize_registry(future)
+    assert exc_info.value.code == "UNSUPPORTED_REGISTRY_SCHEMA"
+
+
+def test_codec_omits_absent_runtime_intent_instead_of_materializing_defaults() -> None:
+    snapshot = PluginRegistrySnapshot.build(
+        {"demo": PluginEntry(plugin_id="demo")},
+        updated_at=TS,
+    )
+
+    raw_entry = json.loads(serialize_registry(snapshot))["plugins"]["demo"]
+
+    assert "enabled" not in raw_entry
+    assert "auto_start" not in raw_entry
 
 
 @pytest.mark.parametrize("bad_revision", [0, -1, "5", True, None])
-def test_codec_degrades_an_unusable_revision_to_one(bad_revision: object) -> None:
-    inventory = parse_inventory(
-        {"revision": bad_revision}, now=TS, schema_version=3
-    )
-    assert inventory.revision == 1
+def test_codec_rejects_an_unusable_revision(bad_revision: object) -> None:
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry({"revision": bad_revision}, now=TS, schema_version=1)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
 
 
-def test_codec_drops_a_selection_that_names_a_removed_candidate() -> None:
+def test_codec_rejects_a_selection_that_names_a_removed_candidate() -> None:
     removed = CandidateRecord.from_lock_entry(
         _lock_entry(plugin_id="demo", removed=True)
     )
-    inventory = PluginInventory.build(
+    inventory = PluginRegistrySnapshot.build(
         {
             "demo": PluginEntry(
                 plugin_id="demo",
@@ -203,12 +248,11 @@ def test_codec_drops_a_selection_that_names_a_removed_candidate() -> None:
         updated_at=TS,
     )
 
-    parsed = _roundtrip(inventory)
+    from plugin.server.application.install_source import InstallSourceError
 
-    # The row survives; the selection does not, so the pure Resolver re-picks
-    # instead of the inventory resurrecting retired code.
-    assert parsed.entry("demo").candidates == (removed,)
-    assert parsed.entry("demo").selected_candidate is None
+    with pytest.raises(InstallSourceError) as exc_info:
+        _roundtrip(inventory)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
 
 
 def test_codec_keeps_the_ownership_receipt_for_a_removed_candidate() -> None:
@@ -216,7 +260,7 @@ def test_codec_keeps_the_ownership_receipt_for_a_removed_candidate() -> None:
     removed = CandidateRecord.from_lock_entry(
         _lock_entry(plugin_id="demo", removed=True)
     )
-    inventory = PluginInventory.build(
+    inventory = PluginRegistrySnapshot.build(
         {
             "demo": PluginEntry(
                 plugin_id="demo",
@@ -233,7 +277,7 @@ def test_codec_keeps_the_ownership_receipt_for_a_removed_candidate() -> None:
 
 def test_codec_fails_closed_on_an_ownership_receipt_with_no_row() -> None:
     raw = {
-        "schema_version": 3,
+        "schema_version": 1,
         "revision": 1,
         "updated_at": TS,
         "plugins": {
@@ -253,13 +297,16 @@ def test_codec_fails_closed_on_an_ownership_receipt_with_no_row() -> None:
         },
     }
 
-    parsed = parse_inventory(raw, now=TS, schema_version=3)
-    assert parsed.entry("demo").state_owner is None
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(raw, now=TS, schema_version=1)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
 
 
-def test_codec_dedups_a_repeated_primary_key_keeping_the_later_row() -> None:
+def test_codec_rejects_a_repeated_candidate_primary_key() -> None:
     raw = {
-        "schema_version": 3,
+        "schema_version": 1,
         "revision": 1,
         "updated_at": TS,
         "plugins": {
@@ -292,9 +339,66 @@ def test_codec_dedups_a_repeated_primary_key_keeping_the_later_row() -> None:
         },
     }
 
-    candidates = parse_inventory(raw, now=TS, schema_version=3).entry("demo").candidates
-    assert len(candidates) == 1
-    assert candidates[0].last_seen_at == TS_LATER
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(raw, now=TS, schema_version=1)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
+    assert exc_info.value.details["reason"] == "duplicate_candidate"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("channel", "unknown"),
+        ("reason", "unknown"),
+        ("removed", "false"),
+        ("profile_installed", "yes"),
+        ("installed_at", "not-a-timestamp"),
+    ],
+)
+def test_codec_rejects_malformed_candidate_fields(field: str, value: object) -> None:
+    raw_candidate = {
+        "root_id": "user",
+        "directory_name": "demo",
+        "channel": "manual",
+        "reason": "user_requested",
+        "installed_at": TS,
+        "updated_at": TS,
+        "last_seen_at": TS,
+        "removed": False,
+        "source_detail": None,
+    }
+    raw_candidate[field] = value
+    raw = {
+        "schema_version": 1,
+        "revision": 1,
+        "updated_at": TS,
+        "plugins": {"demo": {"candidates": [raw_candidate]}},
+    }
+
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(raw, now=TS, schema_version=1)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
+
+
+@pytest.mark.parametrize(("field", "value"), [("enabled", 1), ("auto_start", "yes")])
+def test_codec_rejects_malformed_runtime_intent(field: str, value: object) -> None:
+    raw = {
+        "schema_version": 1,
+        "revision": 1,
+        "updated_at": TS,
+        "plugins": {"demo": {"candidates": [], field: value}},
+    }
+
+    from plugin.server.application.install_source import InstallSourceError
+
+    with pytest.raises(InstallSourceError) as exc_info:
+        parse_registry(raw, now=TS, schema_version=1)
+    assert exc_info.value.code == "LOCK_FILE_CORRUPT"
+    assert exc_info.value.details["reason"] == "invalid_runtime_intent"
 
 
 # --- Migration ---------------------------------------------------------------
@@ -322,12 +426,12 @@ def test_migration_groups_candidates_and_carries_selection_and_owner() -> None:
     selections = {"demo": _selection("user", "demo-market")}
     owners = {"demo": _selection("user", "demo-market")}
 
-    inventory = migrate_lock_to_inventory(
+    inventory = migrate_legacy_state_to_registry(
         lock, selections=selections, state_owners=owners, now=TS_LATER
     )
 
     entry = inventory.entry("demo")
-    assert inventory.schema_version == 3
+    assert inventory.schema_version == 1
     assert inventory.revision == 1
     assert inventory.created_at == TS
     assert inventory.updated_at == TS_LATER
@@ -338,11 +442,42 @@ def test_migration_groups_candidates_and_carries_selection_and_owner() -> None:
     assert entry.selected_candidate.primary_key == ("user", "demo-market")
     assert entry.candidate_source == "market"
     assert entry.state_owner.state_access_grant == "trusted_market_chain"
-    assert entry.enabled is True
+    assert entry.enabled is None
+    assert entry.auto_start is None
 
     assert describe_migration_losses(
         lock, inventory, selections=selections, state_owners=owners
     ) == []
+
+
+def test_migration_carries_sparse_runtime_overrides_without_guessing_defaults() -> None:
+    lock = LockFile(
+        schema_version=2,
+        entries=(_lock_entry(plugin_id="demo"),),
+        updated_at=TS,
+        created_at=TS,
+    )
+    overrides = {
+        "demo": {"enabled": True, "auto_start": False},
+        "legacy": False,
+    }
+
+    registry = migrate_legacy_state_to_registry(
+        lock,
+        runtime_overrides=overrides,
+        now=TS,
+    )
+
+    assert registry.entry("demo").enabled is True
+    assert registry.entry("demo").auto_start is False
+    assert registry.entry("legacy").enabled is False
+    assert registry.entry("legacy").auto_start is None
+    assert describe_migration_losses(
+        lock,
+        registry,
+        runtime_overrides=overrides,
+    ) == []
+    assert _roundtrip(registry) == registry
 
 
 def test_migration_preserves_every_market_provenance_field() -> None:
@@ -354,7 +489,7 @@ def test_migration_preserves_every_market_provenance_field() -> None:
         created_at=TS,
     )
 
-    inventory = migrate_lock_to_inventory(lock, now=TS)
+    inventory = migrate_legacy_state_to_registry(lock, now=TS)
     candidate = inventory.entry("demo").candidates[0]
 
     assert candidate.source_detail == detail
@@ -373,7 +508,7 @@ def test_migration_keeps_a_row_whose_plugin_id_is_not_known_yet() -> None:
         created_at=TS,
     )
 
-    inventory = migrate_lock_to_inventory(lock, now=TS)
+    inventory = migrate_legacy_state_to_registry(lock, now=TS)
 
     # v2's placeholder rule: the directory name stands in until the scanner
     # resolves the real id, so provenance is not thrown away.
@@ -391,7 +526,9 @@ def test_migration_drops_a_selection_whose_candidate_is_soft_removed() -> None:
     )
     selections = {"demo": _selection("user", "demo")}
 
-    inventory = migrate_lock_to_inventory(lock, selections=selections, now=TS)
+    inventory = migrate_legacy_state_to_registry(
+        lock, selections=selections, now=TS
+    )
 
     assert inventory.entry("demo").selected_candidate is None
     losses = describe_migration_losses(lock, inventory, selections=selections)
@@ -407,7 +544,9 @@ def test_migration_keeps_the_ownership_receipt_for_a_soft_removed_candidate() ->
     )
     owners = {"demo": _selection("user", "demo")}
 
-    inventory = migrate_lock_to_inventory(lock, state_owners=owners, now=TS)
+    inventory = migrate_legacy_state_to_registry(
+        lock, state_owners=owners, now=TS
+    )
 
     owner = inventory.entry("demo").state_owner
     assert owner is not None
@@ -419,7 +558,9 @@ def test_migration_fails_closed_on_an_owner_with_no_lock_row() -> None:
     lock = LockFile(schema_version=2, entries=(), updated_at=TS, created_at=TS)
     owners = {"demo": _selection("user", "ghost")}
 
-    inventory = migrate_lock_to_inventory(lock, state_owners=owners, now=TS)
+    inventory = migrate_legacy_state_to_registry(
+        lock, state_owners=owners, now=TS
+    )
 
     assert inventory.entry("demo").state_owner is None
     losses = describe_migration_losses(lock, inventory, state_owners=owners)
@@ -438,17 +579,21 @@ def test_migration_is_deterministic_and_repeatable() -> None:
     )
     selections = {"demo": _selection("user", "a")}
 
-    first = migrate_lock_to_inventory(lock, selections=selections, now=TS)
-    second = migrate_lock_to_inventory(lock, selections=selections, now=TS)
+    first = migrate_legacy_state_to_registry(
+        lock, selections=selections, now=TS
+    )
+    second = migrate_legacy_state_to_registry(
+        lock, selections=selections, now=TS
+    )
 
     assert first == second
-    assert serialize_inventory(first) == serialize_inventory(second)
+    assert serialize_registry(first) == serialize_registry(second)
 
 
 def test_migration_of_an_empty_lock_yields_an_empty_inventory() -> None:
     lock = LockFile(schema_version=1, entries=(), updated_at=TS, created_at=None)
 
-    inventory = migrate_lock_to_inventory(lock, now=TS)
+    inventory = migrate_legacy_state_to_registry(lock, now=TS)
 
     assert inventory.plugins == {}
     assert inventory.revision == 1
@@ -501,7 +646,7 @@ def test_property_codec_roundtrip_is_the_identity(rows, revision: int) -> None:
         if live
         else None
     )
-    inventory = PluginInventory.build(
+    inventory = PluginRegistrySnapshot.build(
         {
             "demo": PluginEntry(
                 plugin_id="demo",

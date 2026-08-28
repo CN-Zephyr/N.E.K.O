@@ -244,6 +244,69 @@ def test_mark_removed_idempotent_and_builtin_locked(tmp_path: Path) -> None:
     assert info.value.code == "BUILTIN_CHANNEL_LOCKED"
 
 
+def test_mark_profile_removed_keeps_candidate_audit_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    mgr, _, user_root, _ = _build_mgr(tmp_path)
+    target = user_root / "profile-owner"
+    target.mkdir()
+    profile_dir = tmp_path / "profiles" / "profile-owner-package"
+    mgr.record_import(
+        directory_path=target,
+        package_filename="profile-owner.neko-plugin",
+        package_sha256="b" * 64,
+        package_id="profile-owner-package",
+        profile_dir=str(profile_dir),
+    )
+    mgr.mark_removed(directory_path=target)
+    before = mgr.entry_for_directory(target, include_removed=True)
+    assert before is not None
+
+    mgr.mark_profile_removed(directory_path=target)
+
+    after = mgr.entry_for_directory(target, include_removed=True)
+    assert after is not None
+    assert after.removed is True
+    assert after.removed_at == before.removed_at
+    assert after.installed_at == before.installed_at
+    assert after.source_detail == before.source_detail
+    assert after.package_id == "profile-owner-package"
+    assert after.profile_dir == ""
+    assert after.profile_installed is False
+    persisted = mgr.lock_path.read_bytes()
+    mgr.mark_profile_removed(directory_path=target)
+    assert mgr.lock_path.read_bytes() == persisted
+
+
+def test_mark_profile_removed_restores_snapshot_when_legacy_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr, _, user_root, _ = _build_mgr(tmp_path)
+    target = user_root / "profile-owner"
+    target.mkdir()
+    mgr.record_import(
+        directory_path=target,
+        package_filename="profile-owner.neko-plugin",
+        package_sha256="c" * 64,
+        package_id="profile-owner-package",
+        profile_dir=str(tmp_path / "profiles" / "profile-owner-package"),
+    )
+    before = mgr.snapshot()
+    persisted = mgr.lock_path.read_bytes()
+
+    def fail_save() -> None:
+        raise PermissionError("simulated lock write failure")
+
+    monkeypatch.setattr(mgr, "save", fail_save)
+
+    with pytest.raises(PermissionError, match="simulated lock write failure"):
+        mgr.mark_profile_removed(directory_path=target)
+
+    assert mgr.snapshot() == before
+    assert mgr.lock_path.read_bytes() == persisted
+
+
 def test_record_market_captures_previous_version_on_upgrade(tmp_path: Path) -> None:
     """Market upgrade captures previous_version; same-version no-op; promotion=None."""
     mgr, _, user_root, _ = _build_mgr(tmp_path)

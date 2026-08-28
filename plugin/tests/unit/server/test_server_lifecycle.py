@@ -110,6 +110,16 @@ async def test_startup_uses_registry_refresh_then_autostart(monkeypatch: pytest.
             _retry_deferred_profile_cleanup,
         )
 
+        async def _retry_deferred_candidate_cleanup() -> int:
+            calls.append(("candidate_cleanup", "retry"))
+            return 0
+
+        monkeypatch.setattr(
+            service._plugin_lifecycle_service,
+            "retry_deferred_candidate_cleanup",
+            _retry_deferred_candidate_cleanup,
+        )
+
         async def _refresh_registry() -> dict[str, object]:
             calls.append(("registry", "refresh"))
             with module.state.acquire_plugins_write_lock():
@@ -151,6 +161,7 @@ async def test_startup_uses_registry_refresh_then_autostart(monkeypatch: pytest.
 
         assert calls == [
             ("profile_cleanup", "retry"),
+            ("candidate_cleanup", "retry"),
             ("registry", "refresh"),
             ("start", "auto_plugin:False"),
         ]

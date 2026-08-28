@@ -19,6 +19,17 @@
 
       <el-button :loading="loading" data-yui-guide-id="log-refresh" @click="refreshLogs">{{ $t('common.refresh') }}</el-button>
 
+      <el-button
+        v-if="props.pluginId !== '_server'"
+        type="danger"
+        plain
+        :loading="clearing"
+        data-yui-guide-id="log-clear"
+        @click="clearLogs"
+      >
+        {{ $t('logs.clear') }}
+      </el-button>
+
       <el-switch v-model="autoScroll" data-yui-guide-id="log-auto-scroll" :active-text="$t('logs.autoScroll')" />
     </div>
 
@@ -61,6 +72,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLogsStore } from '@/stores/logs'
 import { useLogStream } from '@/composables/useLogStream'
 
@@ -78,6 +90,7 @@ const levelFilter = ref('')
 const search = ref('')
 const lines = ref(500)
 const autoScroll = ref(true)
+const clearing = ref(false)
 const logContainerRef = ref<HTMLElement | null>(null)
 
 const loading = computed(() => logsStore.loading)
@@ -129,6 +142,34 @@ async function refreshLogs() {
     level: levelFilter.value || undefined,
     search: search.value.trim() || undefined
   })
+}
+
+async function clearLogs() {
+  if (!props.pluginId || props.pluginId === '_server') return
+  try {
+    await ElMessageBox.confirm(
+      t('logs.clearConfirm'),
+      t('logs.clearTitle'),
+      {
+        confirmButtonText: t('logs.clear'),
+        cancelButtonText: t('common.cancel'),
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+
+  clearing.value = true
+  try {
+    await logsStore.clearLogs(props.pluginId)
+    await refreshLogs()
+    ElMessage.success(t('logs.clearSuccess'))
+  } catch {
+    ElMessage.error(t('logs.clearFailed'))
+  } finally {
+    clearing.value = false
+  }
 }
 
 async function scrollToBottom() {

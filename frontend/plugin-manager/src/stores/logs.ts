@@ -3,7 +3,7 @@
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { getPluginLogs, getPluginLogFiles } from '@/api/logs'
+import { clearPluginLogs, getPluginLogs, getPluginLogFiles } from '@/api/logs'
 import type { LogEntry, LogFile } from '@/types/api'
 
 const MAX_LOGS_PER_PLUGIN = 5000
@@ -77,6 +77,16 @@ export const useLogsStore = defineStore('logs', () => {
     }
   }
 
+  async function clearLogs(pluginId: string) {
+    await clearPluginLogs(pluginId)
+    logs.value[pluginId] = []
+    logFiles.value[pluginId] = []
+    logFileInfo.value[pluginId] = {
+      total_lines: 0,
+      returned_lines: 0
+    }
+  }
+
   function getLogs(pluginId: string): LogEntry[] {
     return logs.value[pluginId] || []
   }
@@ -129,6 +139,7 @@ export const useLogsStore = defineStore('logs', () => {
     // 操作
     fetchLogs,
     fetchLogFiles,
+    clearLogs,
     getLogs,
     getFiles,
     getLogFileInfo,
@@ -136,4 +147,3 @@ export const useLogsStore = defineStore('logs', () => {
     appendLogs
   }
 })
-

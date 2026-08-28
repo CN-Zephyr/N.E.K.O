@@ -3,12 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, replace
 import hashlib
-import shutil
 import zipfile
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
-from plugin.core.plugin_layout import resolve_plugin_layout
 from plugin.logging_config import get_logger
 from plugin.neko_plugin_cli.core.models import InstallResult
 from plugin.neko_plugin_cli.public import (
@@ -26,15 +24,26 @@ from plugin.server.application.plugin_cli.paths import PluginCliPathPolicy
 from plugin.server.application.package_management.install_plan import (
     REPLACEMENT_ACTIONS,
     PluginInstallPlan,
-    is_manifestless_state_directory,
 )
 from plugin.server.application.package_management.package_service import (
     PluginPackageService,
 )
+from plugin.server.application.package_management.coordinator import (
+    InstallationCoordinator,
+    LocalImportRequest,
+    LocalReplacementRequest,
+    MarketFreshInstallRequest,
+    MarketReplacementInstallRequest,
+    install_result_entries,
+    install_result_profile_dirs,
+    install_result_target_dirs,
+    single_install_target,
+)
 from plugin.server.application.package_management.artifacts import PackageArtifactStore
-from plugin.server.application.package_management import replacement as package_replacement
-from plugin.server.application.package_management import filesystem as package_filesystem
-from plugin.server.application.plugins import upgrade_support
+from plugin.server.application.package_management.plugin_cli_adapter import (
+    PluginCliInstallationAdapter,
+)
+from plugin.server.application.package_management.replacement import ReplacePluginError
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
 from plugin.server.application.plugin_cli.source_resolver import (
     PluginSourceResolver,
@@ -143,7 +152,7 @@ def _classify_package_error(exc: Exception) -> str | None:
 
 
 def _replacement_error_details(
-    exc: package_replacement.ReplacePluginError,
+    exc: ReplacePluginError,
 ) -> dict[str, object]:
     details: dict[str, object] = {
         "stage": exc.stage,
@@ -354,53 +363,26 @@ class PluginCliService:
                 details=asdict(plan),
             )
 
-        async def validate_manifestless_backup(backup_dir: Path) -> None:
-            if not await asyncio.to_thread(is_manifestless_state_directory, backup_dir):
-                raise ValueError("manifest-less plugin state changed before installation")
-
-        async def install_new() -> dict[str, object]:
-            return await asyncio.to_thread(
-                self._install_sync,
-                package=package,
-                plugins_root=plugins_root,
-                profiles_root=profiles_root,
-                on_conflict="fail",
-                use_staging=use_staging,
-                forced_directory_name=forced_directory_name,
-                _allow_external_profiles_root=_allow_external_profiles_root,
-            )
-
-        async def validate_new() -> None:
-            plugin_id = self._read_installed_plugin_toml_id(target_dir)
-            if plugin_id != plan.plugin_id or target_dir.name != plan.directory_name:
-                raise ValueError("installed plugin identity does not match the upgrade plan")
-
-        async def start(plugin_id: str) -> None:
-            await upgrade_support.start_plugin_after_replace(plugin_id, strict=True)
-
+        port = PluginCliInstallationAdapter(self)
         try:
-            result = await package_replacement.replace_plugin(
-                layout=resolve_plugin_layout(plan.plugin_id, target_dir),
-                install_new=install_new,
-                validate_new=validate_new,
-                is_running=upgrade_support.plugin_is_running,
-                stop=upgrade_support.stop_plugin_for_replace,
-                start=start,
-                cleanup_backup=package_filesystem.remove_directory,
-                additional_targets=(profile_dir,),
-                preserve_targets=(
-                    (target_dir, profile_dir)
-                    if plan.manifestless_state
-                    else (profile_dir,)
-                ),
-                initialize_runtime_config=not plan.manifestless_state,
-                validate_backup=(
-                    validate_manifestless_backup
-                    if plan.manifestless_state
-                    else None
-                ),
+            result = await InstallationCoordinator(
+                local_replacement=port
+            ).replace_local(
+                LocalReplacementRequest(
+                    plugin_id=plan.plugin_id,
+                    directory_name=plan.directory_name,
+                    target_dir=target_dir,
+                    profile_dir=profile_dir,
+                    manifestless_state=plan.manifestless_state,
+                    package=package,
+                    plugins_root=plugins_root,
+                    profiles_root=profiles_root,
+                    use_staging=use_staging,
+                    forced_directory_name=forced_directory_name,
+                    allow_external_profiles_root=_allow_external_profiles_root,
+                )
             )
-        except package_replacement.ReplacePluginError as exc:
+        except ReplacePluginError as exc:
             raise ServerDomainError(
                 code="PLUGIN_UPGRADE_ROLLED_BACK",
                 message="plugin upgrade failed and rollback was attempted",
@@ -552,57 +534,20 @@ class PluginCliService:
             raise ValueError("upload_and_install accepts content or package_path, not both")
 
         if install_source_override is None:
-            owns_saved_package = content is not None or package_path is not None
-            saved: dict[str, object] | None = None
-            unpacked_target_dirs: list[Path] = []
-            unpacked_profile_dirs: list[Path] = []
-            if package_path is not None:
-                saved = await asyncio.to_thread(
-                    self._save_package_file_sync,
+            port = PluginCliInstallationAdapter(self)
+            result = await InstallationCoordinator(
+                port
+            ).install_local(
+                LocalImportRequest(
                     filename=filename,
+                    content=content,
                     package_path=package_path,
-                )
-                actual_sha256 = await asyncio.to_thread(
-                    self._sha256_file,
-                    str(saved["path"]),
-                )
-            else:
-                saved = await self.save_uploaded_package(
-                    filename=filename,
-                    content=content or b"",
-                )
-                actual_sha256 = hashlib.sha256(content or b"").hexdigest().lower()
-            try:
-                install_result = await self.install(
-                    package=str(saved["path"]),
                     profiles_root=profiles_root,
+                    allow_external_profiles_root=_allow_external_profiles_root,
                     on_conflict=on_conflict,
-                    use_staging=True,
-                    _allow_external_profiles_root=_allow_external_profiles_root,
                 )
-                unpacked_target_dirs = self._extract_unpack_target_dirs(install_result)
-                unpacked_profile_dirs = self._extract_unpack_profile_dirs(install_result)
-                warning = await self._record_install_source_best_effort(
-                    install_result=install_result,
-                    package_filename=str(saved["name"]),
-                    package_sha256=actual_sha256,
-                    override=None,
-                )
-                payload: dict[str, object] = {
-                    "upload": saved,
-                    "install": install_result,
-                }
-                if warning is not None:
-                    payload["install_source_warning"] = warning
-                return payload
-            except Exception:
-                self._cleanup_after_failure(
-                    saved=saved,
-                    unpacked_target_dirs=unpacked_target_dirs,
-                    unpacked_profile_dirs=unpacked_profile_dirs,
-                    delete_saved_package=owns_saved_package,
-                )
-                raise
+            )
+            return result.to_api_dict()
 
         channel = install_source_override.get("channel")
         if channel != "market":
@@ -610,278 +555,92 @@ class PluginCliService:
                 f"unsupported install_source_override channel: {channel!r}"
             )
 
-        warnings: list[str] = []
-        saved: dict[str, object] | None = None
-        unpack_result: dict[str, object] | None = None
-        unpacked_target_dirs: list[Path] = []
-        unpacked_profile_dirs: list[Path] = []
-        owns_saved_package = False
-
-        try:
-            # Step 1 — materialise package bytes on disk when needed.
-            if package_path is not None:
-                saved = await asyncio.to_thread(
-                    self._save_package_file_sync,
+        install_mode = install_source_override.get("mode") or "install"
+        if install_mode == "install":
+            market_detail_raw = install_source_override.get("market_detail") or {}
+            forced_directory_name_raw = install_source_override.get("directory_name")
+            return await self.install_market_fresh(
+                MarketFreshInstallRequest(
                     filename=filename,
+                    content=content,
                     package_path=package_path,
+                    profiles_root=profiles_root,
+                    allow_external_profiles_root=_allow_external_profiles_root,
+                    on_conflict=on_conflict,
+                    forced_directory_name=(
+                        forced_directory_name_raw
+                        if isinstance(forced_directory_name_raw, str)
+                        else None
+                    ),
+                    market_detail=dict(market_detail_raw),
                 )
-                actual_sha256 = await asyncio.to_thread(
-                    self._sha256_file,
-                    str(saved["path"]),
-                )
-                owns_saved_package = True
-            else:
-                saved = await self.save_uploaded_package(
-                    filename=filename,
-                    content=content or b"",
-                )
-                owns_saved_package = True
-                actual_sha256 = hashlib.sha256(content or b"").hexdigest().lower()
-
-            # Step 2 — install/unpack into the user plugin root.
-            saved_path = str(saved["path"])
-            install_mode = install_source_override.get("mode") or "install"
-            forced_directory_name = install_source_override.get("directory_name")
-            use_staging = install_mode == "install" or isinstance(
-                forced_directory_name,
-                str,
             )
-            unpack_result = await self.install(
-                package=saved_path,
-                plugins_root=None,
+        if install_mode not in {"upgrade", "reinstall"}:
+            raise ValueError(f"unsupported Market install mode: {install_mode!r}")
+        market_detail_raw = install_source_override.get("market_detail") or {}
+        forced_directory_name_raw = install_source_override.get("directory_name")
+        return await self.install_market_replacement(
+            MarketReplacementInstallRequest(
+                filename=filename,
+                mode=install_mode,
+                content=content,
+                package_path=package_path,
                 profiles_root=profiles_root,
+                allow_external_profiles_root=_allow_external_profiles_root,
                 on_conflict=on_conflict,
-                use_staging=use_staging,
                 forced_directory_name=(
-                    forced_directory_name
-                    if isinstance(forced_directory_name, str)
+                    forced_directory_name_raw
+                    if isinstance(forced_directory_name_raw, str)
                     else None
                 ),
-                _allow_external_profiles_root=_allow_external_profiles_root,
+                market_detail=dict(market_detail_raw),
             )
-            unpacked_target_dirs = self._extract_unpack_target_dirs(unpack_result)
-            unpacked_profile_dirs = self._extract_unpack_profile_dirs(unpack_result)
-            target_dir, _target_directory_plugin_id = self._extract_unpack_target(
-                unpack_result
-            )
-            package_plugin_id = self._read_installed_plugin_toml_id(target_dir)
+        )
 
-            # Step 4 — degrade to imported when market_detail is incomplete.
-            market_detail_raw = install_source_override.get("market_detail") or {}
-            market_detail = dict(market_detail_raw)
-            required_keys = ("plugin_market_id", "version", "package_url")
-            missing = [k for k in required_keys if not market_detail.get(k)]
-            if missing:
-                warnings.append(
-                    f"market_detail missing required fields ({', '.join(missing)}); "
-                    "falling back to imported channel"
-                )
-                install_dict = await self._record_imported_for_unpack(
-                    target_dir=target_dir,
-                    saved_filename=str(saved["name"]),
-                    actual_sha256=actual_sha256,
-                    package_id=str(unpack_result.get("package_id") or ""),
-                    profile_dir=str(unpack_result.get("profile_dir") or ""),
-                )
-                response = self._compose_install_result(
-                    saved=saved,
-                    unpack_result=unpack_result,
-                    install_dict=install_dict,
-                    warnings=warnings,
-                )
-                if install_mode == "install":
-                    activated = await self._activate_fresh_install_candidate(
-                        plugin_id=package_plugin_id,
-                        target_dir=target_dir,
-                    )
-                    if not activated:
-                        response["candidate_selection_required"] = True
-                return response
+    async def install_market_replacement(
+        self,
+        request: MarketReplacementInstallRequest,
+    ) -> dict[str, object]:
+        """Deploy one prepared Market replacement through the coordinator."""
 
-            # Step 4b — plugin identity consistency check.
-            # When Market tells us "this is plugin X" by passing
-            # ``expected_plugin_toml_id`` (the Market plugin slug),
-            # the unpacked package's plugin.toml [plugin].id is expected
-            # to match. Fresh installs keep the historic soft-warning
-            # behavior because Market may still publish legacy slugs, but
-            # upgrade/reinstall must fail fast: the bridge rollback flow is
-            # keyed to the original plugin id and directory.
-            expected_toml_id = market_detail.get("expected_plugin_toml_id")
-            if (
-                isinstance(expected_toml_id, str)
-                and expected_toml_id
-                and package_plugin_id
-                and expected_toml_id != package_plugin_id
-            ):
-                message = (
-                    f"plugin identity mismatch: Market declared "
-                    f"'{expected_toml_id}' but the package contains "
-                    f"plugin id '{package_plugin_id}'"
-                )
-                if install_mode in ("upgrade", "reinstall"):
-                    raise ValueError(message)
-                warnings.append(
-                    f"{message}; install proceeds but please verify the "
-                    "package source"
-                )
-            # ``expected_plugin_toml_id`` is informational only — drop it
-            # before passing market_detail to ISM so it does not leak into
-            # the lock entry's source_detail.
-            market_detail.pop("expected_plugin_toml_id", None)
+        port = PluginCliInstallationAdapter(self)
+        result = await InstallationCoordinator(
+            market_install=port
+        ).install_market_replacement(request)
+        return result.to_api_dict()
 
-            # Step 5 — overwrite hash fields with our own freshly-computed
-            # values. Mismatches are warnings, not failures (R3.5 says
-            # caller's value is informational; the bytes we hashed are what
-            # actually landed on disk).
-            caller_sha = (market_detail.get("package_sha256") or "").lower()
-            if caller_sha and caller_sha != actual_sha256:
-                warnings.append(
-                    f"package_sha256 mismatch: market={caller_sha!r}, "
-                    f"actual={actual_sha256!r}; recording actual"
-                )
-            market_detail["package_sha256"] = actual_sha256
+    async def install_market_fresh(
+        self,
+        request: MarketFreshInstallRequest,
+    ) -> dict[str, object]:
+        """Deploy one prepared fresh Market package through the coordinator."""
 
-            unpacked_payload_hash = unpack_result.get("payload_hash")
-            if isinstance(unpacked_payload_hash, str) and unpacked_payload_hash:
-                caller_payload = market_detail.get("payload_hash")
-                if (
-                    isinstance(caller_payload, str)
-                    and caller_payload
-                    and caller_payload.lower() != unpacked_payload_hash.lower()
-                ):
-                    warnings.append(
-                        "payload_hash mismatch between market and unpacked package"
-                    )
-                market_detail["payload_hash"] = unpacked_payload_hash
-
-            # Step 6 — record into ISM with the right semantic.
-            mgr = self._require_install_source_manager()
-            root_id, directory_name = classify_plugin_path(
-                target_dir,
-                builtin_root=mgr.builtin_root,
-                user_root=mgr.user_root,
-            )
-
-            if install_mode in ("upgrade", "reinstall"):
-                entry, ism_warnings = mgr.record_market_upgrade(
-                    root_id=root_id,
-                    directory_name=directory_name,
-                    plugin_id=package_plugin_id,
-                    market_detail=market_detail,
-                    package_id=str(unpack_result.get("package_id") or ""),
-                    profile_dir=str(unpack_result.get("profile_dir") or ""),
-                )
-            else:
-                entry, ism_warnings = mgr.record_market_install(
-                    root_id=root_id,
-                    directory_name=directory_name,
-                    plugin_id=package_plugin_id,
-                    market_detail=market_detail,
-                    package_id=str(unpack_result.get("package_id") or ""),
-                    profile_dir=str(unpack_result.get("profile_dir") or ""),
-                )
-            warnings.extend(ism_warnings)
-
-            install_dict: dict[str, Any] = {
-                "channel": entry.channel,
-                "directory_name": entry.directory_name,
-                "plugin_id": entry.plugin_id,
-            }
-            if entry.source_detail is not None and hasattr(
-                entry.source_detail, "version"
-            ):
-                # Mirror SourceDetailMarket fields for the API response.
-                install_dict.update(
-                    {
-                        "version": getattr(entry.source_detail, "version", ""),
-                        "package_sha256": getattr(
-                            entry.source_detail, "package_sha256", ""
-                        ),
-                        "payload_hash": getattr(
-                            entry.source_detail, "payload_hash", None
-                        ),
-                        "published_at": getattr(
-                            entry.source_detail, "published_at", ""
-                        ),
-                        "previous_version": getattr(
-                            entry.source_detail, "previous_version", None
-                        ),
-                    }
-                )
-
-            response = self._compose_install_result(
-                saved=saved,
-                unpack_result=unpack_result,
-                install_dict=install_dict,
-                warnings=warnings,
-            )
-            if install_mode == "install":
-                activated = await self._activate_fresh_install_candidate(
-                    plugin_id=package_plugin_id,
-                    target_dir=target_dir,
-                )
-                if not activated:
-                    response["candidate_selection_required"] = True
-            return response
-
-        except InstallSourceError:
-            # Lock write failed — fs cleanup still runs, but propagate the
-            # structured error so Bridge can map it to ``lock_write_failed``.
-            self._cleanup_after_failure(
-                saved=saved,
-                unpacked_target_dirs=unpacked_target_dirs,
-                unpacked_profile_dirs=unpacked_profile_dirs,
-                delete_saved_package=owns_saved_package,
-            )
-            raise
-        except Exception:
-            self._cleanup_after_failure(
-                saved=saved,
-                unpacked_target_dirs=unpacked_target_dirs,
-                unpacked_profile_dirs=unpacked_profile_dirs,
-                delete_saved_package=owns_saved_package,
-            )
-            raise
+        port = PluginCliInstallationAdapter(self)
+        result = await InstallationCoordinator(
+            market_install=port
+        ).install_market_fresh(request)
+        return result.to_api_dict()
 
     @staticmethod
     def _extract_unpack_entries(unpack_result: dict[str, object]) -> list[dict[str, object]]:
-        unpacked_plugins = unpack_result.get("unpacked_plugins")
-        if unpacked_plugins is None:
-            unpacked_plugins = unpack_result.get("installed_plugins")
-        if not isinstance(unpacked_plugins, list) or not unpacked_plugins:
-            raise ValueError("install returned no plugins")
-        entries: list[dict[str, object]] = []
-        for item in unpacked_plugins:
-            if not isinstance(item, dict):
-                raise ValueError("unpack returned malformed unpacked_plugins entry")
-            entries.append(item)
-        return entries
+        """Compatibility facade for the package-management result parser."""
 
-    @classmethod
-    def _extract_unpack_target_dirs(cls, unpack_result: dict[str, object]) -> list[Path]:
+        return install_result_entries(unpack_result)
+
+    @staticmethod
+    def _extract_unpack_target_dirs(unpack_result: dict[str, object]) -> list[Path]:
         """Return every target dir created by the unpack operation."""
 
-        target_dirs: list[Path] = []
-        for entry in cls._extract_unpack_entries(unpack_result):
-            target_dir_raw = entry.get("target_dir")
-            if isinstance(target_dir_raw, str) and target_dir_raw:
-                target_dirs.append(Path(target_dir_raw))
-        return target_dirs
+        return install_result_target_dirs(unpack_result)
 
     @staticmethod
     def _extract_unpack_profile_dirs(unpack_result: dict[str, object]) -> list[Path]:
         """Return promoted profile dirs created by the unpack operation."""
 
-        if unpack_result.get("profile_reused") is True:
-            return []
-        profile_dir_raw = unpack_result.get("profile_dir")
-        if isinstance(profile_dir_raw, str) and profile_dir_raw:
-            return [Path(profile_dir_raw)]
-        return []
+        return install_result_profile_dirs(unpack_result)
 
-    @classmethod
+    @staticmethod
     def _extract_unpack_target(
-        cls,
         unpack_result: dict[str, object],
     ) -> tuple[Path, str]:
         """Pull the single Market plugin's target dir + plugin id from a dump.
@@ -892,39 +651,11 @@ class PluginCliService:
         entry so extra unpacked plugins cannot become untracked installs.
         """
 
-        unpacked_plugins = cls._extract_unpack_entries(unpack_result)
-        if len(unpacked_plugins) != 1:
-            raise ValueError(
-                "Market packages must contain exactly one plugin; "
-                f"got {len(unpacked_plugins)}"
-            )
-        first = unpacked_plugins[0]
-        target_dir_raw = first.get("target_dir")
-        if not isinstance(target_dir_raw, str) or not target_dir_raw:
-            raise ValueError("unpack returned no target_dir for plugin")
-        target_plugin_id = str(first.get("target_plugin_id", "")) or ""
-        return Path(target_dir_raw), target_plugin_id
+        return single_install_target(unpack_result)
 
     @staticmethod
     def _read_installed_plugin_toml_id(target_dir: Path) -> str:
         return PluginPackageService().read_installed_plugin_id(target_dir)
-
-    def _compose_install_result(
-        self,
-        *,
-        saved: dict[str, object],
-        unpack_result: dict[str, object],
-        install_dict: dict[str, Any],
-        warnings: list[str],
-    ) -> dict[str, object]:
-        result: dict[str, object] = {
-            "upload": saved,
-            "unpack": unpack_result,
-            "install": install_dict,
-        }
-        if warnings:
-            result["install_source_warning"] = "; ".join(warnings)
-        return result
 
     async def _activate_fresh_install_candidate(
         self,
@@ -1062,59 +793,6 @@ class PluginCliService:
             "package_filename": saved_filename,
             "package_sha256": actual_sha256,
         }
-
-    def _cleanup_after_failure(
-        self,
-        *,
-        saved: dict[str, object] | None,
-        unpacked_target_dirs: list[Path] | None = None,
-        unpacked_profile_dirs: list[Path] | None = None,
-        delete_saved_package: bool = True,
-    ) -> None:
-        """Best-effort fs cleanup on upload_and_install failure (R3.6).
-
-        Order is important: we delete the unpacked directory first (so a
-        partial extract doesn't get adopted by the next reconcile pass)
-        and then the saved archive. Both calls swallow OSError because
-        the original exception is what we care about — cleanup failures
-        get logged but don't shadow the real error.
-        """
-
-        for unpacked_target_dir in unpacked_target_dirs or []:
-            self._rollback_install_source_best_effort(unpacked_target_dir)
-            self._cleanup_failed_unpack(unpacked_target_dir)
-        for unpacked_profile_dir in unpacked_profile_dirs or []:
-            self._cleanup_failed_unpack(unpacked_profile_dir)
-        if delete_saved_package and saved is not None:
-            saved_path_raw = saved.get("path")
-            if isinstance(saved_path_raw, str) and saved_path_raw:
-                try:
-                    Path(saved_path_raw).unlink(missing_ok=True)
-                except OSError as exc:
-                    logger.warning(
-                        "upload_and_install: failed to clean up saved package "
-                        "{}: {}",
-                        saved_path_raw,
-                        exc,
-                    )
-
-    @staticmethod
-    def _cleanup_failed_unpack(target_dir: Path) -> None:
-        """Recursively remove ``target_dir`` ignoring missing-path errors.
-
-        Does NOT touch the lock file — fs rollback only. The caller is
-        responsible for ensuring no partial lock entry exists (we never
-        write one before unpack completes).
-        """
-
-        try:
-            shutil.rmtree(target_dir, ignore_errors=True)
-        except OSError as exc:  # pragma: no cover — ignore_errors=True suppresses
-            logger.warning(
-                "upload_and_install: _cleanup_failed_unpack({}) failed: {}",
-                target_dir,
-                exc,
-            )
 
     @staticmethod
     def _rollback_install_source_best_effort(target_dir: Path) -> None:

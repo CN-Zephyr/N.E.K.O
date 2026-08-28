@@ -1,15 +1,18 @@
-"""Deterministic v2 → v3 migration for the plugin inventory.
+"""Deterministic legacy-state → Registry v1 migration.
 
-v2 keeps two durable authorities:
+Legacy desired state spans three durable inputs:
 
 * ``plugins.lock.json`` — a flat ``entries`` list of per-directory provenance;
 * ``plugin_candidate_selections.json`` — ``selections`` (which candidate is
   chosen) plus ``state_owners`` (who may read the logical id's shared state).
+* ``plugin_runtime_overrides.json`` — sparse user choices layered over manifest
+  runtime defaults.
 
-v3 folds both into one :class:`PluginInventory` grouped by logical PluginId.
+Registry v1 folds these inputs into one :class:`PluginRegistrySnapshot` grouped
+by logical PluginId and also carries sparse runtime overrides.
 This module performs only the pure data transform: no filesystem access, no
 clock, no scanner. The caller supplies already-parsed inputs and the timestamp
-to stamp, which keeps the migration deterministic and independently testable.
+to stamp, which keeps migration deterministic and independently testable.
 
 Deliberate narrowings, both logged:
 
@@ -27,29 +30,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Mapping
 
-from plugin.logging_config import get_logger
 from plugin.server.application.install_source.models import (
     CandidateRecord,
     CandidateRef,
     LockFile,
     PluginEntry,
-    PluginInventory,
+    PluginRegistrySnapshot,
     StateOwnership,
 )
 
 if TYPE_CHECKING:
     from plugin.server.infrastructure.plugin_selections import PluginSelection
 
-logger = get_logger("server.application.install_source.migration")
-
-def migrate_lock_to_inventory(
+def migrate_legacy_state_to_registry(
     lock: LockFile,
     *,
     selections: Mapping[str, "PluginSelection"] | None = None,
     state_owners: Mapping[str, "PluginSelection"] | None = None,
+    runtime_overrides: Mapping[str, object] | None = None,
     now: str,
-) -> PluginInventory:
-    """Fold a v2 lock plus its selection receipts into a v3 inventory.
+) -> PluginRegistrySnapshot:
+    """Fold legacy provenance, selection and runtime intent into registry v1.
 
     Args:
         lock: parsed ``plugins.lock.json`` (schema v1 or v2).
@@ -57,24 +58,30 @@ def migrate_lock_to_inventory(
             per logical id. ``None`` is treated as empty.
         state_owners: ``PluginSelectionStore.state_owners`` — the data-access
             receipt per logical id. ``None`` is treated as empty.
+        runtime_overrides: sparse user overrides from
+            ``plugin_runtime_overrides.json``. Legacy booleans mean an
+            ``enabled`` override only.
         now: timestamp to stamp on the resulting snapshot.
 
     Returns:
-        A :class:`PluginInventory` at ``revision=1`` preserving every
+        A :class:`PluginRegistrySnapshot` at ``revision=1`` preserving every
         representable v2 field. ``created_at`` is carried over from the lock so
         the original First_Startup stamp is not lost.
 
     The transform is idempotent in the sense that re-running it on the same
     inputs yields an equal snapshot; it is not meant to be run against an
-    already-migrated v3 document.
+    already-migrated Registry document.
     """
 
     selections = selections or {}
     state_owners = state_owners or {}
+    runtime_overrides = runtime_overrides or {}
 
     grouped = _group_candidates(lock)
 
-    plugin_ids = set(grouped) | set(selections) | set(state_owners)
+    plugin_ids = (
+        set(grouped) | set(selections) | set(state_owners) | set(runtime_overrides)
+    )
     entries: dict[str, PluginEntry] = {}
     for plugin_id in sorted(plugin_ids):
         entries[plugin_id] = _build_entry(
@@ -82,9 +89,10 @@ def migrate_lock_to_inventory(
             candidates=grouped.get(plugin_id, ()),
             selection=selections.get(plugin_id),
             owner=state_owners.get(plugin_id),
+            runtime_override=runtime_overrides.get(plugin_id),
         )
 
-    return PluginInventory.build(
+    return PluginRegistrySnapshot.build(
         entries,
         revision=1,
         updated_at=lock.updated_at or now,
@@ -102,11 +110,6 @@ def _group_candidates(lock: LockFile) -> dict[str, tuple[CandidateRecord, ...]]:
             # Req 4.3: directory_name stands in for plugin_id until the
             # scanner reads the real id. Keep the row so provenance survives.
             key = entry.directory_name
-            logger.info(
-                "migration: entry %s has no plugin_id yet; grouping under its "
-                "directory name until the scanner resolves it",
-                entry.primary_key,
-            )
         grouped.setdefault(key, []).append(CandidateRecord.from_lock_entry(entry))
 
     return {
@@ -123,8 +126,9 @@ def _build_entry(
     candidates: tuple[CandidateRecord, ...],
     selection: "PluginSelection | None",
     owner: "PluginSelection | None",
+    runtime_override: object,
 ) -> PluginEntry:
-    """Assemble one PluginEntry, enforcing the v3 entry invariants."""
+    """Assemble one PluginEntry, enforcing the Registry v1 entry invariants."""
 
     live_keys = {c.primary_key for c in candidates if not c.removed}
     all_keys = {c.primary_key for c in candidates}
@@ -139,28 +143,36 @@ def _build_entry(
         if ref.primary_key in live_keys:
             selected_ref = ref
             candidate_source = selection.candidate_source
-        else:
-            logger.warning(
-                "migration: plugin_id=%r selected %s which has no live row; "
-                "dropping the selection so the Resolver picks again",
-                plugin_id,
-                ref.primary_key,
-            )
+
+    enabled, auto_start = _runtime_intent(runtime_override)
 
     return PluginEntry(
         plugin_id=plugin_id,
         candidates=candidates,
         selected_candidate=selected_ref,
         candidate_source=candidate_source,
-        # v2 has no durable enable intent; runtime overrides stay outside the
-        # inventory, so every migrated entry starts as "intended to run".
-        enabled=True,
-        state_owner=_build_owner(plugin_id, owner=owner, known_keys=all_keys),
+        enabled=enabled,
+        auto_start=auto_start,
+        state_owner=_build_owner(owner=owner, known_keys=all_keys),
     )
 
 
+def _runtime_intent(raw: object) -> tuple[bool | None, bool | None]:
+    """Normalize legacy and structured sparse runtime overrides."""
+
+    if isinstance(raw, bool):
+        return raw, None
+    if isinstance(raw, Mapping):
+        raw_enabled = raw.get("enabled")
+        raw_auto_start = raw.get("auto_start")
+        return (
+            raw_enabled if isinstance(raw_enabled, bool) else None,
+            raw_auto_start if isinstance(raw_auto_start, bool) else None,
+        )
+    return None, None
+
+
 def _build_owner(
-    plugin_id: str,
     *,
     owner: "PluginSelection | None",
     known_keys: set[tuple[str, str]],
@@ -180,12 +192,6 @@ def _build_owner(
         directory_name=owner.candidate.directory_name,
     )
     if ref.primary_key not in known_keys:
-        logger.warning(
-            "migration: state owner %s for plugin_id=%r has no row in the lock; "
-            "dropping the receipt (fail closed)",
-            ref.primary_key,
-            plugin_id,
-        )
         return None
 
     return StateOwnership(
@@ -199,10 +205,11 @@ def _build_owner(
 
 def describe_migration_losses(
     lock: LockFile,
-    inventory: PluginInventory,
+    inventory: PluginRegistrySnapshot,
     *,
     selections: Mapping[str, "PluginSelection"] | None = None,
     state_owners: Mapping[str, "PluginSelection"] | None = None,
+    runtime_overrides: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return a human-readable list of everything the migration did not carry.
 
@@ -213,6 +220,7 @@ def describe_migration_losses(
 
     selections = selections or {}
     state_owners = state_owners or {}
+    runtime_overrides = runtime_overrides or {}
     losses: list[str] = []
 
     migrated_rows: set[tuple[str, str]] = set()
@@ -249,10 +257,24 @@ def describe_migration_losses(
                 f"state owner for {plugin_id!r} became {actual} (was {expected})"
             )
 
+    for plugin_id, raw_override in runtime_overrides.items():
+        expected = _runtime_intent(raw_override)
+        entry = inventory.entry(plugin_id)
+        actual = (
+            (entry.enabled, entry.auto_start)
+            if entry is not None
+            else (None, None)
+        )
+        if actual != expected:
+            losses.append(
+                f"runtime override for {plugin_id!r} became {actual} "
+                f"(was {expected})"
+            )
+
     if inventory.created_at != lock.created_at:
         losses.append("created_at was not preserved")
 
     return losses
 
 
-__all__ = ["migrate_lock_to_inventory", "describe_migration_losses"]
+__all__ = ["migrate_legacy_state_to_registry", "describe_migration_losses"]

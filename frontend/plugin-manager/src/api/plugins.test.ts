@@ -2,16 +2,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const postMock = vi.fn()
 const getMock = vi.fn()
+const delMock = vi.fn()
 
 vi.mock('@/api', () => ({
   get: getMock,
   post: postMock,
+  del: delMock,
 }))
 
 describe('plugin hosted UI API', () => {
   beforeEach(() => {
     postMock.mockReset()
     getMock.mockReset()
+    delMock.mockReset()
   })
 
   it('merges locale with existing plugin list parameters', async () => {
@@ -76,6 +79,38 @@ describe('plugin hosted UI API', () => {
       directory_name: 'demo-imported',
       allow_legacy_shared_state: true,
     }, { suppressErrorMessage: true })
+  })
+
+  it('uses the retained-profile projection and exact confirmed delete endpoint', async () => {
+    const {
+      deleteRetainedPackageProfile,
+      getRetainedPackageProfiles,
+    } = await import('./plugins')
+
+    getRetainedPackageProfiles()
+    deleteRetainedPackageProfile({
+      plugin_id: 'demo plugin',
+      candidate: {
+        root_id: 'user',
+        directory_name: 'demo-market',
+      },
+    })
+
+    expect(getMock).toHaveBeenCalledWith(
+      '/plugins/retained-package-profiles',
+      { suppressErrorMessage: true },
+    )
+    expect(delMock).toHaveBeenCalledWith(
+      '/plugin/demo%20plugin/package-profile',
+      {
+        data: {
+          root_id: 'user',
+          directory_name: 'demo-market',
+          confirm_delete: true,
+        },
+        suppressErrorMessage: true,
+      },
+    )
   })
 
   it('silences initial hosted action errors while passing its timeout', async () => {

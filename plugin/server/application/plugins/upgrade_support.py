@@ -1,23 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 from plugin.logging_config import get_logger
-from plugin.server.application.package_management import filesystem as package_filesystem
-from plugin.server.application.package_management.replacement import (
-    ReplacePluginError,
-    ReplacePluginResult,
-    replace_plugin,
-    rollback_targets as _rollback_targets,
-    run_rollback,
-)
 from plugin.server.domain.errors import ServerDomainError
-
-# Compatibility test seam for callers that historically patched
-# ``upgrade_support.shutil``. The actual filesystem owner is now the dedicated
-# package-management module.
-shutil = package_filesystem.shutil
 
 logger = get_logger("server.application.plugins.upgrade_support")
 
@@ -69,38 +55,6 @@ async def start_plugin_after_replace(plugin_id: str, *, strict: bool) -> bool:
         return False
 
 
-# Market keeps the established names until its Day 3 adapter switches to the
-# shared replace transaction.
+# Compatibility lifecycle aliases retained for the Market replacement adapter.
 stop_plugin_for_upgrade = stop_plugin_for_replace
 start_plugin_after_upgrade = start_plugin_after_replace
-
-
-def backup_path_for(target_dir: Path, *, backup_root: Path | None = None) -> Path:
-    return package_filesystem.backup_path_for(target_dir, backup_root=backup_root)
-
-
-async def restore_directory(backup_dir: Path, target_dir: Path) -> None:
-    await package_filesystem.restore_directory(backup_dir, target_dir)
-
-
-async def remove_directory(target_dir: Path) -> None:
-    await package_filesystem.remove_directory(target_dir)
-
-
-async def merge_directory_contents(source_dir: Path, target_dir: Path) -> None:
-    await package_filesystem.merge_directory_contents(source_dir, target_dir)
-
-
-def _assert_preserved_tree_has_no_links_or_reparse_points(source: Path) -> None:
-    package_filesystem.assert_preserved_tree_has_no_links_or_reparse_points(source)
-
-
-def _canonical_profile_sources(sources: list[Path]) -> dict[str, Path]:
-    return package_filesystem.canonical_profile_sources(sources)
-
-
-async def _restore_manifest_adjacent_profiles(backup_dir: Path, target_dir: Path) -> None:
-    await package_filesystem.restore_manifest_adjacent_profiles(
-        backup_dir,
-        target_dir,
-    )

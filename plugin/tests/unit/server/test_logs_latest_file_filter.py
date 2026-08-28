@@ -22,11 +22,14 @@ import os
 import time
 
 import pytest
+from fastapi import HTTPException
 
 from plugin.server.logs import (
     SERVER_LOG_ID,
     _is_error_log_file,
     _list_plugin_log_files_for_tail,
+    clear_plugin_logs,
+    get_plugin_log_files,
 )
 
 
@@ -107,3 +110,42 @@ def test_list_plugin_log_files_for_tail_server_id_uses_pluginserver_pattern(tmp_
     files = _list_plugin_log_files_for_tail(tmp_path, SERVER_LOG_ID)
 
     assert files == [server_daily]
+
+
+@pytest.mark.plugin_unit
+def test_clear_plugin_logs_isolated_to_exact_plugin_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import plugin.server.logs as logs_module
+
+    daily = tmp_path / "N.E.K.O_Plugin_demo_20260421.log"
+    error = tmp_path / "N.E.K.O_Plugin_demo_error.log"
+    other_plugin = tmp_path / "N.E.K.O_Plugin_demo_other_20260421.log"
+    daily.write_bytes(b"daily log\n")
+    error.write_bytes(b"error log\n")
+    other_plugin.write_bytes(b"must remain\n")
+    monkeypatch.setattr(logs_module, "get_plugin_log_dir", lambda _plugin_id: tmp_path)
+
+    result = clear_plugin_logs("demo")
+
+    assert result == {
+        "plugin_id": "demo",
+        "cleared_files": 2,
+        "cleared_bytes": len("daily log\n") + len("error log\n"),
+    }
+    assert daily.read_text(encoding="utf-8") == ""
+    assert error.read_text(encoding="utf-8") == ""
+    assert other_plugin.read_text(encoding="utf-8") == "must remain\n"
+    assert {item["filename"] for item in get_plugin_log_files("demo")} == {
+        error.name,
+        daily.name,
+    }
+
+
+@pytest.mark.plugin_unit
+def test_clear_plugin_logs_rejects_server_log_id() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        clear_plugin_logs(SERVER_LOG_ID)
+
+    assert exc_info.value.status_code == 400

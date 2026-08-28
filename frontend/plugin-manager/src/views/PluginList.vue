@@ -169,6 +169,14 @@
               </button>
               <button
                 class="header-btn"
+                data-yui-guide-id="plugin-list-retained-data"
+                @click="retainedDataVisible = true"
+              >
+                <el-icon><FolderDelete /></el-icon>
+                <span>{{ $t('plugins.retainedData.entry') }}</span>
+              </button>
+              <button
+                class="header-btn"
                 :class="{ 'header-btn--active header-btn--success': showMetrics }"
                 data-yui-guide-id="plugin-list-metrics-toggle"
                 @click="toggleMetrics"
@@ -397,6 +405,11 @@
       @select="handleContextActionSelect"
     />
 
+    <RetainedPackageProfilesDialog
+      :visible="retainedDataVisible"
+      @close="retainedDataVisible = false"
+    />
+
     <PluginDangerConfirmDialog
       :visible="dangerDialogVisible"
       :loading="dangerDialogLoading"
@@ -474,7 +487,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Refresh, DataAnalysis, RefreshRight, Box, Connection, Finished, Sort, CircleClose, Close, VideoPlay, VideoPause, Delete, Upload, Download, ShoppingCart, ArrowRight, ArrowLeft, InfoFilled, User } from '@element-plus/icons-vue'
+import { Refresh, DataAnalysis, RefreshRight, Box, Connection, Finished, Sort, CircleClose, Close, VideoPlay, VideoPause, Delete, Upload, Download, ShoppingCart, ArrowRight, ArrowLeft, InfoFilled, User, FolderDelete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { usePluginStore } from '@/stores/plugin'
 import { useMetricsStore } from '@/stores/metrics'
@@ -482,6 +495,7 @@ import { useMarketVersionsStore } from '@/stores/marketVersions'
 import PluginGridSection from '@/components/plugin/PluginGridSection.vue'
 import PluginContextMenu from '@/components/plugin/PluginContextMenu.vue'
 import PluginDangerConfirmDialog from '@/components/plugin/PluginDangerConfirmDialog.vue'
+import RetainedPackageProfilesDialog from '@/components/plugin/RetainedPackageProfilesDialog.vue'
 import PackageManagerPanel from '@/components/plugin/PackageManagerPanel.vue'
 import GithubMirrorSourcePanel from '@/components/plugin/GithubMirrorSourcePanel.vue'
 import MarketPanel from '@/components/plugin/MarketPanel.vue'
@@ -533,6 +547,7 @@ const packagePanelVisible = ref(false)
 const packagePanelEverOpened = ref(false)
 const mirrorPanelVisible = ref(false)
 const mirrorPanelEverOpened = ref(false)
+const retainedDataVisible = ref(false)
 const marketPanelVisible = ref(false)
 const marketPanelEverOpened = ref(false)
 const contextMenuVisible = ref(false)

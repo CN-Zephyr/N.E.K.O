@@ -126,6 +126,53 @@ def _include_optional_router(
     app.include_router(router)
 
 
+async def _initialize_plugin_persistence() -> object:
+    """Reconcile legacy state, then select Registry authority before discovery."""
+
+    from plugin.server.application.install_source import (
+        StartupReconciler,
+        build_install_source_manager,
+    )
+    from plugin.server.application.package_management.registry_startup import (
+        initialize_plugin_registry_startup,
+    )
+    from plugin.server.application.plugins.operation_lock import plugin_operation_lock
+    from plugin.utils.time_utils import now_iso
+    from utils.config_manager import get_config_manager
+
+    install_source_manager = build_install_source_manager()
+    reconciled = await StartupReconciler(install_source_manager).run()
+    return await initialize_plugin_registry_startup(
+        install_source_manager=install_source_manager,
+        config_paths=get_config_manager(migrate=False),
+        operation_lock=plugin_operation_lock,
+        clock=now_iso,
+        reconciled=reconciled,
+    )
+
+
+def _clear_plugin_persistence_authority() -> None:
+    from plugin.server.application.install_source import set_global_manager
+    from plugin.server.infrastructure.plugin_registry_authority import (
+        clear_plugin_registry_authority,
+    )
+
+    set_global_manager(None)
+    clear_plugin_registry_authority()
+
+
+def _block_plugin_persistence_authority() -> None:
+    """Fail closed when startup cannot determine a safe persistence owner."""
+
+    from plugin.server.application.install_source import set_global_manager
+    from plugin.server.infrastructure.plugin_registry_authority import (
+        block_plugin_registry_authority,
+    )
+
+    set_global_manager(None)
+    block_plugin_registry_authority()
+
+
 @asynccontextmanager
 async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
     _ = app
@@ -174,41 +221,42 @@ async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     heartbeat_task = asyncio.create_task(_heartbeat(), name="server-heartbeat")
 
-    # When embedded inside agent_server, lifecycle is managed externally
-    # via the user_plugin_enabled flag — do NOT auto-start here.
-    if not _EMBEDDED_BY_AGENT:
-        await lifecycle_startup()
-
-    # Install-source lock subsystem: tracks plugin provenance (builtin/manual/
-    # imported/market). Runs after lifecycle_startup so filesystem state is stable.
+    # Persistence authority must be fixed before any Registry discovery or
+    # plugin autostart. The reconciled v2 manager is either migrated to the
+    # Registry facade, retained before first cutover, or blocked after cutover.
     try:
-        from plugin.server.application.install_source import (
-            StartupReconciler,
-            build_install_source_manager,
-            set_global_manager,
+        persistence = await _initialize_plugin_persistence()
+        logger.info(
+            "plugin persistence startup completed: mode={}, error_reason={}",
+            getattr(persistence, "mode", "unknown"),
+            getattr(persistence, "error_reason", None),
         )
-        _install_source_mgr = build_install_source_manager()
-        await StartupReconciler(_install_source_mgr).run()
-        set_global_manager(_install_source_mgr)
     except Exception as exc:
         logger.error(
-            "InstallSourceManager init failed, subsystem degraded: {}", exc,
+            "plugin persistence startup failed before authority selection: err_type={}",
+            type(exc).__name__,
         )
         try:
-            from plugin.server.application.install_source import set_global_manager
-            set_global_manager(None)
+            _block_plugin_persistence_authority()
         except Exception:
-            pass  # already in degraded mode
-
-    # Write bridge token file for Market frontend / URI handler
-    try:
-        from plugin.server.routes.market_bridge import write_bridge_token_file
-        from pathlib import Path
-        write_bridge_token_file(Path.home() / ".neko")
-    except Exception as exc:
-        logger.warning("Failed to write bridge token file: {}", exc)
+            pass
 
     try:
+        # When embedded inside agent_server, lifecycle is managed externally
+        # via the user_plugin_enabled flag — do NOT auto-start here.
+        if not _EMBEDDED_BY_AGENT:
+            await lifecycle_startup()
+
+        # Write bridge token file for Market frontend / URI handler
+        try:
+            from pathlib import Path
+
+            from plugin.server.routes.market_bridge import write_bridge_token_file
+
+            write_bridge_token_file(Path.home() / ".neko")
+        except Exception as exc:
+            logger.warning("Failed to write bridge token file: {}", exc)
+
         yield
     finally:
         stop_event.set()
@@ -223,8 +271,11 @@ async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 type(exc).__name__,
                 str(exc),
             )
-        if not _EMBEDDED_BY_AGENT:
-            await lifecycle_shutdown()
+        try:
+            if not _EMBEDDED_BY_AGENT:
+                await lifecycle_shutdown()
+        finally:
+            _clear_plugin_persistence_authority()
 
 
 def build_plugin_server_app(title: str = "N.E.K.O User Plugin Server") -> FastAPI:

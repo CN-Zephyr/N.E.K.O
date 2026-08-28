@@ -145,12 +145,53 @@ export function deletePlugin(pluginId: string): Promise<{
   plugin_id: string
   plugin_dir: string
   deleted_from_disk: boolean
+  user_data_preserved: boolean
   fallback_candidate?: PluginCandidateKey | null
   fallback_started?: boolean
   message: string
 }> {
   const safeId = encodeURIComponent(pluginId)
   return del(`/plugin/${safeId}`)
+}
+
+export type RetainedPackageProfile = {
+  plugin_id: string
+  candidate: {
+    root_id: 'user'
+    directory_name: string
+  }
+  source: 'imported' | 'market'
+  package_id: string
+  deletable: boolean
+  blocked_reason: 'candidate_code_present' | null
+}
+
+export function getRetainedPackageProfiles(): Promise<{
+  profiles: RetainedPackageProfile[]
+  count: number
+}> {
+  return get('/plugins/retained-package-profiles', { suppressErrorMessage: true })
+}
+
+export function deleteRetainedPackageProfile(
+  profile: Pick<RetainedPackageProfile, 'plugin_id' | 'candidate'>,
+): Promise<{
+  success: boolean
+  plugin_id: string
+  candidate: RetainedPackageProfile['candidate']
+  package_profile_deleted: boolean
+  cleanup_deferred: boolean
+  cleanup_recorded: boolean | null
+  message: string
+}> {
+  const safeId = encodeURIComponent(profile.plugin_id)
+  return del(`/plugin/${safeId}/package-profile`, {
+    data: {
+      ...profile.candidate,
+      confirm_delete: true,
+    },
+    suppressErrorMessage: true,
+  })
 }
 
 /**

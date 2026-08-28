@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Query, WebSocket
@@ -46,6 +47,17 @@ async def get_plugin_logs_endpoint(
 async def get_plugin_log_files_endpoint(plugin_id: str, _: str = require_admin) -> dict[str, object]:
     try:
         return log_query_service.get_plugin_log_files(plugin_id)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.delete("/plugin/{plugin_id}/logs")
+async def clear_plugin_logs_endpoint(
+    plugin_id: str,
+    _: str = require_admin,
+) -> dict[str, object]:
+    try:
+        return await asyncio.to_thread(log_query_service.clear_plugin_logs, plugin_id)
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 

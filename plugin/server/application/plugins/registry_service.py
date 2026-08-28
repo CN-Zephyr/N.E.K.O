@@ -8,7 +8,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from plugin._types.plugin_types import SUPPORTED_PLUGIN_TYPES
 from plugin.core.dependency import _topological_sort_plugins
@@ -28,6 +28,11 @@ from plugin.core.registry import (
 from plugin.core.state import state
 from plugin.logging_config import get_logger
 from plugin.server.application.install_source import get_install_source_manager
+from plugin.server.application.install_source.models import (
+    PluginEntry,
+    PluginRegistrySnapshot,
+    SourceDetailMarket,
+)
 from plugin.server.domain.plugin_candidates import (
     CandidateKey,
     PluginCandidate,
@@ -43,6 +48,9 @@ from plugin.server.infrastructure.plugin_selections import (
     get_plugin_selection,
     get_plugin_selection_record,
     get_plugin_state_owner,
+)
+from plugin.server.infrastructure.plugin_registry_authority import (
+    get_published_registry_snapshot_provider,
 )
 from plugin.server.infrastructure import plugin_selections as plugin_selection_store
 from plugin.settings import BUILTIN_PLUGIN_CONFIG_ROOT, PLUGIN_CONFIG_ROOTS
@@ -116,6 +124,18 @@ class PluginInventoryScan:
     inventory: PluginInventory
     failures: list[PluginDiscoveryFailure]
     config_paths: set[Path]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginInventoryView:
+    """Candidate inventory plus the durable intent used to resolve it."""
+
+    scan: PluginInventoryScan
+    selection: PluginSelection | None
+    state_owner: PluginSelection | None
+
+
+RegistrySnapshotProvider = Callable[[], PluginRegistrySnapshot | None]
 
 
 def _get_registered_plugin_snapshot_sync() -> dict[str, dict[str, object]]:
@@ -378,22 +398,209 @@ def _scan_plugin_inventory_sync(roots: tuple[Path, ...]) -> PluginInventoryScan:
     )
 
 
+def _candidate_roots_by_id(
+    roots: tuple[Path, ...],
+) -> dict[str, Path] | None:
+    """Resolve the two Registry root ids without guessing across extra roots."""
+
+    manager = get_install_source_manager()
+    builtin_root = _resolve_config_path(
+        manager.builtin_root
+        if manager is not None
+        else BUILTIN_PLUGIN_CONFIG_ROOT
+    )
+    if manager is not None:
+        user_root = _resolve_config_path(manager.user_root)
+        return {"builtin": builtin_root, "user": user_root}
+
+    user_roots = tuple(
+        _resolve_config_path(root)
+        for root in roots
+        if _resolve_config_path(root) != builtin_root
+    )
+    if len(user_roots) != 1:
+        return None
+    return {"builtin": builtin_root, "user": user_roots[0]}
+
+
+def _scan_registry_plugin_inventory_sync(
+    plugin_id: str,
+    entry: PluginEntry,
+    roots: tuple[Path, ...],
+) -> PluginInventoryScan | None:
+    """Read only one Registry entry's live manifests.
+
+    ``None`` means the snapshot cannot safely describe the current filesystem.
+    Once Registry authority is configured, callers must fail closed rather than
+    discover replacement candidates from arbitrary directories. Invalid
+    manifests are retained as invalid candidates, matching the legacy scanner's
+    behaviour.
+    """
+
+    root_paths = _candidate_roots_by_id(roots)
+    if root_paths is None or entry.plugin_id != plugin_id:
+        return None
+
+    candidates: list[PluginCandidate] = []
+    failures: list[PluginDiscoveryFailure] = []
+    config_paths: set[Path] = set()
+    live_records = entry.live_candidates()
+    if not live_records:
+        return PluginInventoryScan(
+            inventory=PluginInventory.build(()),
+            failures=[],
+            config_paths=set(),
+        )
+
+    for record in live_records:
+        root = root_paths.get(record.root_id)
+        if root is None or not record.directory_name:
+            return None
+        candidate_dir = _resolve_config_path(root / record.directory_name)
+        if candidate_dir.parent != root:
+            return None
+        config_path = candidate_dir / "plugin.toml"
+        if not config_path.is_file():
+            return None
+
+        version = ""
+        valid = True
+        error: str | None = None
+        try:
+            with config_path.open("rb") as file_obj:
+                manifest = tomllib.load(file_obj)
+            plugin_section = manifest.get("plugin")
+            if not isinstance(plugin_section, dict):
+                raise ValueError("plugin.toml is missing a [plugin] table")
+            raw_plugin_id = plugin_section.get("id")
+            if not isinstance(raw_plugin_id, str) or not _PLUGIN_ID_PATTERN.fullmatch(
+                raw_plugin_id.strip()
+            ):
+                raise ValueError("plugin.toml contains an invalid [plugin].id")
+            if raw_plugin_id.strip() != plugin_id:
+                return None
+            raw_version = plugin_section.get("version")
+            if isinstance(raw_version, str):
+                version = raw_version.strip()
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            valid = False
+            error = str(exc)
+            failures.append(
+                PluginDiscoveryFailure(
+                    plugin_id=plugin_id,
+                    config_path=config_path,
+                    error=error,
+                )
+            )
+
+        source_detail = record.source_detail
+        release_chain_id = (
+            source_detail.plugin_market_id.strip() or None
+            if record.channel == "market"
+            and isinstance(source_detail, SourceDetailMarket)
+            else None
+        )
+        config_paths.add(config_path)
+        candidates.append(
+            PluginCandidate(
+                key=CandidateKey(
+                    root_id=record.root_id,
+                    directory_name=record.directory_name,
+                ),
+                plugin_id=plugin_id,
+                config_path=config_path,
+                version=version,
+                source=record.channel,
+                release_chain_id=release_chain_id,
+                valid=valid,
+                error=error,
+            )
+        )
+
+    return PluginInventoryScan(
+        inventory=PluginInventory.build(candidates),
+        failures=failures,
+        config_paths=config_paths,
+    )
+
+
+def _selection_from_registry_entry(entry: PluginEntry) -> PluginSelection | None:
+    selected = entry.selected_candidate
+    if selected is None:
+        return None
+    owner = entry.state_owner
+    owner_matches = owner is not None and owner.candidate.primary_key == selected.primary_key
+    return PluginSelection(
+        candidate=CandidateKey(
+            root_id=selected.root_id,
+            directory_name=selected.directory_name,
+        ),
+        candidate_source=entry.candidate_source,
+        state_scope=owner.state_scope if owner_matches else None,
+        state_access_grant=owner.state_access_grant if owner_matches else None,
+        release_chain_id=owner.release_chain_id if owner_matches else None,
+        authorized_at=owner.authorized_at if owner_matches else None,
+    )
+
+
+def _state_owner_from_registry_entry(entry: PluginEntry) -> PluginSelection | None:
+    owner = entry.state_owner
+    if owner is None:
+        return None
+    record = next(
+        (
+            candidate
+            for candidate in entry.candidates
+            if candidate.primary_key == owner.candidate.primary_key
+        ),
+        None,
+    )
+    if record is None:
+        return None
+    return PluginSelection(
+        candidate=CandidateKey(
+            root_id=owner.candidate.root_id,
+            directory_name=owner.candidate.directory_name,
+        ),
+        candidate_source=record.channel,
+        state_scope=owner.state_scope,
+        state_access_grant=owner.state_access_grant,
+        release_chain_id=owner.release_chain_id,
+        authorized_at=owner.authorized_at,
+    )
+
+
 def _resolve_inventory_sync(
     inventory: PluginInventory,
     *,
     transient_candidates: Mapping[str, CandidateKey] | None = None,
     desired_candidates: Mapping[str, CandidateKey] | None = None,
+    selection_records: Mapping[str, PluginSelection | None] | None = None,
+    state_owner_records: Mapping[str, PluginSelection | None] | None = None,
 ) -> dict[str, PluginResolution]:
     transient = transient_candidates or {}
     desired_overrides = desired_candidates or {}
     resolutions: dict[str, PluginResolution] = {}
     for plugin_id in inventory.plugin_ids:
+        selection_record = (
+            selection_records.get(plugin_id)
+            if selection_records is not None
+            else get_plugin_selection_record(plugin_id)
+        )
         desired = (
             desired_overrides[plugin_id]
             if plugin_id in desired_overrides
-            else get_plugin_selection(plugin_id)
+            else (
+                selection_record.candidate
+                if selection_record is not None
+                else None
+            )
         )
-        state_owner = get_plugin_state_owner(plugin_id)
+        state_owner = (
+            state_owner_records.get(plugin_id)
+            if state_owner_records is not None
+            else get_plugin_state_owner(plugin_id)
+        )
         transient_candidate = transient.get(plugin_id)
         resolution = resolve_plugin_candidate(
             inventory,
@@ -409,7 +616,6 @@ def _resolve_inventory_sync(
             ),
             None,
         )
-        selection_record = get_plugin_selection_record(plugin_id)
         shared_state_exists = bool(
             transient_candidate is None
             and state_owner is None
@@ -588,6 +794,92 @@ def _discover_registry_snapshot_sync(
         failures=failures,
         config_paths=scan.config_paths,
         inventory=scan.inventory,
+        resolutions=resolutions,
+    )
+
+
+def _discover_authoritative_registry_snapshot_sync(
+    snapshot: PluginRegistrySnapshot,
+    roots: tuple[Path, ...],
+) -> PluginDiscoverySnapshot:
+    """Build runtime discovery strictly from one canonical Registry snapshot."""
+
+    candidates: list[PluginCandidate] = []
+    failures: list[PluginDiscoveryFailure] = []
+    config_paths: set[Path] = set()
+    selection_records: dict[str, PluginSelection | None] = {}
+    state_owner_records: dict[str, PluginSelection | None] = {}
+
+    for plugin_id, entry in snapshot.plugins.items():
+        scan = _scan_registry_plugin_inventory_sync(plugin_id, entry, roots)
+        if scan is None:
+            raise ServerDomainError(
+                code="PLUGIN_REGISTRY_STALE",
+                message=(
+                    f"Plugin Registry revision {snapshot.revision} cannot describe "
+                    f"plugin '{plugin_id}' safely"
+                ),
+                status_code=503,
+                details={
+                    "plugin_id": plugin_id,
+                    "registry_revision": snapshot.revision,
+                },
+            )
+        candidates.extend(scan.inventory.candidates)
+        failures.extend(scan.failures)
+        config_paths.update(scan.config_paths)
+        selection_records[plugin_id] = _selection_from_registry_entry(entry)
+        state_owner_records[plugin_id] = _state_owner_from_registry_entry(entry)
+
+    inventory = PluginInventory.build(candidates)
+    resolutions = _resolve_inventory_sync(
+        inventory,
+        selection_records=selection_records,
+        state_owner_records=state_owner_records,
+    )
+    processed_paths: set[Path] = set()
+    records: list[PluginDiscoveryRecord] = []
+
+    for plugin_id, resolution in resolutions.items():
+        if resolution.candidate is None:
+            if resolution.reason == "ambiguous" and resolution.available_candidates:
+                failures.append(
+                    PluginDiscoveryFailure(
+                        plugin_id=plugin_id,
+                        config_path=resolution.available_candidates[0].config_path,
+                        error=(
+                            f"plugin '{plugin_id}' has multiple candidates and requires "
+                            "an explicit selection"
+                        ),
+                    )
+                )
+            continue
+        try:
+            records.append(
+                _build_selected_discovery_record_sync(
+                    resolution,
+                    processed_paths=processed_paths,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "authoritative Registry discovery failed: plugin_id={}, err_type={}",
+                plugin_id,
+                type(exc).__name__,
+            )
+            failures.append(
+                PluginDiscoveryFailure(
+                    plugin_id=plugin_id,
+                    config_path=resolution.candidate.config_path,
+                    error=str(exc),
+                )
+            )
+
+    return PluginDiscoverySnapshot(
+        records=records,
+        failures=failures,
+        config_paths=config_paths,
+        inventory=inventory,
         resolutions=resolutions,
     )
 
@@ -877,6 +1169,24 @@ def _candidate_key_payload(candidate: CandidateKey | None) -> dict[str, str] | N
 
 
 class PluginRegistryService:
+    def __init__(
+        self,
+        *,
+        registry_snapshot_provider: RegistrySnapshotProvider | None = None,
+    ) -> None:
+        # Supplying the provider is the explicit cutover boundary. Existing
+        # runtime instances keep the legacy scanner/selection files until the
+        # startup migration owns and publishes a Registry snapshot.
+        self._registry_snapshot_provider = registry_snapshot_provider
+
+    def _configured_registry_snapshot_provider(
+        self,
+    ) -> RegistrySnapshotProvider | None:
+        return (
+            self._registry_snapshot_provider
+            or get_published_registry_snapshot_provider()
+        )
+
     async def refresh_registry(self) -> dict[str, object]:
         return await asyncio.to_thread(self._refresh_registry_sync)
 
@@ -923,6 +1233,74 @@ class PluginRegistryService:
     async def order_plugin_ids(self, plugin_ids: list[str]) -> list[str]:
         return await asyncio.to_thread(self._order_plugin_ids_sync, plugin_ids)
 
+    def _authoritative_registry_snapshot_sync(self) -> PluginRegistrySnapshot:
+        provider = self._configured_registry_snapshot_provider()
+        if provider is None:
+            raise RuntimeError("Registry snapshot provider is not configured")
+        try:
+            snapshot = provider()
+        except Exception as exc:
+            raise ServerDomainError(
+                code="PLUGIN_REGISTRY_UNAVAILABLE",
+                message="Plugin Registry authority could not be read safely",
+                status_code=503,
+                details={
+                    "authority": "plugin_registry",
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
+        if snapshot is None:
+            raise ServerDomainError(
+                code="PLUGIN_REGISTRY_NOT_READY",
+                message="Plugin Registry authority is not initialized",
+                status_code=503,
+                details={"authority": "plugin_registry"},
+            )
+        return snapshot
+
+    def _plugin_inventory_view_sync(self, plugin_id: str) -> PluginInventoryView:
+        roots = _plugin_config_roots()
+        provider = self._configured_registry_snapshot_provider()
+        if provider is None:
+            return PluginInventoryView(
+                scan=_scan_plugin_inventory_sync(roots),
+                selection=get_plugin_selection_record(plugin_id),
+                state_owner=get_plugin_state_owner(plugin_id),
+            )
+
+        snapshot = self._authoritative_registry_snapshot_sync()
+
+        entry = snapshot.entry(plugin_id)
+        if entry is None:
+            return PluginInventoryView(
+                scan=PluginInventoryScan(
+                    inventory=PluginInventory.build(()),
+                    failures=[],
+                    config_paths=set(),
+                ),
+                selection=None,
+                state_owner=None,
+            )
+        scan = _scan_registry_plugin_inventory_sync(plugin_id, entry, roots)
+        if scan is None:
+            raise ServerDomainError(
+                code="PLUGIN_REGISTRY_STALE",
+                message=(
+                    f"Plugin Registry revision {snapshot.revision} cannot describe "
+                    f"plugin '{plugin_id}' safely"
+                ),
+                status_code=503,
+                details={
+                    "plugin_id": plugin_id,
+                    "registry_revision": snapshot.revision,
+                },
+            )
+        return PluginInventoryView(
+            scan=scan,
+            selection=_selection_from_registry_entry(entry),
+            state_owner=_state_owner_from_registry_entry(entry),
+        )
+
     def _refresh_registry_sync(self) -> dict[str, object]:
         roots = _plugin_config_roots()
         _prepare_plugin_import_roots(roots, logger)
@@ -932,9 +1310,13 @@ class PluginRegistryService:
         added: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
-        snapshot = _discover_registry_snapshot_sync(
-            roots,
-        )
+        if self._configured_registry_snapshot_provider() is None:
+            snapshot = _discover_registry_snapshot_sync(roots)
+        else:
+            snapshot = _discover_authoritative_registry_snapshot_sync(
+                self._authoritative_registry_snapshot_sync(),
+                roots,
+            )
         failed = [
             {
                 "plugin_id": item.plugin_id or "",
@@ -1042,13 +1424,23 @@ class PluginRegistryService:
         roots = _plugin_config_roots()
         existing_snapshot = _get_registered_plugin_snapshot_sync()
         running_ids = _list_running_plugin_ids_sync()
-        scan = _scan_plugin_inventory_sync(roots)
+        registry_view = (
+            self._plugin_inventory_view_sync(normalized_plugin_id)
+            if self._configured_registry_snapshot_provider() is not None
+            else None
+        )
+        scan = (
+            registry_view.scan
+            if registry_view is not None
+            else _scan_plugin_inventory_sync(roots)
+        )
         existing_config_path = _resolve_meta_config_path(
             existing_snapshot.get(normalized_plugin_id)
         )
         legacy_registered_path = (
             existing_config_path
             if existing_config_path is not None
+            and registry_view is None
             and existing_config_path.exists()
             and scan.inventory.by_config_path(existing_config_path) is None
             else None
@@ -1142,6 +1534,16 @@ class PluginRegistryService:
                 if transient_candidate is not None
                 else None
             ),
+            selection_records=(
+                {logical_plugin_id: registry_view.selection}
+                if registry_view is not None
+                else None
+            ),
+            state_owner_records=(
+                {logical_plugin_id: registry_view.state_owner}
+                if registry_view is not None
+                else None
+            ),
         )[logical_plugin_id]
         if resolution.candidate is None:
             raise ServerDomainError(
@@ -1230,7 +1632,8 @@ class PluginRegistryService:
 
     def _list_plugin_candidates_sync(self, plugin_id: str) -> dict[str, object]:
         normalized_plugin_id = _normalize_plugin_id(plugin_id)
-        scan = _scan_plugin_inventory_sync(_plugin_config_roots())
+        view = self._plugin_inventory_view_sync(normalized_plugin_id)
+        scan = view.scan
         if normalized_plugin_id not in scan.inventory.plugin_ids:
             raise ServerDomainError(
                 code="PLUGIN_CONFIG_NOT_FOUND",
@@ -1239,10 +1642,16 @@ class PluginRegistryService:
                 details={"plugin_id": normalized_plugin_id},
             )
 
-        resolution = _resolve_inventory_sync(scan.inventory)[normalized_plugin_id]
-        desired = get_plugin_selection(normalized_plugin_id)
-        desired_record = get_plugin_selection_record(normalized_plugin_id)
-        state_owner_record = get_plugin_state_owner(normalized_plugin_id)
+        resolution = _resolve_inventory_sync(
+            scan.inventory,
+            selection_records={normalized_plugin_id: view.selection},
+            state_owner_records={normalized_plugin_id: view.state_owner},
+        )[normalized_plugin_id]
+        desired_record = view.selection
+        desired = (
+            desired_record.candidate if desired_record is not None else None
+        )
+        state_owner_record = view.state_owner
         registered_meta = _get_registered_plugin_snapshot_sync().get(normalized_plugin_id)
         registered_config_path = _resolve_meta_config_path(registered_meta)
         registered_candidate = (
@@ -1359,7 +1768,8 @@ class PluginRegistryService:
     ) -> dict[str, object]:
         normalized_plugin_id = _normalize_plugin_id(plugin_id)
         roots = _plugin_config_roots()
-        scan = _scan_plugin_inventory_sync(roots)
+        view = self._plugin_inventory_view_sync(normalized_plugin_id)
+        scan = view.scan
         candidate = next(
             (
                 item
@@ -1393,7 +1803,9 @@ class PluginRegistryService:
         resolution = resolve_plugin_candidate(
             scan.inventory,
             normalized_plugin_id,
-            desired_candidate=get_plugin_selection(normalized_plugin_id),
+            desired_candidate=(
+                view.selection.candidate if view.selection is not None else None
+            ),
             transient_candidate=candidate_key,
         )
         _prepare_plugin_import_roots(roots, logger)
@@ -1450,7 +1862,8 @@ class PluginRegistryService:
         """Resolve the post-removal candidate without touching disk or runtime."""
 
         normalized_plugin_id = _normalize_plugin_id(plugin_id)
-        scan = _scan_plugin_inventory_sync(_plugin_config_roots())
+        view = self._plugin_inventory_view_sync(normalized_plugin_id)
+        scan = view.scan
         target = next(
             (
                 candidate
@@ -1479,6 +1892,8 @@ class PluginRegistryService:
             resolution = _resolve_inventory_sync(
                 remaining,
                 desired_candidates={normalized_plugin_id: candidate_key},
+                selection_records={normalized_plugin_id: view.selection},
+                state_owner_records={normalized_plugin_id: view.state_owner},
             )[normalized_plugin_id]
         else:
             resolution = resolve_plugin_candidate(

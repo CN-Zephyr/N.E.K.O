@@ -8,7 +8,10 @@ keeps HTTP/CLI response shaping outside the package-management boundary.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+import os
+import re
 import shutil
 import stat
 import tomllib
@@ -25,6 +28,19 @@ from plugin.server.application.install_source import get_install_source_manager
 from plugin.server.domain.errors import ServerDomainError
 
 from .install_plan import PluginInstallPlan, build_install_plan
+
+_RETIREMENT_COMMIT_SUFFIX = ".committed"
+_RETIREMENT_COMMIT_PAYLOAD = b"NEKO-CANDIDATE-RETIREMENT-V1\n"
+_RETIREMENT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+@dataclass(frozen=True)
+class StagedCandidateRetirement:
+    """One candidate directory moved outside the scanner-visible namespace."""
+
+    original_dir: Path
+    staged_dir: Path | None
+    existed: bool
 
 
 class PluginPackageService:
@@ -55,6 +71,96 @@ class PluginPackageService:
             package_id=package_id,
             plugin_ids=plugin_ids,
         )
+
+    def stage_candidate_retirement(self, target_dir: Path) -> StagedCandidateRetirement:
+        """Atomically hide candidate code so a failed Registry write can restore it."""
+
+        if not target_dir.exists():
+            return StagedCandidateRetirement(
+                original_dir=target_dir,
+                staged_dir=None,
+                existed=False,
+            )
+        if _is_link_or_reparse(target_dir):
+            raise ValueError("candidate directory must not be a link or reparse point")
+        if not target_dir.is_dir():
+            raise NotADirectoryError(target_dir)
+
+        staging_root = target_dir.parent / ".delete-backups"
+        if _is_link_or_reparse(staging_root):
+            raise ValueError("candidate retirement staging root must not be a link")
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staged_dir = staging_root / f"{target_dir.name}.retiring.{uuid.uuid4().hex}"
+        target_dir.rename(staged_dir)
+        return StagedCandidateRetirement(
+            original_dir=target_dir,
+            staged_dir=staged_dir,
+            existed=True,
+        )
+
+    def restore_candidate_retirement(self, staged: StagedCandidateRetirement) -> None:
+        """Put staged code back after the Registry retirement failed."""
+
+        if staged.staged_dir is None or not staged.staged_dir.exists():
+            return
+        if staged.original_dir.exists():
+            raise FileExistsError(staged.original_dir)
+        staged.staged_dir.rename(staged.original_dir)
+        _remove_empty_directory(staged.staged_dir.parent)
+
+    def finalize_candidate_retirement(self, staged: StagedCandidateRetirement) -> None:
+        """Permanently clean code only after the Registry retirement committed."""
+
+        if staged.staged_dir is None:
+            return
+        shutil.rmtree(staged.staged_dir)
+        _retirement_commit_marker(staged.staged_dir).unlink(missing_ok=True)
+        _remove_empty_directory(staged.staged_dir.parent)
+
+    def mark_candidate_retirement_committed(
+        self,
+        staged: StagedCandidateRetirement,
+    ) -> None:
+        """Persist a cleanup-only marker after durable retirement commits."""
+
+        if staged.staged_dir is None:
+            return
+        marker = _retirement_commit_marker(staged.staged_dir)
+        with marker.open("xb") as file_obj:
+            file_obj.write(_RETIREMENT_COMMIT_PAYLOAD)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+
+    def retry_candidate_retirement_cleanup(self, roots: tuple[Path, ...]) -> int:
+        """Delete only hidden backups carrying our exact post-commit marker."""
+
+        cleaned = 0
+        for root in dict.fromkeys(path.resolve(strict=False) for path in roots):
+            staging_root = root / ".delete-backups"
+            if not staging_root.is_dir() or _is_link_or_reparse(staging_root):
+                continue
+            for marker in tuple(staging_root.glob(f".*{_RETIREMENT_COMMIT_SUFFIX}")):
+                staged_dir = _staged_directory_from_marker(marker)
+                if (
+                    staged_dir is None
+                    or staged_dir.parent != staging_root
+                    or _is_link_or_reparse(marker)
+                    or not marker.is_file()
+                ):
+                    continue
+                try:
+                    if marker.read_bytes() != _RETIREMENT_COMMIT_PAYLOAD:
+                        continue
+                    if staged_dir.exists():
+                        if _is_link_or_reparse(staged_dir) or not staged_dir.is_dir():
+                            continue
+                        shutil.rmtree(staged_dir)
+                    marker.unlink()
+                except OSError:
+                    continue
+                cleaned += 1
+            _remove_empty_directory(staging_root)
+        return cleaned
 
     def plan_install(
         self,
@@ -237,6 +343,35 @@ def _is_link_or_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(file_attributes & reparse_attribute)
 
 
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _retirement_commit_marker(staged_dir: Path) -> Path:
+    return staged_dir.with_name(
+        f".{staged_dir.name}{_RETIREMENT_COMMIT_SUFFIX}"
+    )
+
+
+def _staged_directory_from_marker(marker: Path) -> Path | None:
+    name = marker.name
+    if not name.startswith(".") or not name.endswith(_RETIREMENT_COMMIT_SUFFIX):
+        return None
+    staged_name = name[1 : -len(_RETIREMENT_COMMIT_SUFFIX)]
+    prefix, separator, token = staged_name.rpartition(".retiring.")
+    if (
+        not separator
+        or not prefix
+        or prefix in {".", ".."}
+        or _RETIREMENT_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        return None
+    return marker.with_name(staged_name)
+
+
 def _read_installed_plugin_toml_id(target_dir: Path) -> str:
     plugin_toml = target_dir / "plugin.toml"
     try:
@@ -304,4 +439,4 @@ def _validate_existing_profile_ownership(
     )
 
 
-__all__ = ["PluginPackageService"]
+__all__ = ["PluginPackageService", "StagedCandidateRetirement"]

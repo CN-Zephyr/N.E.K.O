@@ -83,3 +83,63 @@ async def test_candidate_routes_expose_inventory_and_controlled_selection(
             True,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_package_profile_delete_route_requires_exact_confirmed_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, str]] = []
+
+    async def remove_profile(**kwargs: str) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"success": True, "package_profile_deleted": True}
+
+    monkeypatch.setattr(
+        module,
+        "remove_retired_candidate_package_profile",
+        remove_profile,
+    )
+    payload = module.PluginPackageProfileRemovalRequest(
+        root_id="user",
+        directory_name="sample-market",
+        confirm_delete=True,
+    )
+
+    result = await module.delete_plugin_package_profile_endpoint(
+        "sample_plugin",
+        payload,
+        _="test",
+    )
+
+    assert result == {"success": True, "package_profile_deleted": True}
+    assert calls == [
+        {
+            "plugin_id": "sample_plugin",
+            "root_id": "user",
+            "directory_name": "sample-market",
+        }
+    ]
+
+    with pytest.raises(ValueError):
+        module.PluginPackageProfileRemovalRequest(
+            root_id="user",
+            directory_name="sample-market",
+            confirm_delete=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_retained_package_profile_list_route_uses_safe_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {"profiles": [], "count": 0}
+    monkeypatch.setattr(
+        module,
+        "list_retained_candidate_package_profiles",
+        lambda: expected,
+    )
+
+    result = await module.list_retained_package_profiles_endpoint(_="test")
+
+    assert result is expected

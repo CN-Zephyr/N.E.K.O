@@ -16,6 +16,10 @@ from plugin.server.domain.errors import ServerDomainError
 from plugin.server.domain.plugin_candidates import CandidateKey
 from plugin.server.infrastructure.auth import require_admin
 from plugin.server.infrastructure.error_mapping import raise_http_from_domain
+from plugin.server.infrastructure.package_management.profile_removal_runtime import (
+    list_retained_candidate_package_profiles,
+    remove_retired_candidate_package_profile,
+)
 from plugin.server.lifecycle import ensure_plugin_messaging_started
 
 router = APIRouter()
@@ -41,6 +45,22 @@ class PluginCandidateSelectionRequest(BaseModel):
         return value
 
 
+class PluginPackageProfileRemovalRequest(BaseModel):
+    root_id: Literal["user"]
+    directory_name: str = Field(
+        min_length=1,
+        pattern=r"^[^/\\]+$",
+    )
+    confirm_delete: Literal[True]
+
+    @field_validator("directory_name")
+    @classmethod
+    def validate_directory_name(cls, value: str) -> str:
+        if value in {".", ".."}:
+            raise ValueError("directory_name must name one plugin directory")
+        return value
+
+
 @router.get("/plugin/status")
 async def plugin_status(plugin_id: Optional[str] = Query(default=None)) -> dict[str, object]:
     try:
@@ -52,6 +72,16 @@ async def plugin_status(plugin_id: Optional[str] = Query(default=None)) -> dict[
 async def list_plugins(locale: Optional[str] = Query(default=None)) -> dict[str, object]:
     try:
         return await query_service.list_plugins(locale=locale)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.get("/plugins/retained-package-profiles")
+async def list_retained_package_profiles_endpoint(
+    _: str = require_admin,
+) -> dict[str, object]:
+    try:
+        return list_retained_candidate_package_profiles()
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 
@@ -112,6 +142,22 @@ async def stop_plugin_endpoint(plugin_id: str, _: str = require_admin) -> dict[s
 async def delete_plugin_endpoint(plugin_id: str, _: str = require_admin) -> dict[str, object]:
     try:
         return await lifecycle_service.delete_plugin(plugin_id)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.delete("/plugin/{plugin_id}/package-profile")
+async def delete_plugin_package_profile_endpoint(
+    plugin_id: str,
+    payload: PluginPackageProfileRemovalRequest,
+    _: str = require_admin,
+) -> dict[str, object]:
+    try:
+        return await remove_retired_candidate_package_profile(
+            plugin_id=plugin_id,
+            root_id=payload.root_id,
+            directory_name=payload.directory_name,
+        )
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 

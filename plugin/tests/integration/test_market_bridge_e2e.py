@@ -4578,8 +4578,6 @@ async def test_upgrade_lifecycle_uses_installed_plugin_id_not_market_id(
         )
         assert (await _wait_task(resp.json()["task_id"]))["status"] == "completed"
 
-    from plugin.server.routes import market_bridge as market_bridge_module
-
     async def fake_is_running(target: str) -> bool:
         calls.append(("is_running", target))
         return True
@@ -4591,9 +4589,11 @@ async def test_upgrade_lifecycle_uses_installed_plugin_id_not_market_id(
         calls.append(("start", target))
         return strict
 
-    monkeypatch.setattr(market_bridge_module, "plugin_is_running", fake_is_running)
-    monkeypatch.setattr(market_bridge_module, "stop_plugin_for_upgrade", fake_stop)
-    monkeypatch.setattr(market_bridge_module, "start_plugin_after_upgrade", fake_start)
+    from plugin.server.infrastructure.package_management import market_replacement
+
+    monkeypatch.setattr(market_replacement, "plugin_is_running", fake_is_running)
+    monkeypatch.setattr(market_replacement, "stop_plugin_for_upgrade", fake_stop)
+    monkeypatch.setattr(market_replacement, "start_plugin_after_upgrade", fake_start)
 
     with _serve_bytes(
         filename=f"{plugin_id}-2.0.0.neko-plugin", content=v2_zip,

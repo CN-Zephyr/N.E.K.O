@@ -56,7 +56,7 @@ class StartupReconciler:
     def __init__(self, manager: "InstallSourceManager") -> None:
         self.manager = manager
 
-    async def run(self) -> None:
+    async def run(self) -> bool:
         """Drive the ``load → reconcile`` sequence; swallow all errors.
 
         Covers:
@@ -80,6 +80,7 @@ class StartupReconciler:
         try:
             await asyncio.to_thread(self.manager.load)
             await asyncio.to_thread(self.manager.reconcile)
+            return True
         except asyncio.CancelledError:
             # A cancellation of the lifespan task is not a subsystem
             # failure — let it bubble so the shutdown path sees it.
@@ -91,3 +92,4 @@ class StartupReconciler:
                 exc,
                 exc_info=True,
             )
+            return False

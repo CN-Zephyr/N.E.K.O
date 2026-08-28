@@ -13,8 +13,12 @@ from plugin.server.application.plugin_cli.service import (
     PluginCliService,
     _replacement_error_details,
 )
+from plugin.server.application.package_management import replacement as package_replacement
+from plugin.server.application.package_management.replacement import (
+    ReplacePluginError,
+    replace_plugin,
+)
 from plugin.server.application.plugins import upgrade_support
-from plugin.server.application.plugins.upgrade_support import ReplacePluginError, replace_plugin
 from plugin.server.domain.errors import ServerDomainError
 
 pytestmark = pytest.mark.plugin_unit
@@ -200,7 +204,7 @@ async def test_rollback_keeps_targets_that_were_not_backed_up(tmp_path: Path) ->
     profile.mkdir(parents=True)
     (profile / "default.toml").write_text("user_value = true\n", encoding="utf-8")
 
-    restored = await upgrade_support._rollback_targets(
+    restored = await package_replacement.rollback_targets(
         targets=(target, profile),
         backups={target: backup},
         preexisting_targets=frozenset({target, profile}),
@@ -456,7 +460,7 @@ async def test_service_rejects_unsafe_upgrade_plan_paths_before_backup(
         return object()
 
     monkeypatch.setattr(service, "plan_install", unsafe_plan_install)
-    monkeypatch.setattr(upgrade_support, "replace_plugin", unexpected_upgrade)
+    monkeypatch.setattr(package_replacement, "replace_plugin", unexpected_upgrade)
 
     with pytest.raises(ValueError, match=field):
         await service.install(
