@@ -9643,3 +9643,44 @@ async def test_speaker_shadow_abba_cannot_change_provider_authority(
     assert disabled_a["provider_connect_count"] == 1
     assert disabled_a["provider_close_count"] == 1
     assert len(disabled_a["finals"]) == 1
+
+
+async def test_lease_resync_does_not_hand_a_successor_the_replaced_episode() -> None:
+    """A takeover inside the display send must not reach the new recorder.
+
+    The display push is an await, so the voice-owner lookup that follows it
+    can resolve the SUCCESSOR's socket. Withholding the ledger commit
+    afterwards is not enough -- a delivered status cannot be retracted.
+    """
+
+    runtime = _Runtime()
+    assert runtime._begin_voice_input_connection("chat-window") is True
+
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+    owner_payloads: list[dict] = []
+
+    async def stalling_send_status(_message: str) -> bool:
+        send_started.set()
+        await release_send.wait()
+        return True
+
+    async def record_owner_send(payload: dict):
+        owner_payloads.append(payload)
+        return successor_socket
+
+    successor_socket = object()
+    runtime.send_status = AsyncMock(side_effect=stalling_send_status)
+    runtime._voice_owner_socket = lambda: successor_socket
+    runtime._send_to_voice_owner = record_owner_send
+
+    signal = asyncio.create_task(runtime._maybe_signal_voice_lease_resync())
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+
+    # A different window claims the microphone while the display push is stuck.
+    assert runtime._begin_voice_input_connection("recorder-window") is True
+    release_send.set()
+    await asyncio.wait_for(signal, timeout=1)
+
+    assert owner_payloads == []
+    assert runtime._voice_lease_resync_signal_state is None

@@ -1343,6 +1343,7 @@ class AsrRuntimeMixin:
         message: str,
         *,
         progress: tuple[object, set[str]] | None = None,
+        still_current: Callable[[], bool] | None = None,
     ) -> tuple[bool, bool]:
         """Send a mic control-plane status to the current AND voice sockets.
 
@@ -1357,6 +1358,14 @@ class AsrRuntimeMixin:
         tests, and narrow manager doubles do not carry the notify mixin at all.
         The returned pair records each plane independently so episode retries
         can skip a plane that already accepted this exact status.
+
+        ``still_current`` is re-evaluated between the two planes. The display
+        send is an await, and a microphone takeover completing inside it makes
+        the voice-owner lookup below resolve the SUCCESSOR's socket -- which
+        would hand the new active recorder a notice about the episode it just
+        replaced. The post-send episode check at the call sites cannot help:
+        it only withholds the ledger commit, and a delivered status cannot be
+        retracted.
         """
 
         if progress is None:
@@ -1367,6 +1376,10 @@ class AsrRuntimeMixin:
                 delivered_planes.add("display_delivered")
         if "voice_owner_settled" in delivered_planes:
             return "display_delivered" in delivered_planes, True
+        if still_current is not None and not still_current():
+            # Do not settle the voice plane either: this episode is over, and
+            # the caller drops its ledger rather than committing it.
+            return "display_delivered" in delivered_planes, False
         voice_owner_resolver = getattr(self, "_voice_owner_socket", None)
         voice_owner_socket = (
             voice_owner_resolver() if callable(voice_owner_resolver) else None
@@ -1407,7 +1420,10 @@ class AsrRuntimeMixin:
                 progress = (signal_state, set())
                 self._voice_lease_resync_delivery_state = progress
             await self._send_voice_control_status(
-                json.dumps(
+                still_current=(
+                    lambda: self._voice_lease_resync_episode() == signal_state
+                ),
+                message=json.dumps(
                     {
                         "code": "VOICE_INPUT_LEASE_RESYNC_REQUIRED",
                         "details": {
@@ -1483,13 +1499,17 @@ class AsrRuntimeMixin:
                 progress = (signal_state, set())
                 self._blocked_text_mode_microphone_delivery_state = progress
             await self._send_voice_control_status(
-                json.dumps(
+                message=json.dumps(
                     {
                         "code": "VOICE_INPUT_BLOCKED_TEXT_SESSION",
                         "details": {"reason": "text_session_active"},
                     }
                 ),
                 progress=progress,
+                still_current=(
+                    lambda: self._blocked_text_mode_microphone_episode()
+                    == signal_state
+                ),
             )
             if self._blocked_text_mode_microphone_episode() != signal_state:
                 return
