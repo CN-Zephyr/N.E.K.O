@@ -449,10 +449,30 @@ class _ResponseMixin:
             # SDK-send success alone is not response completion.
             if self._gemini_session is None:
                 raise RuntimeError("Gemini session not available for proactive inject")
+            proactive_session = self._gemini_session
+            proactive_scope = getattr(self, "_tool_scope_generation", 0)
             await self._settle_tools_before_gemini_proactive()
-            if self._gemini_session is None:
-                # The settle above is an await; a teardown can land inside it.
+            if self._gemini_session is not proactive_session:
+                # The settle is an await: a teardown OR a replacement session
+                # can land inside it, and this inject belongs to neither.
                 raise RuntimeError("Gemini session not available for proactive inject")
+            if proactive_scope != getattr(self, "_tool_scope_generation", 0):
+                # A real user turn began while we waited. Sending now would put
+                # this notification inside their turn, and Gemini treats client
+                # content as an interruption of the current generation -- the
+                # exact failure the wait exists to avoid, just aimed at the user
+                # instead of at a tool. The caller keeps the callback queued and
+                # retries it on the next idle hook, so nothing is lost.
+                #
+                # Deliberately NOT also gated on is_active_response(): waiting
+                # for tools makes a model response DURING the wait the normal
+                # case (the tool returned and generation continued), and
+                # rejecting on that would silently drop proactive messages on
+                # the healthy path. Guarding an active response is documented
+                # as the caller's job.
+                raise RuntimeError(
+                    "Gemini proactive inject was superseded by a new user turn"
+                )
             outcome_token = f"gemini_inject_{uuid.uuid4().hex}"
             if on_rejected is not None or on_completed is not None:
                 if getattr(self, "_gemini_proactive_outcome", None) is not None:

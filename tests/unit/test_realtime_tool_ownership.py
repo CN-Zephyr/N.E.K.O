@@ -2512,3 +2512,137 @@ async def test_tool_captured_after_a_mid_response_host_rotation_is_withheld() ->
         "premise: no new user turn -- scope_generation cannot be what rejects"
     )
     assert client._tool_task_owner_is_current(rotated) is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_abandons_itself_if_a_user_turn_starts_while_waiting(
+    monkeypatch,
+) -> None:
+    """The tool wait is a window the inject did not previously have.
+
+    Waiting for tools yields for up to the settle budget, and a real user turn
+    can begin inside it. Sending afterwards would put the notification into
+    that turn -- Gemini treats client content as an interruption -- so the
+    inject retires itself. The proactive caller catches this and keeps the
+    callback queued for the next idle hook, so the message is deferred rather
+    than lost.
+    """
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 5.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(call):
+        started.set()
+        await release.wait()
+        return ToolResult(call_id=call.call_id, name=call.name, output={})
+
+    class _RecordingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            sent.append("proactive")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _RecordingSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    inject = asyncio.create_task(
+        client.inject_text_and_request_response("proactive body")
+    )
+    await asyncio.sleep(0)
+    # A real user turn arrives while the inject is parked in the tool wait.
+    # This also cancels the tool task, which is what ends the wait.
+    client.note_user_turn_started()
+
+    with pytest.raises(RuntimeError, match="superseded by a new user turn"):
+        await asyncio.wait_for(inject, timeout=2)
+
+    assert sent == []
+
+    release.set()
+    await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_still_sends_when_only_a_model_response_started(
+    monkeypatch,
+) -> None:
+    """An active model response is NOT the supersede signal.
+
+    Waiting for tools makes "the tool returned and generation continued" the
+    normal outcome, so an active response during the wait says nothing about
+    whose turn it is. Retiring the inject on it would silently drop proactive
+    messages on the healthy path -- only a new USER turn (which advances
+    _tool_scope_generation) may retire it. Guarding an active response is
+    documented as the caller's job on is_active_response.
+    """
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 5.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(call):
+        started.set()
+        await release.wait()
+        return ToolResult(call_id=call.call_id, name=call.name, output={})
+
+    class _RecordingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            sent.append("proactive")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _RecordingSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    scope_before = client._tool_scope_generation
+    inject = asyncio.create_task(
+        client.inject_text_and_request_response("proactive body")
+    )
+    await asyncio.sleep(0)
+    # The model is answering -- no new user turn, so this inject stays valid.
+    client._is_responding = True
+    assert client.is_active_response() is True
+    release.set()
+
+    await asyncio.wait_for(inject, timeout=2)
+    await _wait_for_tool_tasks(client)
+
+    assert client._tool_scope_generation == scope_before
+    assert sent == ["proactive"]
