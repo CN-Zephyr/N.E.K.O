@@ -222,6 +222,34 @@ class _ToolingMixin:
                 if not task.done():
                     task.cancel()
 
+    def _retired_tool_tasks(self) -> set:
+        """Tasks whose call the provider already cancelled in this scope.
+
+        Their results are filtered out on arrival, so nothing downstream can
+        use them -- but the task object stays in ``_tool_tasks`` until the
+        handler actually exits, which a handler that swallows CancelledError
+        may never do. Anyone waiting for tool work to settle has to skip these
+        or it waits out its whole budget for an answer that cannot come.
+
+        Scoped to the current connection/scope: ``_advance_tool_scope`` clears
+        the cancelled set, so a stale entry cannot retire a live successor.
+        """
+
+        cancelled_ids = getattr(self, "_cancelled_tool_call_ids", None)
+        if not cancelled_ids:
+            return set()
+        tasks_by_call_id = getattr(self, "_tool_tasks_by_call_id", None) or {}
+        connection_generation = self._connection_generation
+        scope_generation = getattr(self, "_tool_scope_generation", 0)
+        retired = set()
+        for cancelled_connection, cancelled_scope, call_id in cancelled_ids:
+            if (
+                cancelled_connection == connection_generation
+                and cancelled_scope == scope_generation
+            ):
+                retired.update(tasks_by_call_id.get(call_id, ()))
+        return retired
+
     def _tool_call_was_cancelled(
         self,
         owner: _ToolTaskOwner,

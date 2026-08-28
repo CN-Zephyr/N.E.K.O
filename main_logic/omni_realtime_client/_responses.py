@@ -743,10 +743,17 @@ class _ResponseMixin:
         """
 
         current = asyncio.current_task()
+        # Skip calls the provider already cancelled. The batch collector has
+        # stopped waiting for them and their results are filtered out on
+        # arrival, but the task object survives until the handler exits -- and
+        # a handler that swallows CancelledError may never exit. Without this,
+        # one such call makes EVERY later proactive inject on this connection
+        # pay the full settle timeout for work that can no longer answer.
+        retired = self._retired_tool_tasks()
         pending = tuple(
             task
             for task in getattr(self, "_tool_tasks", ())
-            if not task.done() and task is not current
+            if not task.done() and task is not current and task not in retired
         )
         if not pending:
             return True
