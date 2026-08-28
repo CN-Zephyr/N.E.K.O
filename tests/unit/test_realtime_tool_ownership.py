@@ -2912,7 +2912,9 @@ async def test_replacement_connection_retires_the_predecessors_proactive_outcome
 
     rejections: list[str] = []
 
-    async def on_rejected(reason: str) -> None:
+    def on_rejected(reason: str) -> None:
+        # Sync on purpose: _settle_gemini_proactive_inject CALLS this, it does
+        # not await it. An async double here silently records nothing.
         rejections.append(reason)
 
     client = OmniRealtimeClient(
@@ -2980,7 +2982,7 @@ async def test_a_failing_retired_inject_does_not_clear_the_successors_outcome() 
             await fail_send.wait()
             raise RuntimeError("retired SDK send failed")
 
-    async def on_rejected(_reason: str) -> None:
+    def on_rejected(_reason: str) -> None:
         return None
 
     client = OmniRealtimeClient(
@@ -3018,3 +3020,62 @@ async def test_a_failing_retired_inject_does_not_clear_the_successors_outcome() 
     assert client._gemini_proactive_outcome is successor_outcome
     assert client._gemini_proactive_outcome_owner is successor_owner
     assert client._proactive_inject_awaiting_outcome is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_expiring_proactive_inject_leaves_a_new_user_turn_alone(
+    monkeypatch,
+) -> None:
+    """A stale inject's quarantine must not take the user's turn down with it.
+
+    The connection and the Gemini session both survive a new user turn, so
+    neither tells one apart -- only the tool scope moves. Both halves of the
+    quarantine act on whatever is generating NOW: client_content interrupts
+    it, and the retirement marks the session fatal and closes it. After a real
+    user turn owns the generation, either one kills THEIR response.
+    """
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_CANCEL_GRACE_SECONDS", 0.01)
+
+    rejections: list[str] = []
+
+    def on_rejected(reason: str) -> None:
+        # Sync on purpose: _settle_gemini_proactive_inject CALLS this, it does
+        # not await it. An async double here silently records nothing.
+        rejections.append(reason)
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client.inject_text_and_request_response(
+        "proactive body", on_rejected=on_rejected
+    )
+    token = client._gemini_proactive_outcome[0]
+    sends_after_inject = len(session.client_contents)
+
+    # A real user turn takes over the generation while the inject is pending.
+    client.note_user_turn_started()
+
+    await client._interrupt_and_quarantine_gemini_proactive_outcome(
+        token, error_msg="timed out"
+    )
+
+    # No interrupt aimed at the user's generation...
+    assert len(session.client_contents) == sends_after_inject
+    # ...and the session was not retired out from under them.
+    assert client._fatal_error_occurred is False
+    assert client._gemini_session is session
+    # The stale inject is still settled, so its caller is told and can retry.
+    assert client._gemini_proactive_outcome is None
+    assert rejections == ["timed out"]

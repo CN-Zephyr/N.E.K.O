@@ -491,6 +491,11 @@ class _ResponseMixin:
                     proactive_session,
                     outcome_token,
                     self._gemini_context_manager,
+                    # The connection and the session both survive a new user
+                    # turn, so neither can tell one apart. Only the tool scope
+                    # moves -- and this inject stops owning the Gemini
+                    # generation the moment it does.
+                    proactive_scope,
                 )
                 self._proactive_inject_outcome_token = outcome_token
                 self._proactive_inject_awaiting_outcome = True
@@ -868,10 +873,41 @@ class _ResponseMixin:
         owner = getattr(self, "_gemini_proactive_outcome_owner", None)
         if owner is None or owner[2] != token:
             return
-        connection_generation, provider_session, _, context = owner
+        connection_generation, provider_session, _, context = owner[:4]
+        owner_scope = owner[4] if len(owner) > 4 else None
         # Gemini lifecycle events are not tagged with a response id. Do not
         # release this token while the original generation can still emit a
         # late terminal: that terminal could otherwise settle a newer retry.
+        def scope_still_ours() -> bool:
+            # The connection and the session both survive a new user turn, so
+            # neither tells one apart. Only the tool scope moves.
+            return owner_scope is None or owner_scope == getattr(
+                self, "_tool_scope_generation", 0
+            )
+
+        def retire_without_touching_the_live_turn() -> None:
+            # BOTH halves of this quarantine act on whatever is generating
+            # now: client_content interrupts it, and the retirement below
+            # marks the session fatal and closes it. Once a real user turn
+            # owns the generation, either one takes THEIR response down, so
+            # neither may run -- this inject has no claim left. Settling is
+            # still correct and still safe: the outcome fences added for
+            # replacement connections already stop a late terminal from the
+            # abandoned turn settling anyone else's retry.
+            logger.info(
+                "Gemini proactive quarantine retired without interrupting: a "
+                "new user turn owns the generation now"
+            )
+            self._settle_gemini_proactive_inject(
+                error_msg=error_msg,
+                expected_connection_generation=connection_generation,
+                expected_provider_session=provider_session,
+                expected_outcome_token=token,
+            )
+
+        if not scope_still_ours():
+            retire_without_touching_the_live_turn()
+            return
         try:
             await provider_session.send_client_content(
                 turns=None,
@@ -883,6 +919,11 @@ class _ResponseMixin:
                 exc,
             )
         await asyncio.sleep(_GEMINI_PROACTIVE_CANCEL_GRACE_SECONDS)
+        if not scope_still_ours():
+            # Re-checked: the grace period is exactly long enough for a user
+            # to start talking.
+            retire_without_touching_the_live_turn()
+            return
         live_owner = getattr(self, "_gemini_proactive_outcome_owner", None)
         still_current_connection = bool(
             connection_generation == self._connection_generation
@@ -1321,6 +1362,13 @@ class _ResponseMixin:
         )
 
         proactive_ticket = None
+        # Captured before the inject so the timeout path below can tell a
+        # still-ours generation from one a later user turn took over.
+        ephemeral_scope = getattr(self, "_tool_scope_generation", 0)
+
+        def _ephemeral_scope_still_ours() -> bool:
+            return ephemeral_scope == getattr(self, "_tool_scope_generation", 0)
+
         try:
             inject_kwargs = {
                 "on_rejected": _on_rejected,
@@ -1452,7 +1500,13 @@ class _ResponseMixin:
                             )
                         )
                     else:
-                        await self.cancel_response()
+                        # Gemini has no ticket to cancel, so this is a raw
+                        # client_content interrupt aimed at whatever is
+                        # generating now. Guard it: after a new user turn it
+                        # would cancel THEIR response instead of ours.
+                        await self.cancel_response(
+                            send_guard=_ephemeral_scope_still_ours,
+                        )
                 except Exception as cancel_exc:
                     logger.warning(
                         "prompt_ephemeral: timed-out response cancel failed; keeping inject quarantined: %s",
