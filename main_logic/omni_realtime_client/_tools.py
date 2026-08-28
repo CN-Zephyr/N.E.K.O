@@ -275,13 +275,39 @@ class _ToolingMixin:
         ]
 
         async def _collect() -> None:
-            outcomes = await asyncio.gather(*call_tasks, return_exceptions=True)
+            # Deliberately not one ``gather``. A call the provider cancelled is
+            # dropped from the results below anyway, so continuing to WAIT for
+            # it buys nothing -- and a handler that swallows CancelledError (or
+            # sits in cancellation-resistant I/O) would otherwise hold every
+            # sibling's ``function_call_output`` hostage and stall the whole
+            # provider turn. Re-check the cancelled set on the same bound the
+            # close path already allows a tool to ignore cancellation for.
+            pending = list(zip(call_tasks, calls))
+            outcomes: Dict[str, ToolResult] = {}
+            while pending:
+                still_pending = []
+                for task, call in pending:
+                    if task.done():
+                        if not task.cancelled() and task.exception() is None:
+                            value = task.result()
+                            if isinstance(value, ToolResult):
+                                outcomes[call.call_id] = value
+                    elif not self._tool_call_was_cancelled(owner, call.call_id):
+                        still_pending.append((task, call))
+                pending = still_pending
+                if not pending:
+                    break
+                await asyncio.wait(
+                    [task for task, _ in pending],
+                    timeout=self._TOOL_TASK_CANCEL_TIMEOUT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             if not self._tool_task_owner_is_current(owner):
                 return
             results = [
-                outcome
-                for call, outcome in zip(calls, outcomes)
-                if isinstance(outcome, ToolResult)
+                outcomes[call.call_id]
+                for call in calls
+                if call.call_id in outcomes
                 and not self._tool_call_was_cancelled(owner, call.call_id)
             ]
             if results:

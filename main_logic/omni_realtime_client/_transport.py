@@ -1557,9 +1557,20 @@ class _TransportMixin:
         # guard above still passes — and reading the live value here would make
         # the check compare the successor's epoch with itself.
         released_epoch = self._current_turn_epoch
+        # Connection ownership is a SEPARATE question from turn ownership, and
+        # this path needs both. A replacement bumps _connection_generation
+        # without touching _turn_epoch, and this release runs in its caller's
+        # task rather than the arbiter worker -- so reset_connection_state does
+        # not cancel it. Without this, a release that outlived its connection
+        # still passes _still_ours() and rotates the REPLACEMENT's speech id
+        # (and queues the abandoned turn's trailing text as its TTS).
+        released_generation = self._connection_generation
 
         def _still_ours() -> bool:
             return self._turn_epoch == released_epoch
+
+        def _connection_still_ours() -> bool:
+            return self._connection_generation == released_generation
 
         if not _still_ours():
             # A turn already started before this release even ran, so NOTHING
@@ -1677,7 +1688,7 @@ class _TransportMixin:
         #
         # Best-effort besides: a host that blocks or raises while taking the
         # last half-sentence must not take the rotation behind it down too.
-        if _still_ours():
+        if _still_ours() and _connection_still_ours():
             try:
                 await asyncio.wait_for(
                     self._emit_pending_output_transcript(pending_transcript),
@@ -1702,6 +1713,7 @@ class _TransportMixin:
         await self._notify_turn_finished(
             step_timeout=_STUCK_RELEASE_STEP_TIMEOUT,
             still_ours=_still_ours,
+            connection_still_ours=_connection_still_ours,
         )
 
     async def handle_interruption(

@@ -783,9 +783,22 @@ class _ResponseMixin:
             connection_generation == self._connection_generation
             and provider_session is self._gemini_session
         )
-        if still_current_connection and (
-            live_owner is None or live_owner[:3] != owner[:3]
-        ):
+        if live_owner is None:
+            # SETTLED, not merely superseded -- and the two are different
+            # owners of the teardown. Every other settler (an ordinary close,
+            # the receive-loop teardown, a normal turn_complete) either owns
+            # the context it closed or has no context to close, so exiting the
+            # captured one here would be a second __aexit__ on a one-shot SDK
+            # context that already left the close registry. Deliberately NOT
+            # gated on connection currency: an ordinary close finishing during
+            # the grace sleep also drops _gemini_session, which makes the
+            # connection read false and used to let this fall straight through.
+            return
+        if still_current_connection and live_owner[:3] != owner[:3]:
+            # SUPERSEDED on the live connection: a newer outcome took over and
+            # owns what follows. A replacement CONNECTION is the opposite case
+            # and must not return -- nobody else will exit the context this
+            # quarantine captured.
             return
 
         # No terminal followed the interrupt. Retire the whole Gemini session

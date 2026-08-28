@@ -2217,7 +2217,7 @@ async def test_owned_cleanup_observes_background_failure(caplog) -> None:
         fail_cleanup(),
         name="test-owned-cleanup-failure",
     )
-    await cleanup_observed.wait()
+    await asyncio.wait_for(cleanup_observed.wait(), timeout=1)
 
     assert cleanup.done() is True
     assert not runtime._asr_owned_cleanup_tasks

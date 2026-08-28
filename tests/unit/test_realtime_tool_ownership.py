@@ -2184,3 +2184,133 @@ async def test_raw_tool_task_cancellation_retires_its_arbiter_ticket() -> None:
     assert socket.sent == []
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_cancelled_call_cannot_hold_its_siblings_result(monkeypatch) -> None:
+    """A handler that ignores cancellation must not stall the whole batch."""
+
+    import main_logic.omni_realtime_client._gemini_support as gemini_support
+
+    monkeypatch.setattr(
+        gemini_support,
+        "types",
+        SimpleNamespace(FunctionResponse=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    started = {"first": asyncio.Event(), "second": asyncio.Event()}
+    releases = {"first": asyncio.Event(), "second": asyncio.Event()}
+    first_cancelled = asyncio.Event()
+
+    async def handler(call):
+        started[call.name].set()
+        while True:
+            try:
+                await releases[call.name].wait()
+                break
+            except asyncio.CancelledError:
+                if call.name != "first":
+                    raise
+                # Cancellation-resistant on purpose: this is the shape that
+                # used to hold call-b's function_call_output forever.
+                first_cancelled.set()
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "first"), ("call-b", "second"))),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started["first"].wait(), timeout=1)
+    await asyncio.wait_for(started["second"].wait(), timeout=1)
+
+    await client._process_gemini_response(
+        _gemini_response(cancelled_ids=("call-a",)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(first_cancelled.wait(), timeout=1)
+    releases["second"].set()
+
+    # Bounded by _TOOL_TASK_CANCEL_TIMEOUT_S, generously: the point is that it
+    # arrives at all while call-a is still parked in its handler.
+    for _ in range(40):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.05)
+
+    assert [r.id for r in session.tool_responses[0]] == ["call-b"]
+
+    releases["first"].set()
+    await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_quarantine_does_not_exit_a_context_an_ordinary_close_finished(
+    monkeypatch,
+) -> None:
+    """A settled outcome means the teardown belongs to whoever settled it."""
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_CANCEL_GRACE_SECONDS", 0.05)
+
+    interrupted = asyncio.Event()
+
+    class _QuarantineSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            interrupted.set()
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    session = _QuarantineSession()
+    context = _GatedGeminiContext()
+    context.release.set()
+    client._gemini_session = session
+    client._gemini_context_manager = context
+    client._on_connection_attached()
+
+    token = "outcome-token"
+    client._gemini_proactive_outcome = (token, None, None)
+    client._gemini_proactive_outcome_owner = (
+        client._connection_generation,
+        session,
+        token,
+        context,
+    )
+
+    quarantine = asyncio.create_task(
+        client._interrupt_and_quarantine_gemini_proactive_outcome(
+            token, error_msg="quarantined"
+        )
+    )
+    await asyncio.wait_for(interrupted.wait(), timeout=1)
+
+    # An ordinary close lands while the quarantine sleeps out its grace period:
+    # it exits the context once, drops the session, and settles the outcome.
+    await client._close_gemini_context(context, session)
+    client._gemini_session = None
+    client._gemini_context_manager = None
+    client._gemini_proactive_outcome = None
+    client._gemini_proactive_outcome_owner = None
+    assert context.exit_calls == 1
+
+    await asyncio.wait_for(quarantine, timeout=2)
+
+    assert context.exit_calls == 1, "the one-shot SDK context was exited twice"

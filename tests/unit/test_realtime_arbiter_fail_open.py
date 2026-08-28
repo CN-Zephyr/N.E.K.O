@@ -2780,3 +2780,57 @@ async def test_a_release_over_another_live_response_leaves_the_quarantine_down()
         "resp-live has already announced; quarantining here would mute its "
         "own id-less tool calls until some later response.created"
     )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stuck_release_leaves_a_replacement_connections_turn_alone():
+    # The release runs in its caller's task, not the arbiter worker, so
+    # reset_connection_state does not cancel it -- and a replacement bumps
+    # _connection_generation without touching _turn_epoch, so the turn-epoch
+    # guard alone still reads "ours". Both end-of-turn hooks would then fire
+    # against the replacement: on_sid_rotate would split the new turn's bubble.
+    from main_logic.omni_realtime_client import OmniRealtimeClient
+
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    hooks: list[str] = []
+
+    async def _blocking_repetition() -> None:
+        entered.set()
+        await resume.wait()
+
+    async def _response_done() -> None:
+        hooks.append("response_done")
+
+    async def _sid_rotate() -> None:
+        hooks.append("sid_rotate")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="free-model",
+        api_type="free",
+        on_repetition_detected=_blocking_repetition,
+        on_response_done=_response_done,
+        on_sid_rotate=_sid_rotate,
+    )
+    client._current_response_id = "resp-1"
+    client._is_responding = True
+    # Third strike, so _check_repetition actually reaches the blocking hook.
+    client._current_response_transcript = "一模一样的一句话"
+    client._recent_responses = ["一模一样的一句话", "一模一样的一句话"]
+
+    release = asyncio.create_task(client._on_arbiter_stuck_release("stalled", "resp-1"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    released_epoch = client._current_turn_epoch
+    client._on_connection_attached()
+    # Premise: only the connection moved. The turn-epoch guard still says ours,
+    # which is why it cannot be the one making this decision.
+    assert client._turn_epoch == released_epoch
+
+    resume.set()
+    await asyncio.wait_for(release, timeout=1)
+
+    assert hooks == []
