@@ -3079,3 +3079,67 @@ async def test_expiring_proactive_inject_leaves_a_new_user_turn_alone(
     # The stale inject is still settled, so its caller is told and can retry.
     assert client._gemini_proactive_outcome is None
     assert rejections == ["timed out"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_user_turn_terminal_rejects_the_stale_proactive_outcome() -> None:
+    """The user's turn_complete must not mark a stale notification delivered.
+
+    Connection and session both survive a new user turn, so the settle
+    predicate could not tell that terminal from the proactive inject's own.
+    Reporting it as a COMPLETION drops the plugin callback on the strength of
+    a response that was abandoned; it has to be rejected so the caller
+    re-queues it for the live turn.
+    """
+
+    completed: list[bool] = []
+    rejected: list[str] = []
+
+    def on_completed() -> None:
+        completed.append(True)
+
+    def on_rejected(reason: str) -> None:
+        rejected.append(reason)
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client.inject_text_and_request_response(
+        "proactive body", on_rejected=on_rejected, on_completed=on_completed
+    )
+    assert client._gemini_proactive_outcome is not None
+
+    # A real user turn takes over; its terminal arrives on the SAME connection
+    # and the SAME session, so only the scope distinguishes it.
+    client.note_user_turn_started()
+
+    terminal = SimpleNamespace(
+        tool_call=None,
+        tool_call_cancellation=None,
+        voice_activity_detection_signal=None,
+        server_content=SimpleNamespace(
+            model_turn=None,
+            output_transcription=None,
+            input_transcription=None,
+            turn_complete=True,
+            interrupted=False,
+        ),
+    )
+    await client._process_gemini_response(
+        terminal,
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+
+    assert completed == [], "the abandoned response must not count as delivered"
+    assert rejected and "abandoned by a new user turn" in rejected[0]
+    assert client._gemini_proactive_outcome is None

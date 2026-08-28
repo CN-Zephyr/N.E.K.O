@@ -646,6 +646,24 @@ class _GeminiMixin:
                     and owner[0] == connection_generation
                     and owner[1] is session
                 ):
+                    owner_scope = owner[4] if len(owner) > 4 else None
+                    if (
+                        owner_scope is not None
+                        and owner_scope
+                        != getattr(self, "_tool_scope_generation", 0)
+                    ):
+                        # This terminal belongs to the USER's turn, not to the
+                        # proactive inject: the connection and the session both
+                        # survive a new user turn, so only the scope tells them
+                        # apart. Settling it as a COMPLETION would report the
+                        # notification delivered on the strength of a response
+                        # that was abandoned, and the caller drops the callback
+                        # instead of re-queueing it. Force a rejection so it
+                        # goes back in the queue for the live turn.
+                        error_msg = error_msg or (
+                            "Gemini proactive response was abandoned by a new "
+                            "user turn"
+                        )
                     self._settle_gemini_proactive_inject(
                         error_msg=error_msg,
                         expected_connection_generation=connection_generation,
