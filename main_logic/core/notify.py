@@ -450,22 +450,31 @@ class NotifyMixin:
         return socket
 
     async def send_status(self, message: str) -> bool:
-        """Send a status message to the frontend. message should be a JSON string {"code": "XXX", "details": {...}}, translated by the frontend via i18next."""
+        """Send a status message to the frontend. message should be a JSON string {"code": "XXX", "details": {...}}, translated by the frontend via i18next.
+
+        The return value answers one question only: did the FRONTEND socket
+        take this status. The monitor-process mirror below is a separate,
+        best-effort plane and must never be able to un-deliver it -- callers
+        keep a per-plane retry ledger, so reporting a delivered status as
+        failed leaves their episode uncommitted and re-sends it on every
+        later microphone frame.
+        """
+        delivered = False
         try:
             if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
                 data = json.dumps({"type": "status", "message": message})
                 await self.websocket.send_text(data)
+                delivered = True
 
                 # 同步到同步服务器
                 self.sync_message_queue.put({'type': 'json', 'data': {"type": "status", "message": message}})
-                return True
         except WebSocketDisconnect:
             # Client disconnected mid-send; this push is best-effort.
-            return False
+            return delivered
         except Exception as e:
             logger.error(f"💥 WS Send Status Error: {e}")
-            return False
-        return False
+            return delivered
+        return delivered
     
     async def send_topic_hint(self, *, turn_id: Optional[str] = None) -> bool:
         """Show a frontend-only teaser bubble right before she opens a deep-topic hook.
