@@ -350,7 +350,13 @@ class _GeminiMixin:
             turn_complete=True,
         )
 
-    async def _create_response_gemini(self, instructions: str, *, raise_on_error: bool = False) -> None:
+    async def _create_response_gemini(
+        self,
+        instructions: str,
+        *,
+        raise_on_error: bool = False,
+        starts_user_turn: bool = True,
+    ) -> None:
         """Send text content to Gemini and trigger response."""
         if not self._gemini_session:
             logger.warning("Gemini session not available for create_response")
@@ -364,7 +370,10 @@ class _GeminiMixin:
             return
 
         try:
-            await self._gemini_send_user_turn(instructions)
+            await self._gemini_send_user_turn(
+                instructions,
+                starts_user_turn=starts_user_turn,
+            )
             logger.info("Gemini: sent client content, waiting for response")
         except Exception as e:
             logger.error(f"Error sending client content to Gemini: {e}")
@@ -377,16 +386,25 @@ class _GeminiMixin:
         *,
         skipped: bool = False,
         raise_on_error: bool = False,
+        starts_user_turn: bool = True,
     ) -> None:
         """Set Gemini skip state only for a successfully-started skipped turn."""
         if not skipped:
-            await self._create_response_gemini(instructions, raise_on_error=raise_on_error)
+            await self._create_response_gemini(
+                instructions,
+                raise_on_error=raise_on_error,
+                starts_user_turn=starts_user_turn,
+            )
             return
 
         previous_skip = self._skip_until_next_response
         self._skip_until_next_response = True
         try:
-            await self._create_response_gemini(instructions, raise_on_error=raise_on_error)
+            await self._create_response_gemini(
+                instructions,
+                raise_on_error=raise_on_error,
+                starts_user_turn=starts_user_turn,
+            )
         except Exception:
             self._skip_until_next_response = previous_skip
             raise

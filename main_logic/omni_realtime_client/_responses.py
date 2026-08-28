@@ -108,6 +108,7 @@ class _ResponseMixin:
                 text,
                 skipped=skipped,
                 raise_on_error=True,
+                starts_user_turn=False,
             )
             return
 
@@ -115,7 +116,9 @@ class _ResponseMixin:
             # skipped=False：需要模型主动响应（任务结果汇报）
             # 通过 create_response 注入 user 消息 + 触发响应
             # Qwen 不支持 conversation.item.create，走下方 update_session
-            await self.create_response(text)
+            # Transport-only user message: a task-result report is not the
+            # real user's turn, so it must not retire in-flight tool calls.
+            await self.create_response(text, starts_user_turn=False)
         else:
             # skipped=True 或 Qwen：仅追加到 session instructions
             lock = getattr(self, "_prime_context_lock", None)
@@ -133,8 +136,23 @@ class _ResponseMixin:
                 self.instructions = next_instructions
             logger.info("prime_context: updated session instructions")
 
-    async def create_response(self, instructions: str, skipped: bool = False) -> None:
+    async def create_response(
+        self,
+        instructions: str,
+        skipped: bool = False,
+        *,
+        starts_user_turn: bool = True,
+    ) -> None:
         """Inject a persistent user message and trigger an LLM response.
+
+        ``starts_user_turn=False`` marks an injection that uses a provider
+        ``role=user`` message purely as transport and does NOT replace the
+        real user's turn (a background task-result report, for instance).
+        Only a real user turn may retire in-flight tool calls, so keeping the
+        distinction here is what stops a system-initiated report from
+        cancelling a running tool and leaving its ``function_call``
+        unanswered. Mirrors ``_gemini_send_user_turn``'s keyword of the same
+        name.
 
         Unlike ``prime_context`` (which appends to the system instructions),
         this method creates a user-role conversation message and triggers a
@@ -163,6 +181,7 @@ class _ResponseMixin:
                 instructions,
                 skipped=skipped,
                 raise_on_error=True,
+                starts_user_turn=starts_user_turn,
             )
             return
 
@@ -171,7 +190,8 @@ class _ResponseMixin:
             logger.info("Skipping empty content in create_response")
             return
 
-        self.note_user_turn_started()
+        if starts_user_turn:
+            self.note_user_turn_started()
 
         if skipped:
             self._skip_until_next_response = True

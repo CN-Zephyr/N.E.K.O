@@ -61,12 +61,42 @@ class _ToolingMixin:
     def has_tools(self) -> bool:
         return bool(self._tool_definitions) and self.on_tool_call is not None
 
+    def _pin_tool_scope_host_turn(self) -> str | None:
+        """Freeze the provider-turn host id this tool scope is compared against.
+
+        ``_current_turn_host_id`` is re-stamped by every ``response.created``,
+        including the one a tool result itself triggers. Reading it live at
+        result time therefore lets the FIRST completed call of a parallel
+        batch invalidate its siblings: with two function calls in one
+        response, the faster one's ``response.create`` produces a new
+        announcement, the snapshot moves to the host id the preceding
+        ``response.done`` rotated to, and the slower sibling's result is
+        dropped -- leaving the provider holding an unanswered
+        ``function_call``. A real new user turn advances
+        ``_tool_scope_generation``, which is the fence that owns that
+        decision, so pin the snapshot once per scope and let the generation
+        do the invalidating.
+        """
+
+        scope_generation = getattr(self, "_tool_scope_generation", 0)
+        pinned = getattr(self, "_tool_scope_host_turn", None)
+        if pinned is None or pinned[0] != scope_generation:
+            pinned = (
+                scope_generation,
+                getattr(self, "_current_turn_host_id", None),
+            )
+            self._tool_scope_host_turn = pinned
+        return pinned[1]
+
     def _capture_tool_task_owner(
         self,
         provider_session: Any,
         *,
         connection_generation: int | None = None,
     ) -> _ToolTaskOwner:
+        # Establish this scope's pin before the live read below, so every
+        # sibling call of one provider turn is judged against the same id.
+        self._pin_tool_scope_host_turn()
         return _ToolTaskOwner(
             connection_generation=(
                 self._connection_generation
@@ -92,9 +122,16 @@ class _ToolingMixin:
         # function-calling response.done before the tool result is ready. That
         # ends a provider response, not the user turn that owns the tool. New
         # user inputs advance ``scope_generation`` explicitly; compare the
-        # captured id only with the provider turn's start snapshot so a normal
-        # end-of-response rotation cannot discard a legal result.
-        provider_turn_host_id = getattr(self, "_current_turn_host_id", None)
+        # captured id only with this scope's pinned snapshot -- NOT with the
+        # live ``_current_turn_host_id``, which a sibling tool result's own
+        # response.created moves -- so neither a normal end-of-response
+        # rotation nor a parallel batch can discard a legal result.
+        pinned = getattr(self, "_tool_scope_host_turn", None)
+        provider_turn_host_id = (
+            pinned[1]
+            if pinned is not None and pinned[0] == owner.scope_generation
+            else getattr(self, "_current_turn_host_id", None)
+        )
         return (
             provider_turn_host_id is None
             or provider_turn_host_id == owner.host_turn_id

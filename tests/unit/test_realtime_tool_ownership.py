@@ -756,6 +756,133 @@ async def test_raw_tool_cancel_survives_tool_scope_replacement() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_raw_tool_results_survive_a_sibling_response_created() -> None:
+    """The first result's own response.created must not orphan its siblings."""
+
+    host_turn = ["turn-1"]
+    started = {"call-1": asyncio.Event(), "call-2": asyncio.Event()}
+    release = {"call-1": asyncio.Event(), "call-2": asyncio.Event()}
+
+    async def handler(call):
+        started[call.call_id].set()
+        await release[call.call_id].wait()
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        get_host_turn_id=lambda: host_turn[0],
+        on_tool_call=handler,
+    )
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    client._current_turn_host_id = host_turn[0]
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed(_raw_tool_event("call-1"))
+    socket.feed(_raw_tool_event("call-2"))
+    await asyncio.wait_for(started["call-1"].wait(), timeout=1)
+    await asyncio.wait_for(started["call-2"].wait(), timeout=1)
+
+    # The faster sibling answers first; its response.create is announced only
+    # after response.done has already rotated the host speech id.
+    release["call-1"].set()
+    await _wait_for_socket_sends(socket, 2)
+    host_turn[0] = "turn-2"
+    socket.feed({"type": "response.created", "response": {"id": "tool-response-1"}})
+    socket.feed({"type": "response.done", "response": {"id": "tool-response-1"}})
+    await client._response_arbiter.wait_until_idle(timeout=1)
+    # Premise of this regression: the provider-turn snapshot really did move.
+    assert client._current_turn_host_id == "turn-2"
+
+    release["call-2"].set()
+    await _wait_for_tool_tasks(client)
+
+    answered = [
+        event["item"]["call_id"]
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and event.get("item", {}).get("type") == "function_call_output"
+    ]
+    assert answered == ["call-1", "call-2"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_task_result_report_does_not_retire_in_flight_tool_ownership() -> None:
+    """prime_context is transport-only: it must not cancel a running tool."""
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(call):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ToolResult(call_id=call.call_id, name=call.name, output={"ok": True})
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-realtime",
+        api_type="gpt",
+        on_tool_call=handler,
+    )
+    socket = _QueueSocket()
+    client.ws = socket
+    client._on_connection_attached()
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(_raw_tool_event())
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    scope_before = client._tool_scope_generation
+    tool_task = next(iter(client._tool_tasks))
+    report = asyncio.create_task(client.prime_context("task finished", skipped=False))
+    await _wait_for_socket_sends(socket, 1)
+
+    assert socket.sent[0]["item"]["role"] == "user"
+    assert client._tool_scope_generation == scope_before
+    assert not cancelled.is_set()
+    assert not tool_task.cancelled()
+
+    socket.feed(
+        {
+            "type": "conversation.item.created",
+            "item": {"id": socket.sent[0]["item"]["id"], "role": "user"},
+        }
+    )
+    await asyncio.wait_for(report, timeout=1)
+    socket.feed({"type": "response.created", "response": {"id": "report-response"}})
+    socket.feed({"type": "response.done", "response": {"id": "report-response"}})
+    await client._response_arbiter.wait_until_idle(timeout=1)
+
+    release.set()
+    await _wait_for_tool_tasks(client)
+
+    answered = [
+        event["item"]["call_id"]
+        for event in socket.sent
+        if event.get("type") == "conversation.item.create"
+        and event.get("item", {}).get("type") == "function_call_output"
+    ]
+    assert answered == ["call-1"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_raw_tool_result_cannot_cross_host_turn_on_same_connection() -> None:
     host_turn = ["turn-1"]
     started = asyncio.Event()

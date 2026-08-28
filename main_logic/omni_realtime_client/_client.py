@@ -159,6 +159,9 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # Tool handlers have narrower ownership than generic background work:
         # their results belong to one connection and one user-turn scope.
         self._tool_scope_generation = 0
+        # Host speech id this tool scope compares against, pinned once per
+        # scope. See ``_pin_tool_scope_host_turn``.
+        self._tool_scope_host_turn: tuple[int, Optional[str]] | None = None
         # Some OpenAI-compatible proxies omit speech_started/stopped and only
         # report the completed input transcript. Track whether server VAD has
         # already advanced this input's tool scope so the transcript can fill
