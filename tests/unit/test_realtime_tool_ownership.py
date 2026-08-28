@@ -2953,3 +2953,68 @@ async def test_replacement_connection_retires_the_predecessors_proactive_outcome
     )
     assert client._gemini_proactive_outcome is not None
     assert client._gemini_proactive_outcome_owner[1] is replacement
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_failing_retired_inject_does_not_clear_the_successors_outcome() -> None:
+    """The failure settle is owner-scoped, like the cancellation one beside it.
+
+    A retired connection's send_client_content can raise long after a
+    replacement attached and registered its own outcome. Settling
+    unconditionally would clear the SUCCESSOR's, and its caller would then
+    never see a completion or rejection -- it would wait out its whole
+    timeout instead.
+
+    Reachable because retiring the predecessor's outcome on attach is what
+    lets the replacement register one at all; before that it was refused as
+    "another inject is pending", so there was nothing to clobber.
+    """
+
+    send_started = asyncio.Event()
+    fail_send = asyncio.Event()
+
+    class _StallingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            send_started.set()
+            await fail_send.wait()
+            raise RuntimeError("retired SDK send failed")
+
+    async def on_rejected(_reason: str) -> None:
+        return None
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    retired = _StallingSession()
+    client._gemini_session = retired
+    client.ws = retired
+    client._on_connection_attached()
+
+    retired_inject = asyncio.create_task(
+        client.inject_text_and_request_response("retired body", on_rejected=on_rejected)
+    )
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+
+    replacement = _GeminiSession()
+    client._gemini_session = replacement
+    client.ws = replacement
+    client._on_connection_attached()
+
+    await client.inject_text_and_request_response(
+        "replacement body", on_rejected=on_rejected
+    )
+    successor_owner = client._gemini_proactive_outcome_owner
+    assert successor_owner is not None and successor_owner[1] is replacement
+    successor_outcome = client._gemini_proactive_outcome
+
+    fail_send.set()
+    with pytest.raises(RuntimeError, match="retired SDK send failed"):
+        await asyncio.wait_for(retired_inject, timeout=2)
+
+    assert client._gemini_proactive_outcome is successor_outcome
+    assert client._gemini_proactive_outcome_owner is successor_owner
+    assert client._proactive_inject_awaiting_outcome is True

@@ -474,6 +474,10 @@ class _ResponseMixin:
                     "Gemini proactive inject was superseded by a new user turn"
                 )
             outcome_token = f"gemini_inject_{uuid.uuid4().hex}"
+            # getattr, not attribute access: several focused tests build the
+            # client via __new__ and this read is now unconditional, where the
+            # owner tuple below only ran when a callback was supplied.
+            proactive_generation = getattr(self, "_connection_generation", 0)
             if on_rejected is not None or on_completed is not None:
                 if getattr(self, "_gemini_proactive_outcome", None) is not None:
                     raise RuntimeError("another Gemini proactive inject is pending")
@@ -483,8 +487,8 @@ class _ResponseMixin:
                     on_completed,
                 )
                 self._gemini_proactive_outcome_owner = (
-                    self._connection_generation,
-                    self._gemini_session,
+                    proactive_generation,
+                    proactive_session,
                     outcome_token,
                     self._gemini_context_manager,
                 )
@@ -517,7 +521,17 @@ class _ResponseMixin:
                     )
                 raise
             except Exception:
-                self._settle_gemini_proactive_inject(notify=False)
+                # Owner-scoped, like the CancelledError branch above. This send
+                # can fail AFTER a replacement attached and registered its own
+                # outcome, and an unconditional settle would clear the
+                # SUCCESSOR's -- its caller would then never see a completion
+                # or rejection and would wait out its full timeout.
+                self._settle_gemini_proactive_inject(
+                    notify=False,
+                    expected_connection_generation=proactive_generation,
+                    expected_provider_session=proactive_session,
+                    expected_outcome_token=outcome_token,
+                )
                 raise
             if on_rejected is not None or on_completed is not None:
                 self._fire_task(
