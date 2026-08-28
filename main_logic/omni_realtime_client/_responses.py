@@ -1416,7 +1416,15 @@ class _ResponseMixin:
                         )
                     )
                 elif not outcome_observed.is_set():
-                    await asyncio.shield(self.cancel_response())
+                    # Same fence as the timeout path below, and for the same
+                    # reason: with no ticket this is a raw client_content
+                    # interrupt aimed at whatever is generating NOW, so after
+                    # a real user turn it would cancel THEIR response.
+                    await asyncio.shield(
+                        self.cancel_response(
+                            send_guard=_ephemeral_scope_still_ours,
+                        )
+                    )
             except Exception as cancel_exc:
                 logger.warning(
                     "prompt_ephemeral: cancellation cleanup failed: %s",

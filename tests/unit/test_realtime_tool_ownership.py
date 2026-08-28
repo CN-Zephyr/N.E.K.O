@@ -3143,3 +3143,50 @@ async def test_a_user_turn_terminal_rejects_the_stale_proactive_outcome() -> Non
     assert completed == [], "the abandoned response must not count as delivered"
     assert rejected and "abandoned by a new user turn" in rejected[0]
     assert client._gemini_proactive_outcome is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancelled_prompt_ephemeral_leaves_a_new_user_turn_alone() -> None:
+    """The cancellation cleanup needs the same fence as the timeout path.
+
+    With no arbiter ticket -- the Gemini shape -- the cleanup falls through to
+    a raw cancel_response(), which is a client_content interrupt aimed at
+    whatever is generating NOW. After a real user turn took over, that
+    cancels THEIR response. Sibling branches of one function; the timeout arm
+    got the guard first and this one was left behind.
+    """
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    session = _GeminiSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+    client._ai_recent_activity_time = 0
+    client._user_recent_activity_time = 0
+    client._client_vad_active = False
+    client._client_vad_last_speech_time = 0
+
+    ephemeral = asyncio.create_task(client.prompt_ephemeral(language="zh"))
+    # Let it get past the inject and park on the outcome.
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if session.client_contents:
+            break
+    assert session.client_contents, "prompt_ephemeral never sent its inject"
+    sends_after_inject = len(session.client_contents)
+
+    # A real user turn takes over the generation, then the caller is cancelled.
+    client.note_user_turn_started()
+    ephemeral.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(ephemeral, timeout=2)
+
+    assert len(session.client_contents) == sends_after_inject, (
+        "the cancellation cleanup interrupted the user's own generation"
+    )
