@@ -45,6 +45,13 @@ class _ToolTaskOwner:
 
 class _ToolingMixin:
     _TOOL_TASK_CANCEL_TIMEOUT_S = 0.5
+    # Ceiling for the collector's re-poll interval. The poll only exists to
+    # notice a provider cancellation that its target refuses to honour, so it
+    # starts at the cancel timeout and backs off: a batch still running after
+    # several seconds is not one where another few seconds of ordering latency
+    # matters, and a tool that never returns should not hold a 2Hz wakeup for
+    # the rest of the user turn.
+    _TOOL_BATCH_POLL_CEILING_S = 5.0
 
     def set_tools(self, tool_definitions: Optional[List[ToolDefinition]]) -> None:
         """Replace the active tool list. Takes effect the next time the
@@ -290,6 +297,7 @@ class _ToolingMixin:
             # way, exactly as the blanket gather this replaced was.
             pending = list(enumerate(call_tasks))
             outcomes: Dict[int, ToolResult] = {}
+            poll_interval = self._TOOL_TASK_CANCEL_TIMEOUT_S
             while pending:
                 still_pending = []
                 for index, task in pending:
@@ -305,10 +313,19 @@ class _ToolingMixin:
                 pending = still_pending
                 if not pending:
                     break
+                # Deliberately NOT a total budget. Bailing out after a fixed
+                # deadline would discard the result of a legitimately slow
+                # tool -- a long web lookup is not a stuck one, and dropping
+                # its output leaves the provider with an unanswered call,
+                # which is the failure this collector exists to prevent.
+                # Bound the polling COST instead of the wait.
                 await asyncio.wait(
                     [task for _, task in pending],
-                    timeout=self._TOOL_TASK_CANCEL_TIMEOUT_S,
+                    timeout=poll_interval,
                     return_when=asyncio.FIRST_COMPLETED,
+                )
+                poll_interval = min(
+                    poll_interval * 2, self._TOOL_BATCH_POLL_CEILING_S
                 )
             if not self._tool_task_owner_is_current(owner):
                 return

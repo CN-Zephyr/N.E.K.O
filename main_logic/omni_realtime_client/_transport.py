@@ -1794,13 +1794,27 @@ class _TransportMixin:
                         "Raw receive event retired by the connection teardown"
                     )
                     return True
-                logger.info(
-                    "Raw receive event retired after a replacement connection attached"
-                )
-                await self._abort_failed_transport(
-                    "retired raw receive event",
+                # Delegate instead of aborting inline. Returning True exits
+                # handle_messages, which SKIPS the `else:` tail -- and that
+                # tail is the only consumer of _local_failure_recovery. An
+                # arbiter fail-close landing while this loop sat in a host
+                # callback would otherwise leave the latch armed: socket dead,
+                # _fatal_error_occurred dropping every later send, and the
+                # manager never told, so no toast and no rebuild. The fail-
+                # close reasons ARE slow-host reasons, so that pairing is the
+                # expected one, not a corner.
+                #
+                # The recovery already splits the two cases this needs: latch
+                # present -> finish the teardown and report
+                # CHARACTER_DISCONNECTED; latch absent -> exactly the silent
+                # abort that used to be inlined here. It also logs each case,
+                # where the line this replaces claimed a replacement had
+                # attached even when none had.
+                await self._recover_receive_loop_disconnect(
                     message_ws,
                     message_generation,
+                    "retired raw receive event",
+                    status_code="CHARACTER_DISCONNECTED",
                 )
                 return True
 
