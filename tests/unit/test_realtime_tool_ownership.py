@@ -2738,3 +2738,91 @@ async def test_gemini_proactive_does_not_wait_out_a_provider_cancelled_call(
         # closing and this fails as a HANG rather than an assertion.
         never.set()
         await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_reacts_to_a_cancellation_that_lands_mid_wait(
+    monkeypatch,
+) -> None:
+    """The retired set is recomputed, not snapshotted before the wait.
+
+    Cancellations arrive asynchronously, so one landing INSIDE the settle wait
+    must still release it. Snapshotting the filter once leaves the cancelled
+    task in the wait set and spends the whole budget on a call that can no
+    longer answer.
+    """
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    # Far larger than the assertion timeout: this fails by TAKING the budget.
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 30.0)
+    monkeypatch.setattr(
+        __import__(
+            "main_logic.omni_realtime_client._gemini_support",
+            fromlist=["types"],
+        ),
+        "types",
+        SimpleNamespace(FunctionResponse=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(call):
+        started.set()
+        while True:
+            try:
+                await never.wait()
+                break
+            except asyncio.CancelledError:
+                cancelled.set()  # swallowed on purpose
+        return ToolResult(call_id=call.call_id, name=call.name, output={})
+
+    class _RecordingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            sent.append("proactive")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _RecordingSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    inject = asyncio.create_task(
+        client.inject_text_and_request_response("proactive body")
+    )
+    try:
+        # Let the inject reach the settle wait BEFORE the cancellation exists,
+        # so a one-shot filter cannot have seen it.
+        await asyncio.sleep(0.05)
+        assert not inject.done()
+        await client._process_gemini_response(
+            _gemini_response(cancelled_ids=("call-a",)),
+            provider_session=session,
+            connection_generation=client._connection_generation,
+        )
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+        await asyncio.wait_for(inject, timeout=3)
+        assert sent == ["proactive"]
+    finally:
+        # The handler swallows cancellation; without this a failure hangs the
+        # loop teardown instead of reporting.
+        never.set()
+        await _wait_for_tool_tasks(client)

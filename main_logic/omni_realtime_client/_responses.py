@@ -743,33 +743,44 @@ class _ResponseMixin:
         """
 
         current = asyncio.current_task()
-        # Skip calls the provider already cancelled. The batch collector has
-        # stopped waiting for them and their results are filtered out on
-        # arrival, but the task object survives until the handler exits -- and
-        # a handler that swallows CancelledError may never exit. Without this,
-        # one such call makes EVERY later proactive inject on this connection
-        # pay the full settle timeout for work that can no longer answer.
-        retired = self._retired_tool_tasks()
-        pending = tuple(
-            task
-            for task in getattr(self, "_tool_tasks", ())
-            if not task.done() and task is not current and task not in retired
-        )
-        if not pending:
-            return True
-        _, still_running = await asyncio.wait(
-            pending,
-            timeout=_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS,
-        )
-        if still_running:
-            logger.warning(
-                "Gemini proactive inject proceeding with %d tool call(s) still "
-                "running after %.1fs; the provider may drop them",
-                len(still_running),
-                _GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS,
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS
+        poll_interval = self._TOOL_TASK_CANCEL_TIMEOUT_S
+        while True:
+            # Recomputed every round, not snapshotted once -- same shape as
+            # the batch collector's own wait loop, and for the same reason. A
+            # call the provider cancelled cannot answer any more: its result
+            # is filtered out on arrival and the collector has already stopped
+            # waiting for it. But the task object survives until the handler
+            # exits, which a handler that swallows CancelledError never does,
+            # so waiting for one spends this budget on nothing. Cancellations
+            # arrive asynchronously, so a snapshot taken before the wait goes
+            # stale the moment one lands inside it.
+            retired = self._retired_tool_tasks()
+            pending = tuple(
+                task
+                for task in getattr(self, "_tool_tasks", ())
+                if not task.done() and task is not current and task not in retired
             )
-            return False
-        return True
+            if not pending:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Gemini proactive inject proceeding with %d tool call(s) "
+                    "still running after %.1fs; the provider may drop them",
+                    len(pending),
+                    _GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS,
+                )
+                return False
+            await asyncio.wait(
+                pending,
+                timeout=min(poll_interval, remaining),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            poll_interval = min(
+                poll_interval * 2, self._TOOL_BATCH_POLL_CEILING_S
+            )
 
     def _settle_gemini_proactive_inject(
         self,
