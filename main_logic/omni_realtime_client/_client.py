@@ -165,6 +165,10 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # that gap without advancing a normal provider's turn twice.
         self._raw_speech_started_scope_pending_transcript = False
         self._tool_tasks: set[asyncio.Task] = set()
+        # Tool tasks that can no longer produce a usable result, whatever
+        # retired them. Recorded rather than re-derived: see
+        # ``_retired_tool_tasks``.
+        self._retired_tool_task_set: set[asyncio.Task] = set()
         self._tool_tasks_by_call_id: Dict[str, set[asyncio.Task]] = {}
         self._cancelled_tool_call_ids: set[tuple[int, int, str]] = set()
         # Teardown owns the socket it detached, so a cancelled caller cannot

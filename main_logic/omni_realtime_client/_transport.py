@@ -2423,6 +2423,29 @@ class _TransportMixin:
 
         self._connection_generation += 1
         self._advance_tool_scope()
+        # A pending proactive outcome belongs to the connection that created
+        # it. Left in place it makes the REPLACEMENT reject its own proactive
+        # work as "another Gemini proactive inject is pending" until the 60s
+        # expiry or the quarantine settles the predecessor's -- and a stalled
+        # retired receive loop or context close can push that past anything
+        # useful. Retire it here; the caller re-queues the callback and the
+        # replacement gets to run it. An outcome the replacement creates
+        # afterwards carries the new generation and is untouched.
+        retired_outcome_owner = getattr(
+            self, "_gemini_proactive_outcome_owner", None
+        )
+        if (
+            retired_outcome_owner is not None
+            and retired_outcome_owner[0] != self._connection_generation
+        ):
+            self._settle_gemini_proactive_inject(
+                error_msg=(
+                    "Gemini proactive inject retired by a replacement connection"
+                ),
+                expected_connection_generation=retired_outcome_owner[0],
+                expected_provider_session=retired_outcome_owner[1],
+                expected_outcome_token=retired_outcome_owner[2],
+            )
         self._raw_speech_started_scope_pending_transcript = False
         # Provider response identity and interruption state belong to the
         # retired connection. Some raw proxies never announce responses, so a

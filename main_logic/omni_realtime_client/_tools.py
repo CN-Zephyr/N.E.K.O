@@ -150,6 +150,7 @@ class _ToolingMixin:
 
         def _done(completed: asyncio.Task) -> None:
             tool_tasks.discard(completed)
+            self._retired_tool_task_registry().discard(completed)
             for call_id in tracked_ids:
                 tasks = tasks_by_call_id.get(call_id)
                 if tasks is None:
@@ -193,9 +194,14 @@ class _ToolingMixin:
         getattr(self, "_cancelled_tool_call_ids", set()).clear()
         current_task = asyncio.current_task()
         tasks = tuple(getattr(self, "_tool_tasks", ()))
+        retired = self._retired_tool_task_registry()
         for task in tasks:
             if not task.done():
                 task.cancel()
+                # Marked HERE. The cancelled-id set is cleared one line up, so
+                # a handler that ignores cancellation would otherwise carry no
+                # retirement marker at all and read as live forever.
+                retired.add(task)
         return tuple(task for task in tasks if task is not current_task)
 
     def note_user_turn_started(self) -> None:
@@ -218,37 +224,43 @@ class _ToolingMixin:
                 )
             )
             tasks_by_call_id = getattr(self, "_tool_tasks_by_call_id", {})
+            retired = self._retired_tool_task_registry()
             for task in tuple(tasks_by_call_id.get(call_id, ())):
                 if not task.done():
                     task.cancel()
+                    retired.add(task)
+
+    def _retired_tool_task_registry(self) -> set:
+        registry = getattr(self, "_retired_tool_task_set", None)
+        if registry is None:
+            registry = set()
+            self._retired_tool_task_set = registry
+        return registry
 
     def _retired_tool_tasks(self) -> set:
-        """Tasks whose call the provider already cancelled in this scope.
+        """Tool tasks that can no longer produce a usable result.
 
-        Their results are filtered out on arrival, so nothing downstream can
-        use them -- but the task object stays in ``_tool_tasks`` until the
-        handler actually exits, which a handler that swallows CancelledError
-        may never do. Anyone waiting for tool work to settle has to skip these
-        or it waits out its whole budget for an answer that cannot come.
+        RECORDED at each retirement point, not re-derived from the cancelled
+        call ids. Two things retire a call -- a provider cancellation and a
+        scope advance (a new user turn or a replacement connection) -- and the
+        second CLEARS the cancelled-id set as it goes, so reconstructing from
+        ids can only ever see the first. A handler that swallows
+        CancelledError then sits in ``_tool_tasks`` with no marker at all, and
+        every later wait for tool work to settle spends its whole budget on an
+        answer that cannot come. Recording it where the retirement happens is
+        correct for both routes, and for any third one added later.
 
-        Scoped to the current connection/scope: ``_advance_tool_scope`` clears
-        the cancelled set, so a stale entry cannot retire a live successor.
+        Results are still filtered by call id at send time. That asks a
+        different question -- may this payload go out -- and stays keyed to
+        the call rather than the task.
         """
 
-        cancelled_ids = getattr(self, "_cancelled_tool_call_ids", None)
-        if not cancelled_ids:
-            return set()
-        tasks_by_call_id = getattr(self, "_tool_tasks_by_call_id", None) or {}
-        connection_generation = self._connection_generation
-        scope_generation = getattr(self, "_tool_scope_generation", 0)
-        retired = set()
-        for cancelled_connection, cancelled_scope, call_id in cancelled_ids:
-            if (
-                cancelled_connection == connection_generation
-                and cancelled_scope == scope_generation
-            ):
-                retired.update(tasks_by_call_id.get(call_id, ()))
-        return retired
+        registry = self._retired_tool_task_registry()
+        if registry:
+            registry.difference_update(
+                {task for task in registry if task.done()}
+            )
+        return registry
 
     def _tool_call_was_cancelled(
         self,
@@ -327,6 +339,7 @@ class _ToolingMixin:
             outcomes: Dict[int, ToolResult] = {}
             poll_interval = self._TOOL_TASK_CANCEL_TIMEOUT_S
             while pending:
+                retired_tasks = self._retired_tool_tasks()
                 still_pending = []
                 for index, task in pending:
                     if task.done():
@@ -334,9 +347,7 @@ class _ToolingMixin:
                             value = task.result()
                             if isinstance(value, ToolResult):
                                 outcomes[index] = value
-                    elif not self._tool_call_was_cancelled(
-                        owner, calls[index].call_id
-                    ):
+                    elif task not in retired_tasks:
                         still_pending.append((index, task))
                 pending = still_pending
                 if not pending:

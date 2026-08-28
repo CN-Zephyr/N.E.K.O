@@ -88,10 +88,16 @@ class _GatedGeminiContext:
 class _GeminiSession:
     def __init__(self) -> None:
         self.tool_responses: list[list] = []
+        self.client_contents: list[bool] = []
         self.closed = False
 
     async def send_tool_response(self, *, function_responses) -> None:
         self.tool_responses.append(list(function_responses))
+
+    async def send_client_content(self, *, turns, turn_complete) -> None:
+        # A real Live session always has this; subclasses that care about the
+        # ordering against tool responses override it to record more.
+        self.client_contents.append(bool(turn_complete))
 
 
 class _GeminiReceiveSession(_GeminiSession):
@@ -2826,3 +2832,124 @@ async def test_gemini_proactive_reacts_to_a_cancellation_that_lands_mid_wait(
         # loop teardown instead of reporting.
         never.set()
         await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_gemini_proactive_skips_a_tool_retired_by_a_scope_advance(
+    monkeypatch,
+) -> None:
+    """Scope retirement leaves no call-id marker, so it must be recorded.
+
+    _advance_tool_scope cancels every tool AND clears the cancelled-id set in
+    the same breath, so a handler that swallows CancelledError survives with
+    nothing pointing at it. Re-deriving retirement from ids cannot see that
+    route -- only recording it where it happens can.
+    """
+
+    import main_logic.omni_realtime_client._responses as responses
+
+    monkeypatch.setattr(responses, "_GEMINI_PROACTIVE_TOOL_SETTLE_SECONDS", 30.0)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+    sent: list[str] = []
+
+    async def handler(call):
+        started.set()
+        while True:
+            try:
+                await never.wait()
+                break
+            except asyncio.CancelledError:
+                cancelled.set()  # swallowed on purpose
+        return ToolResult(call_id=call.call_id, name=call.name, output={})
+
+    class _RecordingSession(_GeminiSession):
+        async def send_client_content(self, *, turns, turn_complete) -> None:
+            sent.append("proactive")
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+        on_tool_call=handler,
+    )
+    session = _RecordingSession()
+    client._gemini_session = session
+    client.ws = session
+    client._on_connection_attached()
+
+    await client._process_gemini_response(
+        _gemini_response(calls=(("call-a", "lookup"),)),
+        provider_session=session,
+        connection_generation=client._connection_generation,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    # Retired by a USER TURN, not by a provider cancellation -- so the
+    # cancelled-id set is empty afterwards.
+    client.note_user_turn_started()
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    assert not client._cancelled_tool_call_ids
+
+    try:
+        await asyncio.wait_for(
+            client.inject_text_and_request_response("proactive body"), timeout=2
+        )
+        assert sent == ["proactive"]
+    finally:
+        never.set()
+        await _wait_for_tool_tasks(client)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_replacement_connection_retires_the_predecessors_proactive_outcome() -> None:
+    """Otherwise the replacement rejects its OWN proactive work as pending."""
+
+    rejections: list[str] = []
+
+    async def on_rejected(reason: str) -> None:
+        rejections.append(reason)
+
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gemini-live",
+        api_type="gemini",
+    )
+    retired_session = _GeminiSession()
+    client._gemini_session = retired_session
+    client.ws = retired_session
+    client._on_connection_attached()
+
+    token = "predecessor-token"
+    client._gemini_proactive_outcome = (token, on_rejected, None)
+    client._gemini_proactive_outcome_owner = (
+        client._connection_generation,
+        retired_session,
+        token,
+        object(),
+    )
+    client._proactive_inject_outcome_token = token
+    client._proactive_inject_awaiting_outcome = True
+
+    replacement = _GeminiSession()
+    client._gemini_session = replacement
+    client.ws = replacement
+    client._on_connection_attached()
+
+    assert client._gemini_proactive_outcome is None
+    assert client._gemini_proactive_outcome_owner is None
+    assert client._proactive_inject_awaiting_outcome is False
+
+    # The replacement can now register its own outcome instead of being told
+    # another inject is pending.
+    await client.inject_text_and_request_response(
+        "replacement body", on_rejected=on_rejected
+    )
+    assert client._gemini_proactive_outcome is not None
+    assert client._gemini_proactive_outcome_owner[1] is replacement
