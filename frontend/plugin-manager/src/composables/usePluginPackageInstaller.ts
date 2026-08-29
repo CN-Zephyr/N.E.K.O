@@ -114,7 +114,9 @@ export function usePluginPackageInstaller() {
         install_source: options.installSource,
       }
       if (plan.action === 'upgrade' || plan.action === 'reinstall' || plan.action === 'downgrade') {
-        const messagePrefix = plan.action
+        const messagePrefix = plan.reason === 'manual_takeover'
+          ? 'manualTakeover'
+          : plan.action
         try {
           await ElMessageBox.confirm(
             t(`package.install.${messagePrefix}Body`, {

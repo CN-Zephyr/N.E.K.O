@@ -302,4 +302,32 @@ describe('usePluginPackageInstaller', () => {
       )
     },
   )
+
+  it('uses ownership-transfer copy for a manual takeover plan', async () => {
+    vi.mocked(planPluginInstall).mockResolvedValue({
+      ...replacePlan,
+      reason: 'manual_takeover',
+      current_source: 'manual',
+      target_source: 'imported',
+    })
+    vi.mocked(ElMessageBox.confirm).mockResolvedValue({ action: 'confirm', value: '' } as never)
+    vi.mocked(installPluginPackage).mockResolvedValue(replaceResponse)
+    const installer = usePluginPackageInstaller()
+
+    await installer.installPackagePath('/packages/demo.neko-plugin')
+
+    expect(ElMessageBox.confirm).toHaveBeenCalledWith(
+      expect.stringContaining('package.install.manualTakeoverBody'),
+      expect.stringContaining('package.install.manualTakeoverTitle'),
+      expect.objectContaining({
+        confirmButtonText: 'package.install.manualTakeoverConfirm',
+      }),
+    )
+    expect(installPluginPackage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        confirm_upgrade: true,
+        confirmation_token: 'a'.repeat(64),
+      }),
+    )
+  })
 })
