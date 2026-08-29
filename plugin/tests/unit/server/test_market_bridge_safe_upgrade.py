@@ -936,7 +936,20 @@ async def test_market_upgrade_rejects_stale_lock_snapshot(
 ) -> None:
     first_entry = _entry("demo", "demo", updated_at="2026-01-01T00:00:00Z", version="1.0.0")
     updated_entry = _entry("demo", "demo", updated_at="2026-01-02T00:00:00Z", version="2.0.0")
-    manager = SimpleNamespace(find_active_market_entry=lambda _plugin_id: updated_entry)
+
+    class ReloadingManager:
+        def __init__(self) -> None:
+            self.current = first_entry
+            self.load_calls = 0
+
+        def load(self) -> None:
+            self.load_calls += 1
+            self.current = updated_entry
+
+        def find_active_user_entry(self, _plugin_id: str) -> SimpleNamespace:
+            return self.current
+
+    manager = ReloadingManager()
 
     with pytest.raises(market_bridge._TaskError) as exc_info:
         await market_bridge._replace_market_plugin_transaction(
@@ -950,6 +963,7 @@ async def test_market_upgrade_rejects_stale_lock_snapshot(
         )
 
     assert exc_info.value.code == "plugin_upgrade_plan_changed"
+    assert manager.load_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1467,9 +1481,13 @@ async def test_market_restart_failure_restores_previous_install_source_entry(
     plugin_dir = plugins_root / "demo"
     profile_dir = profiles_root / "demo"
     plugin_dir.mkdir(parents=True)
-    profile_dir.mkdir(parents=True)
     (plugin_dir / "plugin.toml").write_text("version = '1.0.0'\n", encoding="utf-8")
-    (profile_dir / "default.toml").write_text("user_value = true\n", encoding="utf-8")
+    if original_channel == "market":
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "default.toml").write_text(
+            "user_value = true\n",
+            encoding="utf-8",
+        )
     package_path = tmp_path / "demo.neko-plugin"
     package_path.write_bytes(b"package")
 
@@ -1493,6 +1511,14 @@ async def test_market_restart_failure_restores_previous_install_source_entry(
     manager = FakeManager()
     _configure_paths(monkeypatch, plugins_root=plugins_root, profiles_root=profiles_root)
     monkeypatch.setattr(market_bridge, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        market_bridge,
+        "inspect_package",
+        lambda _path: SimpleNamespace(
+            package_id="demo",
+            profile_names=["payload/profiles/default.toml"],
+        ),
+    )
     monkeypatch.setattr(market_bridge, "plugin_is_running", lambda _plugin_id: _async_true())
     monkeypatch.setattr(
         market_bridge,
@@ -1509,13 +1535,12 @@ async def test_market_restart_failure_restores_previous_install_source_entry(
 
     async def install_new(**_kwargs: Any) -> dict[str, object]:
         plugin_dir.mkdir(parents=True)
+        profile_dir.mkdir(parents=True)
         (plugin_dir / "plugin.toml").write_text("version = '2.0.0'\n", encoding="utf-8")
-        if original_channel == "market":
-            profile_dir.mkdir(parents=True)
-            (profile_dir / "generated.toml").write_text(
-                "replacement = true\n",
-                encoding="utf-8",
-            )
+        (profile_dir / "generated.toml").write_text(
+            "replacement = true\n",
+            encoding="utf-8",
+        )
         manager.current = _entry("demo", "demo", channel="market")
         manager.current.source_detail = SimpleNamespace(version="2.0.0")
         return {"operation": "upgrade"}
@@ -1552,8 +1577,11 @@ async def test_market_restart_failure_restores_previous_install_source_entry(
     assert manager.restore_calls == [old_entry]
     assert manager.current is old_entry
     assert (plugin_dir / "plugin.toml").read_text(encoding="utf-8") == "version = '1.0.0'\n"
-    assert (profile_dir / "default.toml").read_text(encoding="utf-8") == "user_value = true\n"
-    assert not (profile_dir / "generated.toml").exists()
+    if original_channel == "market":
+        assert (profile_dir / "default.toml").read_text(encoding="utf-8") == "user_value = true\n"
+        assert not (profile_dir / "generated.toml").exists()
+    else:
+        assert not profile_dir.exists()
 
 
 @pytest.mark.asyncio

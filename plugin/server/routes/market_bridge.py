@@ -3502,6 +3502,9 @@ async def _replace_market_plugin_transaction(
     rollback_install_source: Any | None = None,
 ) -> Any:
     """Revalidate and replace under the shared plugin filesystem lock."""
+    reload_install_source = getattr(manager, "load", None)
+    if callable(reload_install_source):
+        await asyncio.to_thread(reload_install_source)
     active_entry = _find_active_user_entry(manager, expected_plugin_id)
     original_is_manual = is_manual_takeover_entry(original_entry)
     if active_entry is None or (
@@ -3757,7 +3760,10 @@ async def _do_upgrade(
                 code="unsafe_profile_path",
                 message=f"recorded package profile path does not match package id: {profile_dir}",
             )
-        if manual_takeover and getattr(inspected, "profile_names", ()) and (
+        manual_package_has_profiles = bool(
+            manual_takeover and getattr(inspected, "profile_names", ())
+        )
+        if manual_package_has_profiles and (
             profile_dir.exists() or profile_dir.is_symlink()
         ):
             raise _TaskError(
@@ -3876,7 +3882,11 @@ async def _do_upgrade(
                     "stop": stop_plugin_for_upgrade,
                     "start": start,
                     "cleanup_backup": _async_remove_dir,
-                    "additional_targets": (() if manual_takeover else (profile_dir,)),
+                    "additional_targets": (
+                        (profile_dir,)
+                        if not manual_takeover or manual_package_has_profiles
+                        else ()
+                    ),
                     "preserve_targets": (() if manual_takeover else (profile_dir,)),
                     "on_rollback_start": mark_rollback_running,
                 },

@@ -326,6 +326,10 @@ class PluginCliService:
         confirmation_token: str | None = None,
         _allow_external_profiles_root: bool = False,
     ) -> dict[str, object]:
+        install_source_manager = get_install_source_manager()
+        reload_install_source = getattr(install_source_manager, "load", None)
+        if callable(reload_install_source):
+            await asyncio.to_thread(reload_install_source)
         plan_dict = await self.plan_install(
             package=package,
             plugins_root=plugins_root,
@@ -551,7 +555,11 @@ class PluginCliService:
                 stop=upgrade_support.stop_plugin_for_replace,
                 start=start,
                 cleanup_backup=upgrade_support.remove_directory,
-                additional_targets=(() if manual_manager is not None else (profile_dir,)),
+                additional_targets=(
+                    (profile_dir,)
+                    if manual_manager is None or manual_package_has_profiles
+                    else ()
+                ),
                 preserve_targets=(
                     ()
                     if manual_manager is not None

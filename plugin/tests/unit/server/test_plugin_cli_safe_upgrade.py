@@ -817,6 +817,53 @@ async def test_local_package_manual_takeover_requires_bound_plan_and_records_imp
 
 
 @pytest.mark.asyncio
+async def test_local_manual_takeover_reloads_ownership_inside_operation_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_plugin(tmp_path / "source", "demo", "2.0.0")
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / "demo.neko-plugin"
+    build_plugin(source, package_path)
+    plugins_root = tmp_path / "plugins"
+    manual_dir = _write_plugin(plugins_root, "demo", "1.0.0")
+    sentinel = manual_dir / "manual.py"
+    sentinel.write_text("ORIGINAL = True\n", encoding="utf-8")
+    manager = _ManualTakeoverManager(_manual_entry())
+    load_calls = 0
+
+    def reload_changed_owner() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        manager.entry = _managed_entry()
+
+    manager.load = reload_changed_owner  # type: ignore[attr-defined]
+
+    import plugin.settings as plugin_settings
+    import plugin.server.application.plugin_cli.service as service_module
+
+    monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", tmp_path / "builtin")
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", plugins_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
+    monkeypatch.setattr(plugin_settings, "USER_PACKAGE_PROFILES_ROOT", tmp_path / "profiles")
+    monkeypatch.setattr(service_module, "get_install_source_manager", lambda: manager)
+
+    service = PluginCliService()
+    plan = await service.plan_install(package=str(package_path))
+    with pytest.raises(ServerDomainError) as exc_info:
+        await service.install(
+            package=str(package_path),
+            confirm_upgrade=True,
+            confirmation_token=str(plan["confirmation_token"]),
+        )
+
+    assert exc_info.value.code == "PLUGIN_UPGRADE_PLAN_CHANGED"
+    assert load_calls == 1
+    assert sentinel.read_text(encoding="utf-8") == "ORIGINAL = True\n"
+
+
+@pytest.mark.asyncio
 async def test_local_manual_takeover_rejects_unowned_existing_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1007,6 +1054,7 @@ async def test_failed_local_manual_takeover_restores_directory_and_lock_entry(
     assert sentinel.read_text(encoding="utf-8") == "ORIGINAL = True\n"
     assert manager.entry == original_entry
     assert manager.restore_calls == 1
+    assert not (profiles_root / "demo").exists()
 
 
 @pytest.mark.asyncio
