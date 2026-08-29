@@ -42,6 +42,7 @@ from plugin.server.application.plugins import upgrade_support
 from plugin.server.application.plugins.installation_transactions.manual_takeover import (
     is_manual_takeover_entry,
     local_manual_takeover_confirmation_token,
+    manual_takeover_snapshot_sha256,
 )
 from plugin.server.application.plugins.source_switch import (
     SourceSwitchRequest,
@@ -440,6 +441,8 @@ class PluginCliService:
 
         manual_manager: InstallSourceManager | None = None
         manual_entry: LockEntry | None = None
+        expected_manual_snapshot = ""
+        manual_package_has_profiles = False
         if plan.reason == "manual_takeover":
             manual_manager = self._require_install_source_manager()
             manual_entry = manual_manager.entry_for_directory(target_dir)
@@ -450,10 +453,63 @@ class PluginCliService:
                     status_code=409,
                     details=asdict(plan),
                 )
+            expected_manual_snapshot = await asyncio.to_thread(
+                manual_takeover_snapshot_sha256,
+                entry=manual_entry,
+                target_dir=target_dir,
+            )
+            rebound_token = await asyncio.to_thread(
+                local_manual_takeover_confirmation_token,
+                package_path=package_path,
+                target_dir=target_dir,
+                entry=manual_entry,
+                snapshot_sha256=expected_manual_snapshot,
+            )
+            if not secrets.compare_digest(confirmation_token, rebound_token):
+                raise ServerDomainError(
+                    code="PLUGIN_UPGRADE_PLAN_CHANGED",
+                    message="manual plugin changed after replacement confirmation",
+                    status_code=409,
+                    details=asdict(plan),
+                )
+            inspected = await asyncio.to_thread(inspect_package, package_path)
+            manual_package_has_profiles = bool(getattr(inspected, "profile_names", ()))
+            if manual_package_has_profiles and (
+                profile_dir.exists() or profile_dir.is_symlink()
+            ):
+                raise ServerDomainError(
+                    code="PLUGIN_PACKAGE_PROFILE_OWNERSHIP_CONFLICT",
+                    message=(
+                        "manual takeover cannot claim an existing package profile"
+                    ),
+                    status_code=409,
+                    details={
+                        "package_id": plan.package_id,
+                        "plugin_id": plan.plugin_id,
+                    },
+                )
 
         async def validate_manifestless_backup(backup_dir: Path) -> None:
             if not await asyncio.to_thread(is_manifestless_state_directory, backup_dir):
                 raise ValueError("manifest-less plugin state changed before installation")
+
+        async def validate_manual_takeover_backup(backup_dir: Path) -> None:
+            assert manual_entry is not None
+            staged_snapshot = await asyncio.to_thread(
+                manual_takeover_snapshot_sha256,
+                entry=manual_entry,
+                target_dir=backup_dir,
+            )
+            if not secrets.compare_digest(
+                expected_manual_snapshot,
+                staged_snapshot,
+            ):
+                raise ServerDomainError(
+                    code="PLUGIN_UPGRADE_PLAN_CHANGED",
+                    message="manual plugin changed while it was being stopped",
+                    status_code=409,
+                    details=asdict(plan),
+                )
 
         source_write_attempted = False
 
@@ -495,15 +551,21 @@ class PluginCliService:
                 stop=upgrade_support.stop_plugin_for_replace,
                 start=start,
                 cleanup_backup=upgrade_support.remove_directory,
-                additional_targets=(profile_dir,),
+                additional_targets=(() if manual_manager is not None else (profile_dir,)),
                 preserve_targets=(
-                    (target_dir, profile_dir)
-                    if plan.manifestless_state
-                    else (profile_dir,)
+                    ()
+                    if manual_manager is not None
+                    else (
+                        (target_dir, profile_dir)
+                        if plan.manifestless_state
+                        else (profile_dir,)
+                    )
                 ),
                 initialize_runtime_config=not plan.manifestless_state,
                 validate_backup=(
-                    validate_manifestless_backup
+                    validate_manual_takeover_backup
+                    if manual_manager is not None
+                    else validate_manifestless_backup
                     if plan.manifestless_state
                     else None
                 ),
@@ -1759,17 +1821,21 @@ class PluginCliService:
                 target_root=target_root,
                 profiles_root=profiles_root_path,
             )
-            if plan.action == "override_builtin":
+            if plan.action == "override_builtin" or plan.reason == "manual_takeover":
                 inspected = inspect_package(package_path)
                 target_profile_dir = profiles_root_path / plan.package_id
-                if inspected.profile_names and (
+                if getattr(inspected, "profile_names", ()) and (
                     target_profile_dir.exists() or target_profile_dir.is_symlink()
                 ):
                     plan = replace(
                         plan,
                         action="blocked",
                         confirmation_token="",
-                        reason="override_profile_target_exists",
+                        reason=(
+                            "manual_takeover_profile_target_exists"
+                            if plan.reason == "manual_takeover"
+                            else "override_profile_target_exists"
+                        ),
                     )
             return asdict(plan)
         except Exception as exc:

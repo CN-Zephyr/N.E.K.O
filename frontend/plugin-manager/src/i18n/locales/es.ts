@@ -505,6 +505,8 @@ export default {
       blockedBundleConflict: 'Este paquete contiene un plugin instalado. Actualiza sus plugins uno por uno.',
       blockedDirectoryConflict: 'La carpeta de destino pertenece a otro plugin y no se modificó.',
       blockedLegacyPlugin: 'Todavía hay una versión anterior de este plugin instalada. Desinstala {plugin} antes de continuar.',
+      blockedOwnershipUnknown: 'No se pudo verificar quién es propietario de la carpeta del plugin. Restaura el registro del origen de instalación antes de reintentarlo.',
+      blockedInstallSourceReadOnly: 'El registro del origen de instalación no está disponible o es de solo lectura. Restáuralo antes de reintentarlo.',
       rollbackCompleted: 'La actualización falló y se restauró la versión anterior.',
       rollbackIncomplete: 'La actualización falló y la reversión quedó incompleta. Comprueba el estado del plugin antes de continuar.',
       error: {

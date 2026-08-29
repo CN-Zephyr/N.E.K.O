@@ -1718,10 +1718,15 @@ class PluginLifecycleService:
             )
         plugin_dir = config_path.parent
 
+        install_source_manager = get_install_source_manager()
         try:
+            if install_source_manager is not None:
+                reload_install_source = getattr(install_source_manager, "load", None)
+                if callable(reload_install_source):
+                    await asyncio.to_thread(reload_install_source)
             await asyncio.to_thread(
                 require_uninstall_ownership,
-                manager=get_install_source_manager(),
+                manager=install_source_manager,
                 runtime_plugin_id=plugin_id,
                 config_path=config_path,
             )

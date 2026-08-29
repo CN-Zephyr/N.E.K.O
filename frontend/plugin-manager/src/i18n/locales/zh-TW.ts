@@ -505,6 +505,8 @@ export default {
       blockedBundleConflict: '此整合包包含已安裝的外掛，請逐一升級其中的外掛。',
       blockedDirectoryConflict: '目標目錄屬於另一個外掛，未進行任何變更。',
       blockedLegacyPlugin: '仍安裝著此前版本的外掛。請先解除安裝 {plugin} 再繼續。',
+      blockedOwnershipUnknown: '無法確認現有外掛目錄的所有權。請先還原對應的安裝來源記錄，再重試。',
+      blockedInstallSourceReadOnly: '安裝來源記錄無法使用或處於唯讀狀態。請先還原安裝來源記錄，再重試。',
       rollbackCompleted: '升級失敗，已回復先前的版本。',
       rollbackIncomplete: '升級失敗且回復未完整完成，請先檢查外掛狀態再繼續。',
       error: {

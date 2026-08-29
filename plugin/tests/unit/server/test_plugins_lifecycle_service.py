@@ -700,6 +700,63 @@ async def test_delete_manual_plugin_fails_before_runtime_or_filesystem_mutation(
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
+async def test_delete_reloads_install_source_before_ownership_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "managed_plugin"
+    plugin_dir.mkdir()
+    config_path = plugin_dir / "plugin.toml"
+    config_path.write_text(
+        "[plugin]\nid='managed_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(package_id="", channel="imported")
+    load_calls = 0
+
+    def reload_stale_snapshot() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        manager.channel = "manual"
+
+    manager.load = reload_stale_snapshot  # type: ignore[attr-defined]
+    runtime_checks: list[str] = []
+    delete_calls: list[Path] = []
+
+    monkeypatch.setattr(
+        module,
+        "_get_plugin_meta_sync",
+        lambda _plugin_id: {"id": "managed_plugin"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_plugin_config_path_sync",
+        lambda _plugin_id, _meta: config_path,
+    )
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        module,
+        "_plugin_is_running_sync",
+        lambda plugin_id: runtime_checks.append(plugin_id) or False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_delete_plugin_directory_sync",
+        lambda path: delete_calls.append(path) or True,
+    )
+
+    with pytest.raises(ServerDomainError) as captured:
+        await module.PluginLifecycleService().delete_plugin("managed_plugin")
+
+    assert captured.value.code == "PLUGIN_MANUAL_NOT_MANAGED"
+    assert load_calls == 1
+    assert runtime_checks == []
+    assert delete_calls == []
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
 @pytest.mark.parametrize("channel", ["imported", "market"])
 async def test_delete_runtime_alias_uses_declared_id_for_managed_ownership(
     monkeypatch: pytest.MonkeyPatch,

@@ -953,6 +953,140 @@ async def test_market_upgrade_rejects_stale_lock_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_market_manual_takeover_revalidates_backup_after_stop(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "plugins" / "demo"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.toml").write_text(
+        "[plugin]\nid='demo'\nversion='1.0.0'\n",
+        encoding="utf-8",
+    )
+    sentinel = plugin_dir / "manual.py"
+    sentinel.write_text("confirmed = true\n", encoding="utf-8")
+    entry = _entry("demo", "demo", channel="manual", updated_at="2026-01-01T00:00:00Z")
+    manager = SimpleNamespace(
+        find_active_user_entry=lambda _plugin_id: entry,
+        find_active_market_entry=lambda _plugin_id: None,
+    )
+    expected_snapshot = market_bridge.manual_takeover_snapshot_sha256(
+        entry=entry,
+        target_dir=plugin_dir,
+    )
+    install_called = False
+
+    async def install_new() -> dict[str, object]:
+        nonlocal install_called
+        install_called = True
+        return {}
+
+    async def validate_new() -> None:
+        return None
+
+    async def is_running(_plugin_id: str) -> bool:
+        return True
+
+    async def stop(_plugin_id: str) -> None:
+        sentinel.write_text("edited_during_stop = true\n", encoding="utf-8")
+
+    async def start(_plugin_id: str) -> None:
+        return None
+
+    async def cleanup_backup(backup_dir: Path) -> None:
+        shutil.rmtree(backup_dir)
+
+    layout = SimpleNamespace(
+        plugin_id="demo",
+        installed_dir=plugin_dir,
+        data_dir=tmp_path / "runtime_data" / "plugins" / "demo",
+    )
+    with pytest.raises(market_bridge.ReplacePluginError) as exc_info:
+        await market_bridge._replace_market_plugin_transaction(
+            manager=manager,
+            expected_plugin_id="demo",
+            original_entry=entry,
+            original_entry_fingerprint=market_bridge._market_entry_fingerprint(entry),
+            installed_package_id="demo",
+            plugin_dir=plugin_dir,
+            manual_snapshot_sha256=expected_snapshot,
+            replace_kwargs={
+                "layout": layout,
+                "install_new": install_new,
+                "validate_new": validate_new,
+                "is_running": is_running,
+                "stop": stop,
+                "start": start,
+                "cleanup_backup": cleanup_backup,
+                "initialize_runtime_config": False,
+            },
+        )
+
+    assert isinstance(exc_info.value.cause, market_bridge.ServerDomainError)
+    assert exc_info.value.cause.code == "MANUAL_TAKEOVER_PLAN_CHANGED"
+    assert install_called is False
+    assert sentinel.read_text(encoding="utf-8") == "edited_during_stop = true\n"
+
+
+@pytest.mark.asyncio
+async def test_market_manual_takeover_rejects_unowned_existing_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins_root = tmp_path / "plugins"
+    profiles_root = tmp_path / "profiles"
+    plugin_dir = plugins_root / "demo"
+    profile_dir = profiles_root / "demo"
+    plugin_dir.mkdir(parents=True)
+    profile_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.toml").write_text(
+        "[plugin]\nid='demo'\nversion='1.0.0'\n",
+        encoding="utf-8",
+    )
+    sentinel = profile_dir / "custom.toml"
+    sentinel.write_text("belongs_to_user = true\n", encoding="utf-8")
+    package_path = tmp_path / "demo.neko-plugin"
+    package_path.write_bytes(b"package")
+    entry = _entry("demo", "demo", channel="manual")
+    manager = SimpleNamespace(
+        is_degraded=False,
+        find_active_user_entry=lambda _plugin_id: entry,
+        find_active_market_entry=lambda _plugin_id: None,
+    )
+
+    _configure_paths(monkeypatch, plugins_root=plugins_root, profiles_root=profiles_root)
+    monkeypatch.setattr(market_bridge, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        market_bridge,
+        "_download_package",
+        lambda _url, _task: _async_value(package_path),
+    )
+    monkeypatch.setattr(market_bridge, "_verify_sha256_file", lambda *args, **kwargs: "passed")
+    monkeypatch.setattr(market_bridge, "_cleanup_download_file", lambda _path: None)
+    monkeypatch.setattr(
+        market_bridge,
+        "inspect_package",
+        lambda _path: SimpleNamespace(
+            package_id="demo",
+            profile_names=["payload/profiles/default.toml"],
+        ),
+    )
+    payload = _payload()
+    payload.verified_manual_snapshot_sha256 = (
+        market_bridge.manual_takeover_snapshot_sha256(
+            entry=entry,
+            target_dir=plugin_dir,
+        )
+    )
+
+    with pytest.raises(market_bridge._TaskError) as exc_info:
+        await market_bridge._do_upgrade({}, payload, {})
+
+    assert exc_info.value.code == "manual_takeover_profile_target_exists"
+    assert sentinel.read_text(encoding="utf-8") == "belongs_to_user = true\n"
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_market_upgrade_rolls_back_plugin_profile_with_plugin_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1375,9 +1509,13 @@ async def test_market_restart_failure_restores_previous_install_source_entry(
 
     async def install_new(**_kwargs: Any) -> dict[str, object]:
         plugin_dir.mkdir(parents=True)
-        profile_dir.mkdir(parents=True)
         (plugin_dir / "plugin.toml").write_text("version = '2.0.0'\n", encoding="utf-8")
-        (profile_dir / "generated.toml").write_text("replacement = true\n", encoding="utf-8")
+        if original_channel == "market":
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "generated.toml").write_text(
+                "replacement = true\n",
+                encoding="utf-8",
+            )
         manager.current = _entry("demo", "demo", channel="market")
         manager.current.source_detail = SimpleNamespace(version="2.0.0")
         return {"operation": "upgrade"}

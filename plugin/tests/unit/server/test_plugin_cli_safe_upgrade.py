@@ -817,6 +817,100 @@ async def test_local_package_manual_takeover_requires_bound_plan_and_records_imp
 
 
 @pytest.mark.asyncio
+async def test_local_manual_takeover_rejects_unowned_existing_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_plugin(tmp_path / "source", "demo", "2.0.0")
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / "demo.neko-plugin"
+    build_plugin(source, package_path)
+    plugins_root = tmp_path / "plugins"
+    manual_dir = _write_plugin(plugins_root, "demo", "1.0.0")
+    profile_dir = tmp_path / "profiles" / "demo"
+    profile_dir.mkdir(parents=True)
+    sentinel = profile_dir / "custom.toml"
+    sentinel.write_text("belongs_to_user = true\n", encoding="utf-8")
+    manager = _ManualTakeoverManager(_manual_entry())
+
+    import plugin.settings as plugin_settings
+    import plugin.server.application.plugin_cli.service as service_module
+
+    monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", tmp_path / "builtin")
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", plugins_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
+    monkeypatch.setattr(
+        plugin_settings,
+        "USER_PACKAGE_PROFILES_ROOT",
+        profile_dir.parent,
+    )
+    monkeypatch.setattr(service_module, "get_install_source_manager", lambda: manager)
+
+    plan = await PluginCliService().plan_install(package=str(package_path))
+
+    assert plan["action"] == "blocked"
+    assert plan["reason"] == "manual_takeover_profile_target_exists"
+    assert sentinel.read_text(encoding="utf-8") == "belongs_to_user = true\n"
+    assert manual_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_local_manual_takeover_revalidates_backup_after_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_plugin(tmp_path / "source", "demo", "2.0.0")
+    packages_root = tmp_path / "packages"
+    packages_root.mkdir()
+    package_path = packages_root / "demo.neko-plugin"
+    build_plugin(source, package_path)
+    plugins_root = tmp_path / "plugins"
+    manual_dir = _write_plugin(plugins_root, "demo", "1.0.0")
+    sentinel = manual_dir / "manual.py"
+    sentinel.write_text("confirmed = true\n", encoding="utf-8")
+    manager = _ManualTakeoverManager(_manual_entry())
+
+    import plugin.settings as plugin_settings
+    import plugin.server.application.plugin_cli.service as service_module
+
+    monkeypatch.setattr(plugin_settings, "BUILTIN_PLUGIN_CONFIG_ROOT", tmp_path / "builtin")
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_CONFIG_ROOT", plugins_root)
+    monkeypatch.setattr(plugin_settings, "USER_PLUGIN_PACKAGES_ROOT", packages_root)
+    monkeypatch.setattr(
+        plugin_settings,
+        "USER_PACKAGE_PROFILES_ROOT",
+        tmp_path / "profiles",
+    )
+    monkeypatch.setattr(service_module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(upgrade_support, "plugin_is_running", lambda _plugin_id: _async_true())
+
+    async def mutate_while_stopping(_plugin_id: str) -> None:
+        sentinel.write_text("edited_during_stop = true\n", encoding="utf-8")
+
+    monkeypatch.setattr(upgrade_support, "stop_plugin_for_replace", mutate_while_stopping)
+    monkeypatch.setattr(
+        upgrade_support,
+        "start_plugin_after_replace",
+        lambda _plugin_id, *, strict: _async_true(),
+    )
+
+    service = PluginCliService()
+    plan = await service.plan_install(package=str(package_path))
+    with pytest.raises(ServerDomainError) as exc_info:
+        await service.install(
+            package=str(package_path),
+            confirm_upgrade=True,
+            confirmation_token=str(plan["confirmation_token"]),
+        )
+
+    assert exc_info.value.code == "PLUGIN_UPGRADE_ROLLED_BACK"
+    assert sentinel.read_text(encoding="utf-8") == "edited_during_stop = true\n"
+    assert manager.entry.channel == "manual"
+    assert manager.restore_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_local_package_takes_over_exact_manual_slot_alongside_builtin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

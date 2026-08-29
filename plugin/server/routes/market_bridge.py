@@ -3534,6 +3534,26 @@ async def _replace_market_plugin_transaction(
                 message="manual plugin changed after takeover confirmation",
                 http_status=409,
             )
+        async def validate_manual_backup(backup_dir: Path) -> None:
+            staged_snapshot = await asyncio.to_thread(
+                manual_takeover_snapshot_sha256,
+                entry=active_entry,
+                target_dir=backup_dir,
+            )
+            if not secrets.compare_digest(
+                manual_snapshot_sha256,
+                staged_snapshot,
+            ):
+                raise ServerDomainError(
+                    code="MANUAL_TAKEOVER_PLAN_CHANGED",
+                    message="manual plugin changed while it was being stopped",
+                    status_code=409,
+                )
+
+        replace_kwargs = {
+            **replace_kwargs,
+            "validate_backup": validate_manual_backup,
+        }
     try:
         return await replace_plugin(**replace_kwargs)
     except ReplacePluginError:
@@ -3737,6 +3757,14 @@ async def _do_upgrade(
                 code="unsafe_profile_path",
                 message=f"recorded package profile path does not match package id: {profile_dir}",
             )
+        if manual_takeover and getattr(inspected, "profile_names", ()) and (
+            profile_dir.exists() or profile_dir.is_symlink()
+        ):
+            raise _TaskError(
+                code="manual_takeover_profile_target_exists",
+                message="manual takeover cannot claim an existing package profile",
+                http_status=409,
+            )
         market_override = _build_market_override(
             payload,
             mode="reinstall" if record_as_reinstall else "upgrade",
@@ -3848,8 +3876,8 @@ async def _do_upgrade(
                     "stop": stop_plugin_for_upgrade,
                     "start": start,
                     "cleanup_backup": _async_remove_dir,
-                    "additional_targets": (profile_dir,),
-                    "preserve_targets": (profile_dir,),
+                    "additional_targets": (() if manual_takeover else (profile_dir,)),
+                    "preserve_targets": (() if manual_takeover else (profile_dir,)),
                     "on_rollback_start": mark_rollback_running,
                 },
             )

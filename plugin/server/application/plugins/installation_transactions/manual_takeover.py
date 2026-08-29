@@ -48,6 +48,7 @@ def local_manual_takeover_confirmation_token(
     package_path: Path,
     target_dir: Path,
     entry: LockEntry,
+    snapshot_sha256: str | None = None,
 ) -> str:
     """Bind a local-package confirmation to package, target and ownership."""
 
@@ -57,7 +58,8 @@ def local_manual_takeover_confirmation_token(
             digest.update(chunk)
     for value in (
         str(target_dir.resolve()),
-        manual_takeover_snapshot_sha256(entry=entry, target_dir=target_dir),
+        snapshot_sha256
+        or manual_takeover_snapshot_sha256(entry=entry, target_dir=target_dir),
     ):
         digest.update(b"\0")
         digest.update(value.encode("utf-8"))
@@ -71,10 +73,11 @@ def _replaceable_content_sha256(target_dir: Path) -> str:
         raise FileNotFoundError(root)
 
     def visit(directory: Path, relative_parent: Path) -> None:
-        entries = sorted(
-            os.scandir(directory),
-            key=lambda item: (item.name.casefold(), item.name),
-        )
+        with os.scandir(directory) as scanner:
+            entries = sorted(
+                scanner,
+                key=lambda item: (item.name.casefold(), item.name),
+            )
         for item in entries:
             relative_path = relative_parent / item.name
             metadata = item.stat(follow_symlinks=False)

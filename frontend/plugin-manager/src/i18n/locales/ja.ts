@@ -505,6 +505,8 @@ export default {
       blockedBundleConflict: 'このバンドルにはインストール済みのプラグインが含まれます。プラグインを1つずつアップグレードしてください。',
       blockedDirectoryConflict: '対象ディレクトリは別のプラグインに属するため、変更しませんでした。',
       blockedLegacyPlugin: 'このプラグインの以前のバージョンがまだインストールされています。続行する前に {plugin} をアンインストールしてください。',
+      blockedOwnershipUnknown: '既存のプラグインディレクトリの所有元を確認できません。インストール元の記録を復元してから再試行してください。',
+      blockedInstallSourceReadOnly: 'インストール元の記録を利用できないか、読み取り専用です。記録を復元してから再試行してください。',
       rollbackCompleted: 'アップグレードに失敗したため、以前のバージョンを復元しました。',
       rollbackIncomplete: 'アップグレードに失敗し、ロールバックも完了できませんでした。続行する前にプラグインの状態を確認してください。',
       error: {

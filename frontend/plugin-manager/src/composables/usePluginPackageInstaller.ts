@@ -89,6 +89,10 @@ export function usePluginPackageInstaller() {
           ? 'package.install.blockedBundleConflict'
           : plan.reason === 'legacy_plugin_present'
             ? 'package.install.blockedLegacyPlugin'
+            : plan.reason === 'install_source_ownership_unknown'
+              ? 'package.install.blockedOwnershipUnknown'
+              : plan.reason === 'install_source_read_only'
+                ? 'package.install.blockedInstallSourceReadOnly'
             : 'package.install.blockedDirectoryConflict'
         ElMessage.error(
           plan.reason === 'legacy_plugin_present'

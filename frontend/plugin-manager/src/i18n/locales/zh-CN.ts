@@ -505,6 +505,8 @@ export default {
       blockedBundleConflict: '此整合包包含已安装的插件，请逐个升级其中的插件。',
       blockedDirectoryConflict: '目标目录属于另一个插件，未进行任何更改。',
       blockedLegacyPlugin: '仍安装着此插件的旧版本。请先卸载 {plugin} 再继续。',
+      blockedOwnershipUnknown: '无法确认现有插件目录的所有权。请先恢复对应的安装源记录，再重试。',
+      blockedInstallSourceReadOnly: '安装源记录不可用或处于只读状态。请先恢复安装源记录，再重试。',
       rollbackCompleted: '升级失败，已恢复之前的版本。',
       rollbackIncomplete: '升级失败且回滚未完整完成，请检查插件状态后再继续。',
       error: {
