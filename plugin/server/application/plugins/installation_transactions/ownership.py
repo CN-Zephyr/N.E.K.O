@@ -102,7 +102,14 @@ def require_uninstall_ownership(
     # cross-platform (root_id, directory_name) lookup. Do not repeat that path
     # comparison with raw strings here: it would regress Windows casing and
     # macOS Unicode normalization handled by the manager.
-    if entry.removed or entry.plugin_id != declared_plugin_id:
+    # Legacy/import-window rows may carry the documented empty plugin_id
+    # placeholder.  The exact directory lookup above still proves which slot
+    # the entry describes; only installer-owned channels may use that narrow
+    # compatibility path.
+    entry_identity_matches = entry.plugin_id == declared_plugin_id or (
+        entry.plugin_id == "" and can_neko_uninstall(entry)
+    )
+    if entry.removed or not entry_identity_matches:
         raise _ownership_unknown(
             runtime_plugin_id=runtime_plugin_id,
             reason="entry_identity_mismatch",

@@ -240,6 +240,24 @@ def test_require_uninstall_ownership_returns_exact_managed_entry(
 
 @pytest.mark.plugin_unit
 @pytest.mark.parametrize("channel", ["imported", "market"])
+def test_empty_id_placeholder_keeps_exact_managed_entry_uninstallable(
+    channel: str,
+    tmp_path: Path,
+) -> None:
+    entry = _entry(plugin_id="", channel=channel)
+
+    assert (
+        require_uninstall_ownership(
+            manager=_Manager(entry),
+            runtime_plugin_id="demo",
+            config_path=_config_path(tmp_path),
+        )
+        is entry
+    )
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize("channel", ["imported", "market"])
 def test_runtime_alias_uses_manifest_id_for_installer_owned_entry(
     channel: str,
     tmp_path: Path,
