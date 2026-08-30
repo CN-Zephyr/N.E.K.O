@@ -347,16 +347,15 @@ def clear_runtime_override(plugin_id: str) -> None:
 def restore_runtime_override(
     plugin_id: str,
     snapshot: RuntimeOverride | None,
-) -> None:
-    """Restore one exact entry captured before a transactional mutation."""
+    *,
+    expected_current: RuntimeOverride | None,
+) -> bool:
+    """Restore an exact snapshot only if no newer preference replaced it."""
     if not plugin_id:
-        return
-    if snapshot is None:
-        clear_runtime_override(plugin_id)
-        return
+        return False
 
-    restored: RuntimeOverride
-    if isinstance(snapshot, bool):
+    restored: RuntimeOverride | None
+    if snapshot is None or isinstance(snapshot, bool):
         restored = snapshot
     elif isinstance(snapshot, Mapping):
         restored_mapping = dict(snapshot)
@@ -372,13 +371,19 @@ def restore_runtime_override(
     with _cache_lock:
         if _cache is None:
             _cache = _load_from_disk()
+        if _cache.get(plugin_id) != expected_current:
+            return False
         if _cache.get(plugin_id) == restored:
-            return
+            return True
         candidate = dict(_cache)
-        candidate[plugin_id] = restored
+        if restored is None:
+            candidate.pop(plugin_id, None)
+        else:
+            candidate[plugin_id] = restored
         _ensure_cache_can_be_written()
         _save_to_disk(candidate)
         _cache = candidate
+        return True
 
 
 def reset_cache_for_testing() -> None:

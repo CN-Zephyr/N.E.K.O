@@ -821,7 +821,16 @@ def _snapshot_runtime_preference(plugin_id: str) -> _RuntimePreferenceSnapshot:
 def _restore_runtime_preference(
     plugin_id: str, snapshot: _RuntimePreferenceSnapshot
 ) -> None:
-    restore_runtime_override(plugin_id, snapshot.entry)
+    restored = restore_runtime_override(
+        plugin_id,
+        snapshot.entry,
+        expected_current=None,
+    )
+    if not restored:
+        logger.info(
+            "uninstall rollback kept a newer runtime preference plugin_id={}",
+            plugin_id,
+        )
 
 
 def _registry_refresh_target(

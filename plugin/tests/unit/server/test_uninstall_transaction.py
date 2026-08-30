@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -725,6 +726,45 @@ async def test_uninstall_commit_failure_restores_auto_start_only_preference(
     assert captured.value.filesystem_rollback == "completed"
     assert "preference_rollback" not in _details_of(captured.value)
     assert _isolate_runtime_overrides == {"demo": {"auto_start": True}}
+    assert harness.manager.entry_for_directory(harness.plugin_dir) is not None
+    assert harness.plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_uninstall_rollback_keeps_newer_concurrent_preference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.install(monkeypatch)
+    runtime_overrides_module.set_runtime_override("demo", False)
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+
+    def _fail_commit_after_concurrent_write(_staged: object) -> None:
+        commit_entered.set()
+        release_commit.wait()
+        raise OSError("marker write failed")
+
+    monkeypatch.setattr(
+        uninstall_module,
+        "_commit_staged_plugin_code_sync",
+        _fail_commit_after_concurrent_write,
+    )
+
+    task = asyncio.create_task(uninstall_plugin("demo"))
+    await asyncio.to_thread(commit_entered.wait)
+    runtime_overrides_module.set_runtime_override("demo", True)
+    release_commit.set()
+
+    with pytest.raises(UninstallPluginError) as captured:
+        await task
+
+    assert captured.value.filesystem_rollback == "completed"
+    assert "preference_rollback" not in _details_of(captured.value)
+    assert _isolate_runtime_overrides == {"demo": True}
     assert harness.manager.entry_for_directory(harness.plugin_dir) is not None
     assert harness.plugin_dir.is_dir()
 
