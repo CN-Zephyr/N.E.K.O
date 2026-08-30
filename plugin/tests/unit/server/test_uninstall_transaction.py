@@ -670,6 +670,38 @@ async def test_uninstall_preference_clear_failure_restores_preference(
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
+async def test_uninstall_commit_failure_restores_auto_start_only_preference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.install(monkeypatch)
+    _isolate_runtime_overrides["demo"] = {"auto_start": True}
+    runtime_overrides_module.reset_cache_for_testing()
+
+    def _fail_commit(_staged: object) -> None:
+        raise OSError("marker write failed")
+
+    monkeypatch.setattr(
+        uninstall_module,
+        "_commit_staged_plugin_code_sync",
+        _fail_commit,
+    )
+
+    with pytest.raises(UninstallPluginError) as captured:
+        await uninstall_plugin("demo")
+
+    assert captured.value.stage == "refresh_and_preferences"
+    assert captured.value.filesystem_rollback == "completed"
+    assert "preference_rollback" not in _details_of(captured.value)
+    assert _isolate_runtime_overrides == {"demo": {"auto_start": True}}
+    assert harness.manager.entry_for_directory(harness.plugin_dir) is not None
+    assert harness.plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
 async def test_uninstall_rollback_restores_running_runtime_and_reports_separately(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

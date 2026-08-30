@@ -26,10 +26,10 @@ from plugin.server.application.plugins.operation_lock import serialized_plugin_o
 from plugin.server.application.plugins.registry_service import PluginRegistryService
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.runtime_overrides import (
+    RuntimeOverride,
     clear_runtime_override,
-    get_runtime_auto_start_override,
-    get_runtime_override,
-    set_runtime_override,
+    get_runtime_override_entry,
+    restore_runtime_override,
 )
 from plugin.settings import (
     BUILTIN_PLUGIN_CONFIG_ROOT,
@@ -125,8 +125,7 @@ class _CommittedPluginCodeCleanup:
 
 @dataclass(frozen=True, slots=True)
 class _RuntimePreferenceSnapshot:
-    enabled: bool | None
-    auto_start: bool | None
+    entry: RuntimeOverride | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -807,20 +806,14 @@ def retry_deferred_plugin_code_cleanup_sync() -> int:
 
 def _snapshot_runtime_preference(plugin_id: str) -> _RuntimePreferenceSnapshot:
     return _RuntimePreferenceSnapshot(
-        enabled=get_runtime_override(plugin_id),
-        auto_start=get_runtime_auto_start_override(plugin_id),
+        entry=get_runtime_override_entry(plugin_id),
     )
 
 
 def _restore_runtime_preference(
     plugin_id: str, snapshot: _RuntimePreferenceSnapshot
 ) -> None:
-    if snapshot.enabled is None:
-        clear_runtime_override(plugin_id)
-    else:
-        set_runtime_override(
-            plugin_id, snapshot.enabled, auto_start=snapshot.auto_start
-        )
+    restore_runtime_override(plugin_id, snapshot.entry)
 
 
 def _registry_refresh_target(
