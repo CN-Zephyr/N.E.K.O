@@ -748,10 +748,18 @@ def _finalize_committed_plugin_code_sync(
         raise ValueError(
             "uninstall code cleanup marker does not match staged directory"
         )
+    # Keep the marker outside the recursive delete target.  ``rmtree`` may
+    # partially remove a locked tree before raising; retaining the marker lets
+    # startup authenticate and retry the remaining payload safely.
     try:
-        shutil.rmtree(transaction_dir)
+        shutil.rmtree(staged.staged_dir)
     except FileNotFoundError:
-        return False
+        pass
+    committed.marker_path.unlink(missing_ok=True)
+    try:
+        transaction_dir.rmdir()
+    except FileNotFoundError:
+        pass
     try:
         backup_root.rmdir()
     except OSError:
@@ -852,28 +860,26 @@ def _registry_failure_matches_target(
     if not isinstance(failure, dict):
         return False
 
+    failure_config_path = failure.get("config_path")
+    if isinstance(failure_config_path, str) and failure_config_path:
+        try:
+            resolved_failure_path = Path(failure_config_path).resolve(strict=False)
+        except (OSError, RuntimeError):
+            resolved_failure_path = Path(failure_config_path)
+        for config_path in target.config_paths:
+            try:
+                resolved_target_path = config_path.resolve(strict=False)
+            except (OSError, RuntimeError):
+                resolved_target_path = config_path
+            if resolved_failure_path == resolved_target_path:
+                return True
+        return False
+
     failure_plugin_id = failure.get("plugin_id")
-    if isinstance(failure_plugin_id, str) and failure_plugin_id in {
+    return isinstance(failure_plugin_id, str) and failure_plugin_id in {
         target.runtime_plugin_id,
         target.declared_plugin_id,
-    }:
-        return True
-
-    failure_config_path = failure.get("config_path")
-    if not isinstance(failure_config_path, str) or not failure_config_path:
-        return False
-    try:
-        resolved_failure_path = Path(failure_config_path).resolve(strict=False)
-    except (OSError, RuntimeError):
-        resolved_failure_path = Path(failure_config_path)
-    for config_path in target.config_paths:
-        try:
-            resolved_target_path = config_path.resolve(strict=False)
-        except (OSError, RuntimeError):
-            resolved_target_path = config_path
-        if resolved_failure_path == resolved_target_path:
-            return True
-    return False
+    }
 
 
 async def _refresh_registry(

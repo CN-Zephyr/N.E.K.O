@@ -600,6 +600,35 @@ async def test_uninstall_ignores_unrelated_registry_scan_failure(
 
 
 @pytest.mark.plugin_unit
+def test_registry_failure_path_disambiguates_runtime_alias_declared_id(
+    tmp_path: Path,
+) -> None:
+    target_config = tmp_path / "user" / "demo" / "plugin.toml"
+    builtin_config = tmp_path / "builtin" / "demo" / "plugin.toml"
+    target = uninstall_module._RegistryRefreshTarget(
+        runtime_plugin_id="demo_1",
+        declared_plugin_id="demo",
+        config_paths=(target_config, builtin_config),
+    )
+
+    assert uninstall_module._registry_failure_matches_target(
+        {
+            "plugin_id": "demo",
+            "config_path": str(tmp_path / "other" / "demo" / "plugin.toml"),
+        },
+        target=target,
+    ) is False
+    assert uninstall_module._registry_failure_matches_target(
+        {"plugin_id": "different", "config_path": str(builtin_config)},
+        target=target,
+    ) is True
+    assert uninstall_module._registry_failure_matches_target(
+        {"plugin_id": "demo"},
+        target=target,
+    ) is True
+
+
+@pytest.mark.plugin_unit
 @pytest.mark.asyncio
 async def test_uninstall_restores_then_propagates_system_exit(
     monkeypatch: pytest.MonkeyPatch,
@@ -849,6 +878,37 @@ async def test_uninstall_committed_code_cleanup_failure_is_pending(
 
     assert uninstall_module.retry_deferred_plugin_code_cleanup_sync() == 1
     assert backup_root.exists() is False
+
+
+@pytest.mark.plugin_unit
+def test_committed_code_cleanup_keeps_marker_after_partial_payload_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _Harness(tmp_path)
+    harness.install(monkeypatch)
+    staged = uninstall_module._stage_plugin_code_sync(harness.plugin_dir)
+    committed = uninstall_module._commit_staged_plugin_code_sync(staged)
+    real_rmtree = uninstall_module.shutil.rmtree
+    failed_once = False
+
+    def _partially_remove_then_fail(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path) == staged.staged_dir and not failed_once:
+            failed_once = True
+            (staged.staged_dir / "plugin.toml").unlink()
+            raise OSError("staged payload locked")
+        real_rmtree(path)
+
+    monkeypatch.setattr(uninstall_module.shutil, "rmtree", _partially_remove_then_fail)
+
+    with pytest.raises(OSError, match="staged payload locked"):
+        uninstall_module._finalize_committed_plugin_code_sync(committed)
+
+    assert committed.marker_path.is_file()
+    assert staged.staged_dir.is_dir()
+    assert uninstall_module.retry_deferred_plugin_code_cleanup_sync() == 1
+    assert committed.marker_path.parent.exists() is False
 
 
 @pytest.mark.plugin_unit
