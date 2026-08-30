@@ -48,6 +48,7 @@ plugin_registry_service = PluginRegistryService()
 
 _DEFERRED_PROFILE_CLEANUP_FILENAME = "package_profile_cleanup.json"
 _CODE_BACKUP_ROOT_NAME = ".uninstall-backups"
+_CODE_PAYLOAD_DIR_NAME = "payload"
 _CODE_COMMIT_MARKER_FILENAME = "committed.json"
 _CODE_TRANSACTION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 # ``package_id`` allows dots, so the staged name must too; the leading dot,
@@ -632,11 +633,14 @@ def _stage_plugin_code_sync(plugin_dir: Path) -> _StagedPluginCode:
     ):
         raise ValueError("uninstall code backup root is not a direct local directory")
     transaction_dir.mkdir(exist_ok=False)
-    staged_dir = transaction_dir / plugin_dir.name
+    payload_dir = transaction_dir / _CODE_PAYLOAD_DIR_NAME
+    payload_dir.mkdir()
+    staged_dir = payload_dir / plugin_dir.name
     try:
         plugin_dir.replace(staged_dir)
     except BaseException:
         try:
+            payload_dir.rmdir()
             transaction_dir.rmdir()
             backup_root.rmdir()
         except OSError:
@@ -648,13 +652,15 @@ def _stage_plugin_code_sync(plugin_dir: Path) -> _StagedPluginCode:
 def _restore_staged_plugin_code_sync(staged: _StagedPluginCode) -> None:
     if staged.staged_dir.exists():
         staged.staged_dir.replace(staged.original_dir)
-    transaction_dir = staged.staged_dir.parent
+    payload_dir = staged.staged_dir.parent
+    transaction_dir = payload_dir.parent
     backup_root = transaction_dir.parent
     try:
         (transaction_dir / _CODE_COMMIT_MARKER_FILENAME).unlink()
     except FileNotFoundError:
         pass
     try:
+        payload_dir.rmdir()
         transaction_dir.rmdir()
         backup_root.rmdir()
     except OSError:
@@ -664,7 +670,7 @@ def _restore_staged_plugin_code_sync(staged: _StagedPluginCode) -> None:
 def _commit_staged_plugin_code_sync(
     staged: _StagedPluginCode,
 ) -> _CommittedPluginCodeCleanup:
-    marker_path = staged.staged_dir.parent / _CODE_COMMIT_MARKER_FILENAME
+    marker_path = staged.staged_dir.parent.parent / _CODE_COMMIT_MARKER_FILENAME
     temporary_path = marker_path.with_name(
         f".{marker_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
@@ -718,7 +724,8 @@ def _load_committed_plugin_code_cleanup_sync(
         not original_dir.is_absolute()
         or not staged_dir.is_absolute()
         or original_dir.parent != backup_root.parent
-        or staged_dir != transaction_dir / original_dir.name
+        or staged_dir
+        != transaction_dir / _CODE_PAYLOAD_DIR_NAME / original_dir.name
     ):
         return None
     staged = _StagedPluginCode(
@@ -737,7 +744,8 @@ def _finalize_committed_plugin_code_sync(
     backup_root = staged.original_dir.parent / _CODE_BACKUP_ROOT_NAME
     transaction_dir = backup_root / staged.transaction_id
     if (
-        staged.staged_dir != transaction_dir / staged.original_dir.name
+        staged.staged_dir
+        != transaction_dir / _CODE_PAYLOAD_DIR_NAME / staged.original_dir.name
         or committed.marker_path != transaction_dir / _CODE_COMMIT_MARKER_FILENAME
         or _load_committed_plugin_code_cleanup_sync(
             transaction_dir,
@@ -753,6 +761,10 @@ def _finalize_committed_plugin_code_sync(
     # startup authenticate and retry the remaining payload safely.
     try:
         shutil.rmtree(staged.staged_dir)
+    except FileNotFoundError:
+        pass
+    try:
+        staged.staged_dir.parent.rmdir()
     except FileNotFoundError:
         pass
     committed.marker_path.unlink(missing_ok=True)

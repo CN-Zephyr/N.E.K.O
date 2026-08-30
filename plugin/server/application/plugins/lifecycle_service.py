@@ -574,6 +574,7 @@ async def _start_host_with_timeout(
 
 
 class PluginLifecycleService:
+    @serialized_plugin_operation
     async def start_plugin(
         self,
         plugin_id: str,
@@ -1021,6 +1022,7 @@ class PluginLifecycleService:
                 error_type=type(exc).__name__,
             ) from exc
 
+    @serialized_plugin_operation
     async def stop_plugin(
         self,
         plugin_id: str,

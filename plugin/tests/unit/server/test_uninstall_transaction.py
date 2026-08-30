@@ -755,13 +755,18 @@ async def test_uninstall_rollback_keeps_newer_concurrent_preference(
     )
 
     task = asyncio.create_task(uninstall_plugin("demo"))
-    await asyncio.to_thread(commit_entered.wait)
-    runtime_overrides_module.set_runtime_override("demo", True)
-    release_commit.set()
+    entered = False
+    try:
+        entered = await asyncio.to_thread(commit_entered.wait, 5)
+        if entered:
+            runtime_overrides_module.set_runtime_override("demo", True)
+    finally:
+        release_commit.set()
 
     with pytest.raises(UninstallPluginError) as captured:
         await task
 
+    assert entered is True
     assert captured.value.filesystem_rollback == "completed"
     assert "preference_rollback" not in _details_of(captured.value)
     assert _isolate_runtime_overrides == {"demo": True}
@@ -914,7 +919,12 @@ async def test_uninstall_committed_code_cleanup_failure_is_pending(
     transaction_dirs = list(backup_root.iterdir())
     assert len(transaction_dirs) == 1
     assert (transaction_dirs[0] / "committed.json").is_file()
-    assert (transaction_dirs[0] / "demo" / "plugin.toml").is_file()
+    assert (
+        transaction_dirs[0]
+        / uninstall_module._CODE_PAYLOAD_DIR_NAME
+        / "demo"
+        / "plugin.toml"
+    ).is_file()
 
     assert uninstall_module.retry_deferred_plugin_code_cleanup_sync() == 1
     assert backup_root.exists() is False
@@ -952,6 +962,25 @@ def test_committed_code_cleanup_keeps_marker_after_partial_payload_failure(
 
 
 @pytest.mark.plugin_unit
+def test_code_marker_cannot_collide_with_valid_plugin_directory_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = _Harness(tmp_path, plugin_names=("committed.json",))
+    harness.install(monkeypatch)
+    plugin_dir = harness.exec_root / "committed.json"
+
+    staged = uninstall_module._stage_plugin_code_sync(plugin_dir)
+    committed = uninstall_module._commit_staged_plugin_code_sync(staged)
+
+    assert staged.staged_dir.is_dir()
+    assert staged.staged_dir.name == "committed.json"
+    assert committed.marker_path.is_file()
+    assert committed.marker_path != staged.staged_dir
+    assert uninstall_module._finalize_committed_plugin_code_sync(committed) is True
+
+
+@pytest.mark.plugin_unit
 def test_deferred_code_cleanup_refuses_unmarked_backup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -959,7 +988,7 @@ def test_deferred_code_cleanup_refuses_unmarked_backup(
     harness = _Harness(tmp_path)
     harness.install(monkeypatch)
     transaction_dir = harness.exec_root / ".uninstall-backups" / ("a" * 32)
-    staged_dir = transaction_dir / "demo"
+    staged_dir = transaction_dir / uninstall_module._CODE_PAYLOAD_DIR_NAME / "demo"
     staged_dir.mkdir(parents=True)
     (staged_dir / "plugin.toml").write_text(
         "[plugin]\nid='demo'\n",

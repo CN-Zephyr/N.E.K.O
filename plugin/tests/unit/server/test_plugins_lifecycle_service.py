@@ -14,6 +14,7 @@ from plugin._types.exceptions import PluginLifecycleError
 from plugin.core import registry as registry_module
 from plugin.server.application.plugins import query_service as query_module
 from plugin.server.application.plugins import lifecycle_service as module
+from plugin.server.application.plugins import operation_lock as operation_lock_module
 import plugin.server.application.plugins.installation_transactions.uninstall as uninstall_module
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure import runtime_overrides as runtime_overrides_module
@@ -73,6 +74,66 @@ class _CaptureLogger:
         for arg in args:
             rendered = rendered.replace("{}", str(arg), 1)
         self.errors.append(rendered)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["start", "stop"])
+async def test_runtime_mutations_wait_for_plugin_operation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    plugin_id = "serialized_plugin"
+    host = _FakeProcessHost(
+        plugin_id=plugin_id,
+        entry_point="tests.fake:Plugin",
+        config_path=tmp_path / plugin_id / "plugin.toml",
+    )
+    hosts_backup = dict(module.state.plugin_hosts)
+    second_acquire_attempted = asyncio.Event()
+    original_acquire = operation_lock_module._PROCESS_LOCK.acquire
+    acquire_calls = 0
+
+    async def _tracked_acquire() -> None:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 2:
+            second_acquire_attempted.set()
+        await original_acquire()
+
+    async def _clear_tools(_plugin_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        operation_lock_module._PROCESS_LOCK,
+        "acquire",
+        _tracked_acquire,
+    )
+    monkeypatch.setattr(module, "clear_plugin_llm_tools", _clear_tools)
+
+    try:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = host
+
+        service = module.PluginLifecycleService()
+        async with operation_lock_module.plugin_operation_lock.hold():
+            if operation == "start":
+                task = asyncio.create_task(
+                    service.start_plugin(plugin_id, refresh_registry=False)
+                )
+            else:
+                task = asyncio.create_task(service.stop_plugin(plugin_id))
+            await asyncio.wait_for(second_acquire_attempted.wait(), timeout=5)
+            assert task.done() is False
+
+        response = await asyncio.wait_for(task, timeout=5)
+        assert response["success"] is True
+    finally:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
 
 
 class _FakeInstallSourceManager:
