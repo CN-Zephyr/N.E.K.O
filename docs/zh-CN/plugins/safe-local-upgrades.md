@@ -103,7 +103,7 @@ previous_ids = ["old_plugin_id"] # 可选的旧身份冲突保护
 | 职责 | 权威实现 |
 | --- | --- |
 | 安装计划分类与确认令牌 | `plugin/server/application/plugin_cli/install_plan.py` |
-| 事务、备份、恢复和重启 | `plugin/server/application/plugins/upgrade_support.py` |
+| 事务、备份、恢复和重启 | `plugin/server/application/plugins/installation_transactions/replace.py` |
 | 安装编排与路径策略 | `plugin/server/application/plugin_cli/service.py` |
 | HTTP 请求与响应模型 | `plugin/server/routes/plugin_cli.py` |
 | 插件管理器确认流程与结果提示 | `frontend/plugin-manager/src/composables/usePackageManager.ts` |

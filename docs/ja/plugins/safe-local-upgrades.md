@@ -95,7 +95,7 @@ previous_ids = ["old_plugin_id"] # 任意の旧 identity 衝突 guard
 | 責務 | 正規実装 |
 | --- | --- |
 | Plan 分類と confirmation token | `plugin/server/application/plugin_cli/install_plan.py` |
-| Transaction、backup、restore、restart | `plugin/server/application/plugins/upgrade_support.py` |
+| Transaction、backup、restore、restart | `plugin/server/application/plugins/installation_transactions/replace.py` |
 | Install orchestration と path policy | `plugin/server/application/plugin_cli/service.py` |
 | HTTP request/response model | `plugin/server/routes/plugin_cli.py` |
 | Plugin Manager の確認と結果表示 | `frontend/plugin-manager/src/composables/usePackageManager.ts` |

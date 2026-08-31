@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import tomllib
 
 from plugin import settings
 from plugin.core.plugin_layout import PluginLayout
@@ -16,7 +17,7 @@ from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.config_paths import ensure_plugin_layout_runtime_config
 from plugin.settings import get_plugin_state_root
 
-logger = get_logger("server.application.plugins.upgrade_support")
+logger = get_logger("server.application.plugins.installation_transactions.replace")
 
 _MANIFEST_ADJACENT_PROFILE_NAMES = {
     "profiles.toml": "profiles.toml",
@@ -40,7 +41,7 @@ class ReplacePluginError(RuntimeError):
         self.cause = cause
 
 
-async def plugin_is_running(plugin_id: str) -> bool:
+async def _plugin_is_running(plugin_id: str) -> bool:
     if not plugin_id:
         return False
     try:
@@ -56,7 +57,7 @@ async def plugin_is_running(plugin_id: str) -> bool:
         raise
 
 
-async def stop_plugin_for_replace(plugin_id: str) -> None:
+async def _stop_plugin(plugin_id: str) -> None:
     if not plugin_id:
         return
     from plugin.server.application.plugins.lifecycle_service import PluginLifecycleService
@@ -69,29 +70,21 @@ async def stop_plugin_for_replace(plugin_id: str) -> None:
         raise
 
 
-async def start_plugin_after_replace(plugin_id: str, *, strict: bool) -> bool:
+async def _start_plugin(plugin_id: str) -> None:
     if not plugin_id:
-        return False
+        return
     from plugin.server.application.plugins.lifecycle_service import PluginLifecycleService
 
     try:
         await PluginLifecycleService().start_plugin(plugin_id)
-        return True
+        return
     except Exception as exc:
         logger.error(
             "lifecycle restart failed plugin_id={} err_type={}",
             plugin_id,
             type(exc).__name__,
         )
-        if strict:
-            raise
-        return False
-
-
-# Market keeps the established names until its Day 3 adapter switches to the
-# shared replace transaction.
-stop_plugin_for_upgrade = stop_plugin_for_replace
-start_plugin_after_upgrade = start_plugin_after_replace
+        raise
 
 
 def backup_path_for(target_dir: Path, *, backup_root: Path | None = None) -> Path:
@@ -111,6 +104,26 @@ async def remove_directory(target_dir: Path) -> None:
     if not target_dir.exists():
         return
     await asyncio.to_thread(shutil.rmtree, target_dir)
+
+
+def _validate_installed_identity(layout: PluginLayout) -> None:
+    manifest_path = layout.installed_dir / "plugin.toml"
+    if manifest_path.resolve(strict=False) != layout.manifest_path.resolve(strict=False):
+        raise ValueError("plugin layout manifest does not belong to the replacement target")
+    try:
+        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"installed plugin.toml not found: {manifest_path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"installed plugin.toml is invalid TOML: {manifest_path}") from exc
+    plugin_table = data.get("plugin")
+    if not isinstance(plugin_table, dict):
+        raise ValueError(f"installed plugin.toml missing [plugin] table: {manifest_path}")
+    installed_plugin_id = plugin_table.get("id")
+    if not isinstance(installed_plugin_id, str) or not installed_plugin_id.strip():
+        raise ValueError(f"installed plugin.toml missing [plugin].id: {manifest_path}")
+    if installed_plugin_id.strip() != layout.plugin_id:
+        raise ValueError("installed plugin identity does not match the replacement target")
 
 
 async def merge_directory_contents(source_dir: Path, target_dir: Path) -> None:
@@ -173,7 +186,6 @@ async def run_rollback(
     target_dir: Path,
     backup_dir: Path,
     restart: bool,
-    start: Callable[[str], Awaitable[None]],
 ) -> bool:
     restored = True
     try:
@@ -187,7 +199,7 @@ async def run_rollback(
         )
     if restart:
         try:
-            await start(plugin_id)
+            await _start_plugin(plugin_id)
         except Exception as exc:
             restored = False
             logger.error(
@@ -308,15 +320,11 @@ async def replace_plugin(
     *,
     layout: PluginLayout,
     install_new: Callable[[], Awaitable[dict[str, object]]],
-    validate_new: Callable[[], Awaitable[None]],
-    is_running: Callable[[str], Awaitable[bool]],
-    stop: Callable[[str], Awaitable[None]],
-    start: Callable[[str], Awaitable[None]],
-    cleanup_backup: Callable[[Path], Awaitable[None]],
     additional_targets: tuple[Path, ...] = (),
     preserve_targets: tuple[Path, ...] = (),
     initialize_runtime_config: bool = True,
     validate_backup: Callable[[Path], Awaitable[None]] | None = None,
+    validate_channel_specific: Callable[[], Awaitable[None]] | None = None,
     on_rollback_start: Callable[[], None] | None = None,
 ) -> ReplacePluginResult:
     plugin_id = layout.plugin_id
@@ -338,9 +346,9 @@ async def replace_plugin(
             ensure_plugin_layout_runtime_config,
             layout,
         )
-    was_running = await is_running(plugin_id)
+    was_running = await _plugin_is_running(plugin_id)
     if was_running:
-        await stop(plugin_id)
+        await _stop_plugin(plugin_id)
 
     preexisting_targets = frozenset(target for target in targets if target.exists())
     backups: dict[Path, Path] = {}
@@ -365,7 +373,7 @@ async def replace_plugin(
         )
         if was_running:
             try:
-                await start(plugin_id)
+                await _start_plugin(plugin_id)
             except Exception as restart_exc:
                 recovered = False
                 logger.error(
@@ -385,7 +393,9 @@ async def replace_plugin(
         stage = "install"
         install_result = await install_new()
         stage = "validate"
-        await validate_new()
+        await asyncio.to_thread(_validate_installed_identity, layout)
+        if validate_channel_specific is not None:
+            await validate_channel_specific()
         stage = "preserve"
         for target in preserve_targets:
             backup = backups.get(target)
@@ -396,11 +406,11 @@ async def replace_plugin(
         await asyncio.to_thread(_evict_replaced_plugin_modules, plugin_id)
         if was_running:
             stage = "restart"
-            await start(plugin_id)
+            await _start_plugin(plugin_id)
         stage = "cleanup"
         for backup in backups.values():
             try:
-                await cleanup_backup(backup)
+                await remove_directory(backup)
             except Exception as exc:  # cleanup must not roll back a valid replacement
                 logger.warning(
                     "plugin backup cleanup failed plugin_id={} err_type={}",
@@ -432,7 +442,7 @@ async def replace_plugin(
             )
         if was_running:
             try:
-                await start(plugin_id)
+                await _start_plugin(plugin_id)
             except Exception as restart_exc:
                 restored = False
                 logger.error(

@@ -10,6 +10,7 @@ from .ownership import (
     can_neko_uninstall,
     require_uninstall_ownership,
 )
+from .replace import ReplacePluginError, ReplacePluginResult, replace_plugin
 from .uninstall import (
     UninstallPluginError,
     UninstallPluginResult,
@@ -22,6 +23,8 @@ __all__ = [
     "UninstallOwnershipError",
     "UninstallPluginError",
     "UninstallPluginResult",
+    "ReplacePluginError",
+    "ReplacePluginResult",
     "can_neko_uninstall",
     "is_manual_takeover_entry",
     "local_manual_takeover_confirmation_token",
@@ -29,5 +32,6 @@ __all__ = [
     "require_uninstall_ownership",
     "retry_deferred_plugin_code_cleanup_sync",
     "retry_deferred_profile_cleanup_sync",
+    "replace_plugin",
     "uninstall_plugin",
 ]

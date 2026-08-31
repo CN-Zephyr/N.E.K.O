@@ -38,7 +38,10 @@ from plugin.server.application.plugin_cli.install_plan import (
     build_install_plan,
     is_manifestless_state_directory,
 )
-from plugin.server.application.plugins import upgrade_support
+from plugin.server.application.plugins.installation_transactions import (
+    replace as replacement_transaction,
+)
+from plugin.server.application.plugins import source_switch
 from plugin.server.application.plugins.installation_transactions.manual_takeover import (
     is_manual_takeover_entry,
     local_manual_takeover_confirmation_token,
@@ -210,7 +213,7 @@ def _classify_package_error(exc: Exception) -> str | None:
 
 
 def _replacement_error_details(
-    exc: upgrade_support.ReplacePluginError,
+    exc: replacement_transaction.ReplacePluginError,
 ) -> dict[str, object]:
     details: dict[str, object] = {
         "stage": exc.stage,
@@ -538,23 +541,10 @@ class PluginCliService:
                 )
             return install_result
 
-        async def validate_new() -> None:
-            plugin_id = self._read_installed_plugin_toml_id(target_dir)
-            if plugin_id != plan.plugin_id or target_dir.name != plan.directory_name:
-                raise ValueError("installed plugin identity does not match the upgrade plan")
-
-        async def start(plugin_id: str) -> None:
-            await upgrade_support.start_plugin_after_replace(plugin_id, strict=True)
-
         try:
-            result = await upgrade_support.replace_plugin(
+            result = await replacement_transaction.replace_plugin(
                 layout=resolve_plugin_layout(plan.plugin_id, target_dir),
                 install_new=install_new,
-                validate_new=validate_new,
-                is_running=upgrade_support.plugin_is_running,
-                stop=upgrade_support.stop_plugin_for_replace,
-                start=start,
-                cleanup_backup=upgrade_support.remove_directory,
                 additional_targets=(
                     (profile_dir,)
                     if manual_manager is None or manual_package_has_profiles
@@ -578,7 +568,7 @@ class PluginCliService:
                     else None
                 ),
             )
-        except upgrade_support.ReplacePluginError as exc:
+        except replacement_transaction.ReplacePluginError as exc:
             source_restored = True
             if manual_entry is not None and source_write_attempted:
                 try:
@@ -767,9 +757,6 @@ class PluginCliService:
                 config_path=target_dir / "plugin.toml",
             )
 
-        async def start(plugin_id: str) -> None:
-            await upgrade_support.start_plugin_after_replace(plugin_id, strict=True)
-
         try:
             switched = await switch_builtin_source(
                 SourceSwitchRequest(
@@ -787,9 +774,9 @@ class PluginCliService:
                 clear_user_source=clear_user_source,
                 refresh_registry=refresh_registry,
                 validate_promoted_source=validate_promoted_source,
-                is_running=upgrade_support.plugin_is_running,
-                stop=upgrade_support.stop_plugin_for_replace,
-                start=start,
+                is_running=source_switch.plugin_is_running_for_source_switch,
+                stop=source_switch.stop_plugin_for_source_switch,
+                start=source_switch.start_plugin_for_source_switch,
             )
         finally:
             await asyncio.to_thread(self._cleanup_builtin_override_staging_sync, staged)

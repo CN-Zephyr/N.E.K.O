@@ -6,17 +6,36 @@ import pytest
 
 from plugin.core import host as host_module
 from plugin.core.plugin_layout import resolve_plugin_layout
-from plugin.server.application.plugins import upgrade_support
-from plugin.server.application.plugins.upgrade_support import (
+from plugin.server.application.plugins.installation_transactions import (
     ReplacePluginError,
-    plugin_is_running,
     replace_plugin,
+)
+from plugin.server.application.plugins.installation_transactions import (
+    replace as replace_transaction,
+)
+from plugin.server.application.plugins.installation_transactions.replace import (
+    _plugin_is_running as plugin_is_running,
     remove_directory,
     run_rollback,
 )
 from plugin.server.infrastructure.config_profiles import load_profiles_cfg_from_file
 
 pytestmark = pytest.mark.plugin_unit
+OLD_PLUGIN_MANIFEST = '[plugin]\nid = "demo"\nversion = 1\n'
+NEW_PLUGIN_MANIFEST = '[plugin]\nid = "demo"\nversion = 2\n'
+
+
+@pytest.fixture(autouse=True)
+def _default_replacement_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def not_running(_plugin_id: str) -> bool:
+        return False
+
+    async def no_op(_plugin_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", not_running)
+    monkeypatch.setattr(replace_transaction, "_stop_plugin", no_op)
+    monkeypatch.setattr(replace_transaction, "_start_plugin", no_op)
 
 
 async def _async_none() -> None:
@@ -37,7 +56,7 @@ async def _record(events: list[str], value: str) -> None:
 
 def test_legacy_profile_case_variants_cannot_share_one_canonical_target() -> None:
     with pytest.raises(OSError, match="multiple legacy profile paths map to profiles.toml"):
-        upgrade_support._canonical_profile_sources(
+        replace_transaction._canonical_profile_sources(
             [Path("profiles.toml"), Path("Profiles.toml")]
         )
 
@@ -48,7 +67,7 @@ async def test_replace_plugin_replaces_only_payload_and_preserves_external_user_
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     (target / "vendor").mkdir()
     (target / "vendor" / "dependency.txt").write_text("old", encoding="utf-8")
 
@@ -65,7 +84,7 @@ async def test_replace_plugin_replaces_only_payload_and_preserves_external_user_
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         (target / "vendor").mkdir()
         (target / "vendor" / "dependency.txt").write_text("new", encoding="utf-8")
         return {"installed": True}
@@ -73,14 +92,10 @@ async def test_replace_plugin_replaces_only_payload_and_preserves_external_user_
     result = await replace_plugin(
         layout=resolve_plugin_layout("demo", target, storage_root=storage_root),
         install_new=install_new,
-        validate_new=_async_none,
-        is_running=lambda _plugin_id: _async_false(),
-        stop=lambda _plugin_id: _async_none(),
-        start=lambda _plugin_id: _async_none(),
-        cleanup_backup=remove_directory,
+        validate_channel_specific=_async_none,
     )
 
-    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 2\n"
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == NEW_PLUGIN_MANIFEST
     assert (target / "vendor" / "dependency.txt").read_text(encoding="utf-8") == "new"
     for path, content in expected_state.items():
         assert path.read_text(encoding="utf-8") == content
@@ -93,30 +108,109 @@ async def test_replace_plugin_invalidates_module_cache_before_restart(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     events: list[str] = []
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     def evict(plugin_id: str) -> None:
         events.append(f"evict:{plugin_id}")
 
     monkeypatch.setattr(host_module, "evict_cached_plugin_modules", evict)
+    monkeypatch.setattr(
+        replace_transaction,
+        "_plugin_is_running",
+        lambda _plugin_id: _async_true(),
+    )
+    monkeypatch.setattr(
+        replace_transaction,
+        "_stop_plugin",
+        lambda plugin_id: _record(events, f"stop:{plugin_id}"),
+    )
+    monkeypatch.setattr(
+        replace_transaction,
+        "_start_plugin",
+        lambda plugin_id: _record(events, f"start:{plugin_id}"),
+    )
 
     await replace_plugin(
         layout=resolve_plugin_layout("demo", target),
         install_new=install_new,
-        validate_new=_async_none,
-        is_running=lambda _plugin_id: _async_true(),
-        stop=lambda plugin_id: _record(events, f"stop:{plugin_id}"),
-        start=lambda plugin_id: _record(events, f"start:{plugin_id}"),
-        cleanup_backup=remove_directory,
+        validate_channel_specific=_async_none,
     )
 
     assert events == ["stop:demo", "evict:demo", "start:demo"]
+
+
+@pytest.mark.asyncio
+async def test_replace_plugin_rejects_shared_identity_mismatch_before_channel_validation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "plugins" / "demo"
+    target.mkdir(parents=True)
+    (target / "plugin.toml").write_text(
+        '[plugin]\nid = "demo"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    channel_validation_called = False
+
+    async def install_new() -> dict[str, object]:
+        target.mkdir()
+        (target / "plugin.toml").write_text(
+            '[plugin]\nid = "other"\nversion = "2.0.0"\n',
+            encoding="utf-8",
+        )
+        return {"installed": True}
+
+    async def validate_channel_specific() -> None:
+        nonlocal channel_validation_called
+        channel_validation_called = True
+
+    with pytest.raises(ReplacePluginError) as exc_info:
+        await replace_plugin(
+            layout=resolve_plugin_layout("demo", target),
+            install_new=install_new,
+            validate_channel_specific=validate_channel_specific,
+        )
+
+    assert exc_info.value.stage == "validate"
+    assert exc_info.value.rollback_status == "completed"
+    assert channel_validation_called is False
+    assert 'id = "demo"' in (target / "plugin.toml").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_replace_plugin_rolls_back_new_payload_missing_plugin_table(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "plugins" / "demo"
+    target.mkdir(parents=True)
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
+    channel_validation_called = False
+
+    async def install_new() -> dict[str, object]:
+        target.mkdir()
+        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        return {"installed": True}
+
+    async def validate_channel_specific() -> None:
+        nonlocal channel_validation_called
+        channel_validation_called = True
+
+    with pytest.raises(ReplacePluginError) as exc_info:
+        await replace_plugin(
+            layout=resolve_plugin_layout("demo", target),
+            install_new=install_new,
+            validate_channel_specific=validate_channel_specific,
+        )
+
+    assert exc_info.value.stage == "validate"
+    assert exc_info.value.rollback_status == "completed"
+    assert channel_validation_called is False
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == OLD_PLUGIN_MANIFEST
 
 
 @pytest.mark.asyncio
@@ -126,13 +220,13 @@ async def test_replace_plugin_invalidates_new_cache_before_rollback_restart(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     events: list[str] = []
     start_attempts = 0
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     async def start(plugin_id: str) -> None:
@@ -146,16 +240,23 @@ async def test_replace_plugin_invalidates_new_cache_before_rollback_restart(
         events.append(f"evict:{plugin_id}")
 
     monkeypatch.setattr(host_module, "evict_cached_plugin_modules", evict)
+    monkeypatch.setattr(
+        replace_transaction,
+        "_plugin_is_running",
+        lambda _plugin_id: _async_true(),
+    )
+    monkeypatch.setattr(
+        replace_transaction,
+        "_stop_plugin",
+        lambda plugin_id: _record(events, f"stop:{plugin_id}"),
+    )
+    monkeypatch.setattr(replace_transaction, "_start_plugin", start)
 
     with pytest.raises(ReplacePluginError, match="restart"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=install_new,
-            validate_new=_async_none,
-            is_running=lambda _plugin_id: _async_true(),
-            stop=lambda plugin_id: _record(events, f"stop:{plugin_id}"),
-            start=start,
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
         )
 
     assert events == [
@@ -165,7 +266,7 @@ async def test_replace_plugin_invalidates_new_cache_before_rollback_restart(
         "evict:demo",
         "start:demo",
     ]
-    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 1\n"
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == OLD_PLUGIN_MANIFEST
 
 
 @pytest.mark.asyncio
@@ -174,7 +275,7 @@ async def test_replace_plugin_preserves_manifest_adjacent_user_profiles(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     (target / "profiles.toml").write_text(
         "[config_profiles]\nactive = 'dev'\n",
         encoding="utf-8",
@@ -187,20 +288,16 @@ async def test_replace_plugin_preserves_manifest_adjacent_user_profiles(
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     await replace_plugin(
         layout=resolve_plugin_layout("demo", target),
         install_new=install_new,
-        validate_new=_async_none,
-        is_running=lambda _plugin_id: _async_false(),
-        stop=lambda _plugin_id: _async_none(),
-        start=lambda _plugin_id: _async_none(),
-        cleanup_backup=remove_directory,
+        validate_channel_specific=_async_none,
     )
 
-    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 2\n"
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == NEW_PLUGIN_MANIFEST
     assert (target / "profiles.toml").read_text(encoding="utf-8") == (
         "[config_profiles]\nactive = 'dev'\n"
     )
@@ -215,7 +312,7 @@ async def test_replace_plugin_canonicalizes_legacy_profile_path_case_for_reader(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     (target / "Profiles.toml").write_text(
         "[config_profiles]\nactive = 'dev'\n[config_profiles.files]\ndev = 'profiles/dev.toml'\n",
         encoding="utf-8",
@@ -228,17 +325,13 @@ async def test_replace_plugin_canonicalizes_legacy_profile_path_case_for_reader(
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     await replace_plugin(
         layout=resolve_plugin_layout("demo", target),
         install_new=install_new,
-        validate_new=_async_none,
-        is_running=lambda _plugin_id: _async_false(),
-        stop=lambda _plugin_id: _async_none(),
-        start=lambda _plugin_id: _async_none(),
-        cleanup_backup=remove_directory,
+        validate_channel_specific=_async_none,
     )
 
     restored_names = {path.name for path in target.iterdir()}
@@ -256,7 +349,7 @@ async def test_replace_plugin_rejects_duplicate_casefolded_profile_paths(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     (target / "profiles.toml").write_text("canonical\n", encoding="utf-8")
     (target / "Profiles.toml").write_text("variant\n", encoding="utf-8")
     variants = [
@@ -269,23 +362,19 @@ async def test_replace_plugin_rejects_duplicate_casefolded_profile_paths(
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     with pytest.raises(ReplacePluginError) as exc_info:
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=install_new,
-            validate_new=_async_none,
-            is_running=lambda _plugin_id: _async_false(),
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
         )
 
     assert exc_info.value.stage == "preserve"
     assert exc_info.value.rollback_status == "completed"
-    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 1\n"
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == OLD_PLUGIN_MANIFEST
 
 
 @pytest.mark.asyncio
@@ -300,7 +389,7 @@ async def test_replace_plugin_rejects_manifest_adjacent_profile_symlinks(
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     link_target = tmp_path / f"external-{relative_path.replace('.', '-')}"
     if link_target_exists:
         if relative_path == "profiles":
@@ -316,23 +405,19 @@ async def test_replace_plugin_rejects_manifest_adjacent_profile_symlinks(
 
     async def install_new() -> dict[str, object]:
         target.mkdir()
-        (target / "plugin.toml").write_text("version = 2\n", encoding="utf-8")
+        (target / "plugin.toml").write_text(NEW_PLUGIN_MANIFEST, encoding="utf-8")
         return {"installed": True}
 
     with pytest.raises(ReplacePluginError) as exc_info:
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=install_new,
-            validate_new=_async_none,
-            is_running=lambda _plugin_id: _async_false(),
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
         )
 
     assert exc_info.value.stage == "preserve"
     assert exc_info.value.rollback_status == "completed"
-    assert (target / "plugin.toml").read_text(encoding="utf-8") == "version = 1\n"
+    assert (target / "plugin.toml").read_text(encoding="utf-8") == OLD_PLUGIN_MANIFEST
     assert profile_path.is_symlink()
 
 
@@ -369,11 +454,7 @@ async def test_replace_plugin_initializes_runtime_config_from_old_payload_before
     await replace_plugin(
         layout=resolve_plugin_layout("demo", target, storage_root=storage_root),
         install_new=install_new,
-        validate_new=_async_none,
-        is_running=lambda _plugin_id: _async_false(),
-        stop=lambda _plugin_id: _async_none(),
-        start=lambda _plugin_id: _async_none(),
-        cleanup_backup=remove_directory,
+        validate_channel_specific=_async_none,
     )
 
     runtime_config = storage_root / "plugins" / "demo" / "config" / "plugin.toml"
@@ -383,6 +464,7 @@ async def test_replace_plugin_initializes_runtime_config_from_old_payload_before
 @pytest.mark.asyncio
 async def test_replace_plugin_rejects_invalid_preserve_target_before_side_effects(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "plugins" / "demo"
     target.mkdir(parents=True)
@@ -397,18 +479,13 @@ async def test_replace_plugin_rejects_invalid_preserve_target_before_side_effect
         events.append(f"running:{plugin_id}")
         return True
 
-    async def stop(plugin_id: str) -> None:
-        events.append(f"stop:{plugin_id}")
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
 
     with pytest.raises(ValueError, match="preserve targets"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target, storage_root=storage_root),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=stop,
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             preserve_targets=(tmp_path / "not-a-replacement-target",),
         )
 
@@ -420,6 +497,7 @@ async def test_replace_plugin_rejects_invalid_preserve_target_before_side_effect
 @pytest.mark.parametrize("target_kind", ["duplicate", "nested"])
 async def test_replace_plugin_rejects_overlapping_targets_before_side_effects(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     target_kind: str,
 ) -> None:
     target = tmp_path / "plugins" / "demo"
@@ -435,15 +513,13 @@ async def test_replace_plugin_rejects_overlapping_targets_before_side_effects(
         events.append(f"running:{plugin_id}")
         return False
 
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+
     with pytest.raises(ValueError, match="distinct and non-overlapping"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target, storage_root=tmp_path / "state"),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             additional_targets=(additional_target,),
         )
 
@@ -463,21 +539,19 @@ async def test_replace_plugin_rejects_persistent_state_target_before_side_effect
     state_db.parent.mkdir()
     state_db.write_bytes(b"state")
     events: list[str] = []
-    monkeypatch.setattr(upgrade_support, "get_plugin_state_root", lambda: state_root)
+    monkeypatch.setattr(replace_transaction, "get_plugin_state_root", lambda: state_root)
 
     async def is_running(plugin_id: str) -> bool:
         events.append(f"running:{plugin_id}")
         return False
 
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+
     with pytest.raises(ValueError, match="persistent state paths"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target, storage_root=tmp_path),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
         )
 
     assert events == []
@@ -491,7 +565,7 @@ async def test_replace_plugin_uses_layout_state_root_for_custom_storage(
 ) -> None:
     target = tmp_path / "installed" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     storage_root = tmp_path / "custom-state"
     plugin_state = storage_root / "plugins" / "demo"
     state_db = plugin_state / "data" / "study.db"
@@ -499,7 +573,7 @@ async def test_replace_plugin_uses_layout_state_root_for_custom_storage(
     state_db.write_bytes(b"state")
     events: list[str] = []
     monkeypatch.setattr(
-        upgrade_support,
+        replace_transaction,
         "get_plugin_state_root",
         lambda: tmp_path / "unrelated-global-state",
     )
@@ -508,15 +582,13 @@ async def test_replace_plugin_uses_layout_state_root_for_custom_storage(
         events.append(f"running:{plugin_id}")
         return False
 
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+
     with pytest.raises(ValueError, match="persistent state paths"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target, storage_root=storage_root),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             additional_targets=(plugin_state,),
         )
 
@@ -532,28 +604,26 @@ async def test_replace_plugin_rejects_target_containing_persistent_state_before_
 ) -> None:
     target = tmp_path / "exec" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     profile_ancestor = tmp_path / "managed"
     state_root = profile_ancestor / "plugins"
     state_db = state_root / "study_companion" / "data" / "study.db"
     state_db.parent.mkdir(parents=True)
     state_db.write_bytes(b"state")
     events: list[str] = []
-    monkeypatch.setattr(upgrade_support, "get_plugin_state_root", lambda: state_root)
+    monkeypatch.setattr(replace_transaction, "get_plugin_state_root", lambda: state_root)
 
     async def is_running(plugin_id: str) -> bool:
         events.append(f"running:{plugin_id}")
         return False
 
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+
     with pytest.raises(ValueError, match="persistent state paths"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             additional_targets=(profile_ancestor,),
         )
 
@@ -571,7 +641,7 @@ async def test_replace_plugin_rejects_builtin_root_overlap_before_side_effects(
 ) -> None:
     target = tmp_path / "user-plugins" / "demo"
     target.mkdir(parents=True)
-    (target / "plugin.toml").write_text("version = 1\n", encoding="utf-8")
+    (target / "plugin.toml").write_text(OLD_PLUGIN_MANIFEST, encoding="utf-8")
     builtin_root = tmp_path / "runtime" / "plugin" / "plugins"
     builtin_plugin = builtin_root / "demo"
     builtin_plugin.mkdir(parents=True)
@@ -583,21 +653,23 @@ async def test_replace_plugin_rejects_builtin_root_overlap_before_side_effects(
         "ancestor": builtin_root.parent,
     }[overlap]
     events: list[str] = []
-    monkeypatch.setattr(upgrade_support.settings, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(
+        replace_transaction.settings,
+        "BUILTIN_PLUGIN_CONFIG_ROOT",
+        builtin_root,
+    )
 
     async def is_running(plugin_id: str) -> bool:
         events.append(f"running:{plugin_id}")
         return False
 
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+
     with pytest.raises(ValueError, match="immutable builtin plugin paths"):
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=is_running,
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             additional_targets=(forbidden_target,),
         )
 
@@ -607,7 +679,10 @@ async def test_replace_plugin_rejects_builtin_root_overlap_before_side_effects(
 
 
 @pytest.mark.asyncio
-async def test_run_rollback_removes_new_directory_restores_backup_and_restarts(tmp_path: Path) -> None:
+async def test_run_rollback_removes_new_directory_restores_backup_and_restarts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "demo"
     backup = tmp_path / "demo.bak"
     target.mkdir()
@@ -619,12 +694,13 @@ async def test_run_rollback_removes_new_directory_restores_backup_and_restarts(t
     async def start(plugin_id: str) -> None:
         restarted.append(plugin_id)
 
+    monkeypatch.setattr(replace_transaction, "_start_plugin", start)
+
     restored = await run_rollback(
         plugin_id="demo",
         target_dir=target,
         backup_dir=backup,
         restart=True,
-        start=start,
     )
 
     assert restored is True
@@ -668,16 +744,16 @@ async def test_backup_failure_restarts_running_plugin_without_installing(
         raise PermissionError(destination)
 
     monkeypatch.setattr(Path, "rename", fail_rename)
+    monkeypatch.setattr(replace_transaction, "_plugin_is_running", is_running)
+    monkeypatch.setattr(replace_transaction, "_stop_plugin", stop)
+    monkeypatch.setattr(replace_transaction, "_start_plugin", start)
+    monkeypatch.setattr(replace_transaction, "remove_directory", cleanup_backup)
 
     with pytest.raises(ReplacePluginError) as exc_info:
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=install_new,
-            validate_new=validate_new,
-            is_running=is_running,
-            stop=stop,
-            start=start,
-            cleanup_backup=cleanup_backup,
+            validate_channel_specific=validate_new,
         )
 
     assert exc_info.value.stage == "backup"
@@ -712,11 +788,7 @@ async def test_backup_failure_rolls_back_when_rollback_observer_fails(
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=lambda: _async_none(),  # type: ignore[arg-type]
-            validate_new=_async_none,
-            is_running=lambda _plugin_id: _async_false(),
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             additional_targets=(additional_target,),
             on_rollback_start=fail_observer,
         )
@@ -747,11 +819,7 @@ async def test_install_failure_rolls_back_when_rollback_observer_fails(
         await replace_plugin(
             layout=resolve_plugin_layout("demo", target),
             install_new=fail_install,
-            validate_new=_async_none,
-            is_running=lambda _plugin_id: _async_false(),
-            stop=lambda _plugin_id: _async_none(),
-            start=lambda _plugin_id: _async_none(),
-            cleanup_backup=remove_directory,
+            validate_channel_specific=_async_none,
             on_rollback_start=fail_observer,
         )
 
@@ -780,8 +848,6 @@ async def test_remove_directory_propagates_cleanup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from plugin.server.application.plugins import upgrade_support
-
     target = tmp_path / "demo"
     target.mkdir()
     ignore_values: list[bool] = []
@@ -792,7 +858,11 @@ async def test_remove_directory_propagates_cleanup_failure(
         if not ignore_errors:
             raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(upgrade_support.shutil, "rmtree", fail_unless_errors_are_suppressed)
+    monkeypatch.setattr(
+        replace_transaction.shutil,
+        "rmtree",
+        fail_unless_errors_are_suppressed,
+    )
 
     with pytest.raises(PermissionError, match="cleanup denied"):
         await remove_directory(target)

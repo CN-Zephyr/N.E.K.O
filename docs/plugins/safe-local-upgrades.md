@@ -103,7 +103,7 @@ Both endpoints require administrator authorization. User-facing errors must not 
 | Responsibility | Canonical implementation |
 | --- | --- |
 | Plan classification and confirmation token | `plugin/server/application/plugin_cli/install_plan.py` |
-| Transaction, backup, restore, and restart | `plugin/server/application/plugins/upgrade_support.py` |
+| Transaction, backup, restore, and restart | `plugin/server/application/plugins/installation_transactions/replace.py` |
 | Install orchestration and path policy | `plugin/server/application/plugin_cli/service.py` |
 | HTTP request/response models | `plugin/server/routes/plugin_cli.py` |
 | Plugin Manager confirmation and result messages | `frontend/plugin-manager/src/composables/usePackageManager.ts` |

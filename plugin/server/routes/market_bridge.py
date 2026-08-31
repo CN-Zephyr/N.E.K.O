@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 import dataclasses
 import hashlib
 import hmac
@@ -31,10 +32,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from plugin.logging_config import get_logger
-from plugin.core.plugin_layout import resolve_plugin_layout
+from plugin.core.plugin_layout import PluginLayout, resolve_plugin_layout
 from plugin.neko_plugin_cli.public import inspect_package
 from plugin.server.application.install_source import (
     InstallSourceError,
+    InstallSourceManager,
     LockEntry,
     SourceDetailMarket,
     classify_plugin_path,
@@ -44,19 +46,14 @@ from plugin.server.application.install_source.scanner import PluginDirectoryScan
 from plugin.server.application.plugin_cli import PluginCliService
 from plugin.server.application.plugin_cli.paths import PluginCliPathPolicy
 from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
-from plugin.server.application.plugins.installation_transactions.manual_takeover import (
+from plugin.server.application.plugins.installation_transactions import (
+    ReplacePluginError,
+    ReplacePluginResult,
     is_manual_takeover_entry,
     manual_takeover_snapshot_sha256,
+    replace_plugin,
 )
 from plugin.server.application.plugins.source_switch import SourceSwitchError
-from plugin.server.application.plugins.upgrade_support import (
-    ReplacePluginError,
-    plugin_is_running,
-    remove_directory,
-    replace_plugin,
-    start_plugin_after_upgrade,
-    stop_plugin_for_upgrade,
-)
 from plugin.server.domain.errors import ServerDomainError
 from plugin.settings import (
     MARKET_API_URL,
@@ -3491,16 +3488,21 @@ async def _do_install(
 @serialized_plugin_operation
 async def _replace_market_plugin_transaction(
     *,
-    manager: Any,
+    manager: InstallSourceManager,
     expected_plugin_id: str,
     original_entry: LockEntry,
     original_entry_fingerprint: tuple[object, ...],
     installed_package_id: str,
     plugin_dir: Path,
-    replace_kwargs: dict[str, Any],
+    layout: PluginLayout,
+    install_new: Callable[[], Awaitable[dict[str, object]]],
+    additional_targets: tuple[Path, ...] = (),
+    preserve_targets: tuple[Path, ...] = (),
+    validate_channel_specific: Callable[[], Awaitable[None]] | None = None,
+    on_rollback_start: Callable[[], None] | None = None,
     manual_snapshot_sha256: str = "",
-    rollback_install_source: Any | None = None,
-) -> Any:
+    rollback_install_source: Callable[[], Awaitable[None]] | None = None,
+) -> ReplacePluginResult:
     """Revalidate and replace under the shared plugin filesystem lock."""
     reload_install_source = getattr(manager, "load", None)
     if callable(reload_install_source):
@@ -3537,6 +3539,7 @@ async def _replace_market_plugin_transaction(
                 message="manual plugin changed after takeover confirmation",
                 http_status=409,
             )
+
         async def validate_manual_backup(backup_dir: Path) -> None:
             staged_snapshot = await asyncio.to_thread(
                 manual_takeover_snapshot_sha256,
@@ -3553,12 +3556,18 @@ async def _replace_market_plugin_transaction(
                     status_code=409,
                 )
 
-        replace_kwargs = {
-            **replace_kwargs,
-            "validate_backup": validate_manual_backup,
-        }
+    else:
+        validate_manual_backup = None
     try:
-        return await replace_plugin(**replace_kwargs)
+        return await replace_plugin(
+            layout=layout,
+            install_new=install_new,
+            additional_targets=additional_targets,
+            preserve_targets=preserve_targets,
+            validate_backup=validate_manual_backup,
+            validate_channel_specific=validate_channel_specific,
+            on_rollback_start=on_rollback_start,
+        )
     except ReplacePluginError:
         if rollback_install_source is not None:
             await rollback_install_source()
@@ -3811,20 +3820,8 @@ async def _do_upgrade(
                     restore_exc,
                 )
 
-        async def validate_new() -> None:
-            actual_plugin_id = await asyncio.to_thread(
-                _read_plugin_toml_id,
-                plugin_dir / "plugin.toml",
-            )
-            if actual_plugin_id and actual_plugin_id != installed_plugin_id:
-                raise ValueError(
-                    "installed plugin identity does not match the Market replacement target"
-                )
+        async def validate_channel_specific() -> None:
             if continues_builtin_override:
-                if actual_plugin_id != installed_plugin_id:
-                    raise ValueError(
-                        "installed plugin identity does not match the builtin override target"
-                    )
                 from plugin.server.application.plugins.lifecycle_service import (
                     plugin_registry_service,
                 )
@@ -3833,9 +3830,6 @@ async def _do_upgrade(
                     plugin_id=installed_plugin_id,
                     config_path=plugin_dir / "plugin.toml",
                 )
-
-        async def start(plugin_id: str) -> None:
-            await start_plugin_after_upgrade(plugin_id, strict=True)
 
         def mark_rollback_running() -> None:
             _set_task_stage(
@@ -3872,24 +3866,18 @@ async def _do_upgrade(
                 original_entry_fingerprint=entry_fingerprint,
                 installed_package_id=installed_package_id,
                 plugin_dir=plugin_dir,
+                layout=resolve_plugin_layout(installed_plugin_id, plugin_dir),
+                install_new=install_new,
+                additional_targets=(
+                    (profile_dir,)
+                    if not manual_takeover or manual_package_has_profiles
+                    else ()
+                ),
+                preserve_targets=(() if manual_takeover else (profile_dir,)),
+                validate_channel_specific=validate_channel_specific,
+                on_rollback_start=mark_rollback_running,
                 manual_snapshot_sha256=manual_snapshot_sha256,
                 rollback_install_source=rollback_install_source,
-                replace_kwargs={
-                    "layout": resolve_plugin_layout(installed_plugin_id, plugin_dir),
-                    "install_new": install_new,
-                    "validate_new": validate_new,
-                    "is_running": plugin_is_running,
-                    "stop": stop_plugin_for_upgrade,
-                    "start": start,
-                    "cleanup_backup": _async_remove_dir,
-                    "additional_targets": (
-                        (profile_dir,)
-                        if not manual_takeover or manual_package_has_profiles
-                        else ()
-                    ),
-                    "preserve_targets": (() if manual_takeover else (profile_dir,)),
-                    "on_rollback_start": mark_rollback_running,
-                },
             )
         except ReplacePluginError as exc:
             rollback_ok = exc.rollback_status == "completed" and source_restored
@@ -4067,13 +4055,6 @@ def _post_install_payload_check(
         )
 
 
-async def _async_remove_dir(target_dir: Path) -> None:
-    """Async best-effort rmtree for backup cleanup."""
-
-    try:
-        await remove_directory(target_dir)
-    except Exception as exc:  # pragma: no cover - platform-specific cleanup failure
-        logger.warning("backup cleanup failed for {}: {}", target_dir, exc)
 def _utc_iso_now() -> str:
     """Current UTC time in ISO 8601 with microsecond precision and ``Z`` suffix."""
 
