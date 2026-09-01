@@ -68,10 +68,11 @@ auto_classify = true
 [plugin]
 id = "smart_notes"
 name = "Smart Notes"
+version = "1.2.0"
 entry = "plugin.plugins.smart_notes:SmartNotesPlugin"
 ```
 
-These three fields are **required**. `id` must match `^[A-Za-z0-9_-]+$` and must be unique. Legacy source discovery can still load some folder/ID mismatches, but package build and production installation require the declared ID, archive directory, executable destination, and entry package to stay aligned; no suffixed executable copy is created. `entry` must use `module.path:ClassName` and resolve to a `NekoPluginBase` subclass; a `PluginRouter` cannot be launched directly.
+These four fields are **required** by the supported check and release workflow. `id` must match `^[A-Za-z0-9_-]+$` and must be unique. Legacy source discovery can still load some incomplete manifests or folder/ID mismatches, but package build and production installation require the declared ID, archive directory, executable destination, and entry package to stay aligned; no suffixed executable copy is created. `entry` must use `module.path:ClassName` and resolve to a `NekoPluginBase` subclass; a `PluginRouter` cannot be launched directly.
 
 For a normal plugin, `type = "plugin"` is optional because it is the default. Use `type = "adapter"` only for an Adapter package. The removed `extension` type and `[plugin.host]` table are rejected.
 
@@ -97,7 +98,7 @@ The Agent's final Stage 2 decision returns a `plugin_id` and runtime `entry_id`.
 version = "1.2.0"
 ```
 
-Optional. Used for version management and marketplace publishing.
+Required by the check and release workflow. Used for version management and marketplace publishing.
 
 ---
 

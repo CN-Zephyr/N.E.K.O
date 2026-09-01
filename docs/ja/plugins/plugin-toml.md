@@ -68,10 +68,11 @@ auto_classify = true
 [plugin]
 id = "smart_notes"
 name = "Smart Notes"
+version = "1.2.0"
 entry = "plugin.plugins.smart_notes:SmartNotesPlugin"
 ```
 
-この 3 フィールドは **必須** です。`id` は `^[A-Za-z0-9_-]+$` に一致し、一意でなければなりません。従来のソース探索ではディレクトリ名と ID が異なるプラグインを読み込める場合がありますが、パッケージのビルドと本番環境へのインストールでは、宣言 ID、アーカイブ内のディレクトリ、インストール先、エントリーパッケージを一致させる必要があります。競合時に接尾辞付きのコピーは作成されません。`entry` は `module.path:ClassName` 形式で `NekoPluginBase` のサブクラスを指す必要があり、`PluginRouter` は直接起動できません。
+サポート対象の check / release workflow では、この 4 フィールドが **必須** です。従来のソース探索では、不完全な manifest やディレクトリ名と ID が異なるプラグインを読み込める場合がありますが、有効なリリース package であることを意味しません。`id` は `^[A-Za-z0-9_-]+$` に一致し、一意でなければなりません。パッケージのビルドと本番環境へのインストールでは、宣言 ID、アーカイブ内のディレクトリ、インストール先、エントリーパッケージを一致させる必要があります。競合時に接尾辞付きのコピーは作成されません。`entry` は `module.path:ClassName` 形式で `NekoPluginBase` のサブクラスを指す必要があり、`PluginRouter` は直接起動できません。
 
 通常の plugin では `type = "plugin"` は default なので省略できます。Adapter package のみ `type = "adapter"` を使います。削除済みの `extension` type と `[plugin.host]` table は拒否されます。
 
@@ -97,7 +98,7 @@ Stage 2 の最終出力は `plugin_id` と runtime `entry_id` です。どちら
 version = "1.2.0"
 ```
 
-任意です。バージョン管理やマーケットプレイス公開で使います。
+check / release workflow では必須です。バージョン管理やマーケットプレイス公開で使います。
 
 ---
 

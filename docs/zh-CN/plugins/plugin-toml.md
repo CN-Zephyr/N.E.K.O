@@ -68,10 +68,11 @@ auto_classify = true
 [plugin]
 id = "smart_notes"
 name = "智能笔记"
+version = "1.2.0"
 entry = "plugin.plugins.smart_notes:SmartNotesPlugin"
 ```
 
-这三个字段是**必填**的。`id` 必须符合 `^[A-Za-z0-9_-]+$` 且全局唯一。旧的源码发现路径仍可能加载部分目录名与 ID 不一致的插件，但打包和生产安装要求声明 ID、归档目录、执行目标目录与 entry 包路径保持一致，也不会创建带数字后缀的可执行副本。`entry` 必须是 `module.path:ClassName`，并解析到 `NekoPluginBase` 子类；不能直接把 `PluginRouter` 当作启动类。
+支持的检查与发布流程要求这四个字段**必填**。旧的源码发现路径仍可能加载部分清单不完整、目录名与 ID 不一致的插件，但这不代表它们是有效的发布包。`id` 必须符合 `^[A-Za-z0-9_-]+$` 且全局唯一。打包和生产安装要求声明 ID、归档目录、执行目标目录与 entry 包路径保持一致，也不会创建带数字后缀的可执行副本。`entry` 必须是 `module.path:ClassName`，并解析到 `NekoPluginBase` 子类；不能直接把 `PluginRouter` 当作启动类。
 
 普通插件的 `type = "plugin"` 可省略，因为它是默认值。只有 Adapter 包才使用 `type = "adapter"`。已删除的 `extension` 类型和 `[plugin.host]` 表会被拒绝。
 
@@ -97,7 +98,7 @@ Agent 第二阶段最终返回 `plugin_id` 和运行时 `entry_id`。两者都�
 version = "1.2.0"
 ```
 
-可选。用于版本管理和市场发布。
+检查与发布流程必填，用于版本管理和市场发布。
 
 ---
 
