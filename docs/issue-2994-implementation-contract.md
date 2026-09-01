@@ -1,11 +1,16 @@
 # Issue #2994 implementation contract
 
+> **Status (2026-09-01): completed implementation record.** The ownership,
+> manual-takeover, uninstall-transaction, and replacement-boundary slices below
+> have landed on `upstream/main`. Branch names and PR ordering are retained as
+> historical delivery context, not as pending work.
+
 ## Authority
 
-- Branch: `codex/issue-2994-uninstall-ownership`
-- Baseline: `upstream/main` at `6b6812b3e8735c6aadbe4b158224aff42e136b86`
-- Revalidated: `upstream/main` at `56f068d2`; intervening changes do not touch
-  the plugin modules in this design.
+- Historical starting branch: `codex/issue-2994-uninstall-ownership`
+- Historical baseline: `upstream/main` at `6b6812b3e8735c6aadbe4b158224aff42e136b86`
+- Completion revalidation: `upstream/main` at
+  `3e7da108035017835b67a00f79d9f7339e67965b`.
 - Issue: <https://github.com/Project-N-E-K-O/N.E.K.O/issues/2994>
 - Latest scope review: <https://github.com/Project-N-E-K-O/N.E.K.O/issues/2994#issuecomment-5461019156>
 - Canonical design: `docs/design/plugin-lifecycle-ownership-transactions.md`
@@ -34,7 +39,7 @@ missing or removed entry, unknown channel, or entry/path identity mismatch must
 fail closed before filesystem mutation. The existing path guard remains a
 second independent check.
 
-## Required implementation order
+## Delivered implementation order
 
 1. Centralize and test uninstall ownership using existing fields, including
    fail-closed unknown ownership.
@@ -51,12 +56,11 @@ second independent check.
 7. Confirm real compatibility consumers before changing runtime ID-conflict
    behavior.
 
-## Pull request delivery contract
+## Historical pull request delivery contract
 
-The user explicitly authorized combining the first two safety slices in the
-current pull request. PR 3 and PR 4 remain sequential and must start from the
-updated target branch after the combined safety PR is merged. Do not mix
-investigation-only runtime ID work into these pull requests.
+The first two safety slices were combined, then PR 3 and PR 4 were delivered
+sequentially from the updated target branch. The table records that completed
+sequence.
 
 | Order | Suggested branch | Pull request title | Required outcome |
 |---|---|---|---|
@@ -64,10 +68,11 @@ investigation-only runtime ID work into these pull requests.
 | PR 3 | `codex/issue-2994-uninstall-transaction` | `refactor(plugin): move uninstall into an installation transaction` | Code, installer-owned profile and source record share an explicit uninstall commit point; lifecycle no longer owns package-file transaction order. |
 | PR 4 | `codex/issue-2994-replace-boundary` | `refactor(plugin): narrow plugin replacement boundary` | Replacement owns constant lifecycle dependencies, both callers pass only varying inputs, and Market no longer expands an untyped keyword dictionary. |
 
-Runtime ID-conflict compatibility is a decision gate after PR 4, not a promised
-PR 5. First identify concrete consumers and record the evidence in Issue #2994.
-Only if a behavior change is justified should it receive a separate issue or
-small pull request based on the then-current target branch.
+The post-PR-4 runtime-ID review found no need for a product behavior change or
+PR 5. Production installation rejects executable-directory identity conflicts
+instead of creating suffixed copies, while legacy runtime discovery remains
+unchanged. Any future change needs a concrete consumer case and a separately
+reviewed scope.
 
 ### PR 1 hard scope
 
