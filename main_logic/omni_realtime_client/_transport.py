@@ -368,21 +368,17 @@ class _TransportMixin:
         self._reset_input_route_identity_stream()
         return identity
 
-    async def _deliver_input_transcript(
-        self, transcript: str, *, item_id: object = None
-    ) -> bool:
+    async def _deliver_input_transcript(self, transcript: str, *, item_id: object = None) -> None:
         identity = self._take_input_route_identity(item_id)
         routed_callback = getattr(self, "on_input_transcript_with_route", None)
         if callable(routed_callback):
-            accepted = await routed_callback(
+            await routed_callback(
                 transcript,
                 source_game_route_identity=identity,
             )
-            return accepted is not False
+            return
         if self.on_input_transcript:
-            accepted = await self.on_input_transcript(transcript)
-            return accepted is not False
-        return False
+            await self.on_input_transcript(transcript)
 
     async def connect(self, instructions: str, native_audio=True) -> None:
         """Establish WebSocket connection with the Realtime API."""
@@ -420,7 +416,6 @@ class _TransportMixin:
         # response's events cannot arrive on the new socket) — reset anyway,
         # because 'connection-scoped' should be true by construction.
         self._idless_quarantine = False
-        self._idless_quarantine_scope = None
 
         # ``close()`` releases RNNoise/soxr state. The client object is reused
         # across sessions, so recreate that session-owned processor on demand.
@@ -933,17 +928,6 @@ class _TransportMixin:
                 transport = self.ws
                 if not transport:
                     return False
-                if (
-                    event.get("type") == "response.create"
-                    and not getattr(self, "_has_server_vad", True)
-                ):
-                    # External ASR/text/proactive turns rotate the host speech
-                    # id before their explicit create reaches this transport.
-                    # A never-announcing proxy gives the receive loop no later
-                    # start event at which to capture that owner, so sample it
-                    # at the last synchronous boundary before the create is
-                    # actually written.
-                    self._current_turn_host_id = self._read_host_turn_id()
                 await transport.send(payload)
                 return True
             except _RealtimeEventOwnerRetired:
@@ -2258,7 +2242,6 @@ class _TransportMixin:
         # a fail-open release; ordered socket delivery puts this evidence
         # before any later id-less event from the successor.
         self._idless_quarantine = False
-        self._idless_quarantine_scope = None
         self._is_first_text_chunk = self._is_first_transcript_chunk = True
         self._output_transcript_buffer = ""
         self._current_response_transcript = ""
@@ -2302,6 +2285,7 @@ class _TransportMixin:
         step_timeout: float | None = None,
         still_ours: Callable[[], bool] | None = None,
         connection_still_ours: Callable[[], bool] | None = None,
+        carry_host_turn_forward: bool = False,
     ) -> None:
         """Tell the host this turn is over.
 
@@ -2459,10 +2443,11 @@ class _TransportMixin:
             except Exception as exc:
                 logger.warning("turn-finished speech-id rotation failed: %s", exc)
             else:
-                if connection_still_ours is None or connection_still_ours():
-                    # Some no-VAD compatibility proxies omit response.created
-                    # and response ids. The sid produced by this rotation is
-                    # therefore the only stable owner for their next response.
+                if carry_host_turn_forward and (
+                    connection_still_ours is None or connection_still_ours()
+                ):
+                    # Some no-VAD proxies omit the next response.created and
+                    # response id, so its terminal has no other turn owner.
                     self._current_turn_host_id = self._read_host_turn_id()
 
     async def _on_arbiter_stuck_release(
@@ -2539,12 +2524,6 @@ class _TransportMixin:
                 # instead. Containing an abandoned turn must not mute a live
                 # one.
                 self._idless_quarantine = True
-                self._idless_quarantine_scope = (
-                    self._tool_scope_generation,
-                    False,
-                    False,
-                    _response_id_text(response_id),
-                )
             logger.info(
                 "Arbiter released %s but this turn is tracking %s; leaving it "
                 "alone",
@@ -2643,12 +2622,6 @@ class _TransportMixin:
             # id-less can be attributed. Clearing _current_response_id above
             # quarantines its ID-BEARING events; this covers the rest.
             self._idless_quarantine = True
-            self._idless_quarantine_scope = (
-                self._tool_scope_generation,
-                False,
-                False,
-                _response_id_text(response_id),
-            )
             return
         logger.info("Ending abandoned turn after arbiter release: %s", reason)
         # Both release paths raise it: the abandoned response may still be
@@ -2656,12 +2629,6 @@ class _TransportMixin:
         # id-less can be attributed. Clearing _current_response_id above
         # quarantines its ID-BEARING events; this covers the rest.
         self._idless_quarantine = True
-        self._idless_quarantine_scope = (
-            self._tool_scope_generation,
-            False,
-            False,
-            _response_id_text(response_id),
-        )
 
         # Captured before the reset, which is what clears the buffer: a stalled
         # lifecycle is exactly the case where the terminal that would normally
@@ -2930,25 +2897,6 @@ class _TransportMixin:
                     continue
 
                 if event_type in ID_BEARING_RESPONSE_CONTENT_EVENT_TYPES:
-                    quarantine_scope = self._idless_quarantine_scope
-                    content_response_id = _response_id_text(
-                        event.get("response_id")
-                    )
-                    if (
-                        self._idless_quarantine
-                        and quarantine_scope is not None
-                        and content_response_id is not None
-                        and content_response_id == quarantine_scope[3]
-                    ):
-                        # This check precedes both arbiter start attribution and
-                        # the generic stale-id filter.  Never-announcing routes
-                        # intentionally make that filter fail open, while the
-                        # release still gives us this exact abandoned id.
-                        logger.info(
-                            "Dropping content from released response %s",
-                            content_response_id,
-                        )
-                        continue
                     content_started = self._response_arbiter.notify_response_content(
                         event
                     )
@@ -2961,7 +2909,6 @@ class _TransportMixin:
                 # replacement response has become current.  Providers that
                 # include response identity let us reject those late events
                 # without changing the legacy behaviour of id-less proxies.
-                quarantine_scope = self._idless_quarantine_scope
                 if event_type != "response.created":
                     # Presence, not truthiness, on both reads — the same
                     # correction the arbiter's `_event_response_id` gets in this
@@ -3024,17 +2971,6 @@ class _TransportMixin:
                             # branch continues, so nothing double-counts.
                             self._response_done_total += 1
                             self._record_response_usage(event.get("response"))
-                            quarantine_scope = self._idless_quarantine_scope
-                            if (
-                                self._idless_quarantine
-                                and quarantine_scope is not None
-                                and event_response_id == quarantine_scope[3]
-                            ):
-                                # The identified abandoned terminal has paid
-                                # the quarantine debt even though host-side
-                                # finalization remains stale and is skipped.
-                                self._idless_quarantine = False
-                                self._idless_quarantine_scope = None
                         logger.info(
                             "Dropping stale response event type=%s response_id=%s current_response_id=%s",
                             event_type,
@@ -3042,27 +2978,6 @@ class _TransportMixin:
                             self._current_response_id,
                         )
                         continue
-                quarantine_scope = self._idless_quarantine_scope
-                if (
-                    event_type in ID_BEARING_RESPONSE_CONTENT_EVENT_TYPES
-                    and event_type
-                    not in {
-                        "response.function_call_arguments.delta",
-                        "response.function_call_arguments.done",
-                    }
-                    and self._idless_quarantine
-                    and quarantine_scope is not None
-                    and quarantine_scope[0] == self._tool_scope_generation
-                    and quarantine_scope[1]
-                ):
-                    # Only content that survived the response-id ownership
-                    # filter can prove the accepted successor has started.
-                    self._idless_quarantine_scope = (
-                        quarantine_scope[0],
-                        True,
-                        True,
-                        quarantine_scope[3],
-                    )
                 # ── Tool calling events ────────────────────────────
                 # Three providers, three flavours of the same idea:
                 #   - OpenAI Realtime (gpt): the canonical event is the
@@ -3180,14 +3095,14 @@ class _TransportMixin:
                     # Ahead of the finalize branches below on purpose: several
                     # of them `continue`, and a stale or non-finalizing
                     # terminal still proves the response is over.
-                    terminal_response_id = _response_id_text(
-                        event.get("response_id")
-                    ) or _response_id_text(
+                    self.close_raw_tool_batch(
+                        _response_id_text(event.get("response_id"))
+                        or _response_id_text(
                             (event.get("response") or {}).get("id")
                             if isinstance(event.get("response"), dict)
                             else None
+                        )
                     )
-                    self.close_raw_tool_batch(terminal_response_id)
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)
                     )
@@ -3195,33 +3110,6 @@ class _TransportMixin:
                     self._last_response_done_time = time.time()
                     # 解析实时 API 返回的 token 用量
                     self._record_response_usage(event.get("response"))
-                    quarantine_scope = self._idless_quarantine_scope
-                    if self._idless_quarantine and quarantine_scope is not None:
-                        abandoned_response_id = quarantine_scope[3]
-                        if (
-                            terminal_response_id is not None
-                            and terminal_response_id == abandoned_response_id
-                        ):
-                            self._idless_quarantine = False
-                            self._idless_quarantine_scope = None
-                            continue
-                        if terminal_response_id is None:
-                            successor_has_content = quarantine_scope[2]
-                            self._idless_quarantine = False
-                            self._idless_quarantine_scope = None
-                            if not successor_has_content:
-                                # The abandoned turn was already finalized. Its
-                                # unidentifiable late terminal may release the
-                                # arbiter lane, but must not finalize the host again.
-                                continue
-                        elif terminal_response_id is not None:
-                            # A different id is not positive successor proof:
-                            # it may be a duplicate terminal from any earlier
-                            # completed response.  The target compatibility
-                            # shape omits response ids, so keep this ambiguous
-                            # adjacent shape quarantined instead of weakening
-                            # the existing stale-id boundary.
-                            continue
                     if finalize_response is False:
                         continue
                     self._clear_turn_response_state()
@@ -3254,6 +3142,7 @@ class _TransportMixin:
                     self._reset_per_turn_output_state()
                     await self._notify_turn_finished(
                         connection_still_ours=receive_owner_is_current,
+                        carry_host_turn_forward=True,
                     )
                     if await retire_if_replaced():
                         return
@@ -3346,8 +3235,6 @@ class _TransportMixin:
                     self._client_vad_last_speech_time = _now
                     self._user_recent_activity_time = _now
                 elif event_type == "conversation.item.input_audio_transcription.completed":
-                    transcript_host_turn_id = self._read_host_turn_id()
-                    quarantine_at_ingress = self._idless_quarantine
                     already_scoped = self._raw_transcript_was_already_scoped(
                         event.get("item_id")
                     )
@@ -3357,51 +3244,15 @@ class _TransportMixin:
                         # first authoritative signal that a new user turn has
                         # begun, so stale tool work must retire here.
                         self.note_user_turn_started()
-                    transcript_scope_generation = self._tool_scope_generation
                     self._print_input_transcript = True
                     transcript = event.get("transcript", "")
-                    accepted = True
                     if self.on_input_transcript or self.on_input_transcript_with_route:
-                        accepted = await self._deliver_input_transcript(
+                        await self._deliver_input_transcript(
                             transcript,
                             item_id=event.get("item_id"),
                         )
                         if await retire_if_replaced():
                             return
-                    quarantine_scope = self._idless_quarantine_scope
-                    live_host_turn_id = self._read_host_turn_id()
-                    quarantine_armed_during_callback = bool(
-                        not quarantine_at_ingress
-                        and self._idless_quarantine
-                        and quarantine_scope is not None
-                        and quarantine_scope[0] == transcript_scope_generation
-                    )
-                    if (
-                        accepted
-                        and self._idless_quarantine
-                        and quarantine_scope is not None
-                        and self._tool_scope_generation
-                        == transcript_scope_generation
-                        and (
-                            transcript_scope_generation != quarantine_scope[0]
-                            or quarantine_armed_during_callback
-                        )
-                        and (
-                            live_host_turn_id is None
-                            or live_host_turn_id == transcript_host_turn_id
-                            or (
-                                quarantine_armed_during_callback
-                                and live_host_turn_id
-                                == self._current_turn_host_id
-                            )
-                        )
-                    ):
-                        self._idless_quarantine_scope = (
-                            transcript_scope_generation,
-                            True,
-                            False,
-                            quarantine_scope[3],
-                        )
                 elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
                     self._print_input_transcript = False
                     # [ISSUE4b] Voice-without-text fix. Audio deltas and transcript
