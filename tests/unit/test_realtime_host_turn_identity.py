@@ -668,13 +668,9 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
     async def deliver_transcript(_text, _is_first):
         return None
 
-    async def deliver_text(_text, _is_first):
-        return None
-
     client = _free_client(
         host,
         get_host_turn_id=host.read_speech_id,
-        on_text_delta=deliver_text,
         on_output_transcript=deliver_transcript,
     )
     socket = _RecordingSocket()
@@ -741,6 +737,63 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
         "response_done",
         "sid_rotate",
     ]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_never_announcing_no_vad_connection_ignores_a_duplicate_terminal():
+    """A repeated id-less terminal cannot rotate a never-announced turn twice."""
+
+    host = _Host()
+    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+    socket = _RecordingSocket()
+    client.ws = socket
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.audio.delta", "delta": ""})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert client._announces_responses is False
+    assert host.calls == ["response_done", "sid_rotate"]
+
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_idless_cancelled_terminal_reaches_the_arbiter_without_content():
+    """Cancellation is lifecycle evidence, not a duplicate completed terminal."""
+
+    host = _Host()
+    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+    socket = _RecordingSocket()
+    client.ws = socket
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "first"}})
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "first", "status": "completed"},
+        }
+    )
+    await _settle()
+    host.calls.clear()
+
+    socket.feed({"type": "response.done", "response": {"status": "canceled"}})
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
 
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)

@@ -3107,12 +3107,18 @@ class _TransportMixin:
                             if isinstance(event.get("response"), dict)
                             else None
                     )
+                    terminal_response = event.get("response")
+                    terminal_status = (
+                        str(terminal_response.get("status") or "").strip().lower()
+                        if isinstance(terminal_response, dict)
+                        else ""
+                    )
                     self.close_raw_tool_batch(terminal_response_id)
                     if (
                         not self._has_server_vad
-                        and self._announces_responses
                         and self._current_response_id is None
                         and terminal_response_id is None
+                        and terminal_status in {"", "completed", "success", "succeeded"}
                         and self._audio_delta_count == 0
                         and not self._current_response_transcript
                         and self._current_item_id is None
@@ -3301,13 +3307,16 @@ class _TransportMixin:
 
                 if not self._skip_until_next_response and not self._interrupted:
                     if event_type in ["response.text.delta", "response.output_text.delta"]:
-                        if self.on_text_delta:
-                            if "glm" not in self._model_lower:
+                        if "glm" not in self._model_lower:
+                            is_first_text_chunk = self._is_first_text_chunk
+                            self._is_first_text_chunk = False
+                            if self.on_text_delta:
                                 self._ai_recent_activity_time = time.time()
-                                await self.on_text_delta(event["delta"], self._is_first_text_chunk)
+                                await self.on_text_delta(
+                                    event["delta"], is_first_text_chunk
+                                )
                                 if await retire_if_replaced():
                                     return
-                                self._is_first_text_chunk = False
                     elif event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         self._audio_delta_count += 1
                         self._audio_delta_total += 1
