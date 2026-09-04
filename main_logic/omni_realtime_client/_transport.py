@@ -935,7 +935,7 @@ class _TransportMixin:
                     return False
                 if (
                     event.get("type") == "response.create"
-                    and not self._has_server_vad
+                    and not getattr(self, "_has_server_vad", True)
                 ):
                     # External ASR/text/proactive turns rotate the host speech
                     # id before their explicit create reaches this transport.
@@ -2980,13 +2980,6 @@ class _TransportMixin:
                     if (
                         event_response_id is not None
                         and event_response_id != tracked_text
-                        and not (
-                            event_type == "response.done"
-                            and self._idless_quarantine
-                            and quarantine_scope is not None
-                            and quarantine_scope[1]
-                            and event_response_id != quarantine_scope[3]
-                        )
                         # ...unless this connection has never announced a
                         # response at all. A provider that omits
                         # response.created never writes _current_response_id,
@@ -3221,12 +3214,14 @@ class _TransportMixin:
                                 # unidentifiable late terminal may release the
                                 # arbiter lane, but must not finalize the host again.
                                 continue
-                        elif finalize_response is not False:
-                            # A different identified terminal cannot belong to
-                            # the released response.  It ends the successor and
-                            # closes the quarantine before the next id-less turn.
-                            self._idless_quarantine = False
-                            self._idless_quarantine_scope = None
+                        elif terminal_response_id is not None:
+                            # A different id is not positive successor proof:
+                            # it may be a duplicate terminal from any earlier
+                            # completed response.  The target compatibility
+                            # shape omits response ids, so keep this ambiguous
+                            # adjacent shape quarantined instead of weakening
+                            # the existing stale-id boundary.
+                            continue
                     if finalize_response is False:
                         continue
                     self._clear_turn_response_state()

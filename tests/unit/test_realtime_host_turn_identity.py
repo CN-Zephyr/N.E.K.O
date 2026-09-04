@@ -1127,8 +1127,8 @@ async def test_released_id_content_is_stale_before_any_response_announcement():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_identified_successor_terminal_closes_idless_quarantine():
-    """A different response id ends the successor and its quarantine window."""
+async def test_previously_completed_terminal_id_stays_stale_during_quarantine():
+    """A non-abandoned ID is not proof that a terminal is the successor's."""
 
     host = _Host()
 
@@ -1142,11 +1142,20 @@ async def test_identified_successor_terminal_closes_idless_quarantine():
     )
     socket = _RecordingSocket()
     client.ws = socket
-    client._announces_responses = True
-    client._begin_response_lifecycle("stuck")
-
-    await client._on_arbiter_stuck_release("probe", response_id="stuck")
     receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "older"}})
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "older", "status": "completed"},
+        }
+    )
+    await _settle()
+    client._begin_response_lifecycle("stuck")
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    host.calls.clear()
+
     socket.feed(
         {
             "type": "conversation.item.input_audio_transcription.completed",
@@ -1157,19 +1166,13 @@ async def test_identified_successor_terminal_closes_idless_quarantine():
     socket.feed(
         {
             "type": "response.done",
-            "response": {"id": "successor", "status": "completed"},
+            "response": {"id": "older", "status": "completed"},
         }
     )
     await _settle()
 
-    assert host.calls == [
-        "response_done",
-        "sid_rotate",
-        "response_done",
-        "sid_rotate",
-    ]
-    assert client._idless_quarantine is False
-    assert client._idless_quarantine_scope is None
+    assert host.calls == []
+    assert client._idless_quarantine is True
 
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
