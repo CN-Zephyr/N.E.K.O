@@ -2449,6 +2449,8 @@ class _TransportMixin:
                     # Some no-VAD proxies omit the next response.created and
                     # response id, so its terminal has no other turn owner.
                     self._current_turn_host_id = self._read_host_turn_id()
+                    self._is_first_text_chunk = True
+                    self._is_first_transcript_chunk = True
 
     async def _on_arbiter_stuck_release(
         self, reason: str, response_id: str | None = None
@@ -3110,10 +3112,12 @@ class _TransportMixin:
                         and terminal_response_id is None
                         and self._audio_delta_count == 0
                         and not self._current_response_transcript
+                        and self._is_first_text_chunk
+                        and self._is_first_transcript_chunk
                     ):
                         # The mixed proxy's real id-less reply streams audio or
-                        # transcript content first. With no new content, this is
-                        # only a duplicate terminal from the completed turn.
+                        # text/transcript content first. With no new content,
+                        # this is only a duplicate terminal from the completed turn.
                         continue
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)

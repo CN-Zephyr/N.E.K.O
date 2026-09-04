@@ -668,9 +668,13 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
     async def deliver_transcript(_text, _is_first):
         return None
 
+    async def deliver_text(_text, _is_first):
+        return None
+
     client = _free_client(
         host,
         get_host_turn_id=host.read_speech_id,
+        on_text_delta=deliver_text,
         on_output_transcript=deliver_transcript,
     )
     socket = _RecordingSocket()
@@ -705,6 +709,17 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
     await _settle()
 
     assert host.calls == ["response_done", "sid_rotate"]
+
+    socket.feed({"type": "response.text.delta", "delta": "text reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
 
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
