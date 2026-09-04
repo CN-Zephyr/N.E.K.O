@@ -368,17 +368,21 @@ class _TransportMixin:
         self._reset_input_route_identity_stream()
         return identity
 
-    async def _deliver_input_transcript(self, transcript: str, *, item_id: object = None) -> None:
+    async def _deliver_input_transcript(
+        self, transcript: str, *, item_id: object = None
+    ) -> bool:
         identity = self._take_input_route_identity(item_id)
         routed_callback = getattr(self, "on_input_transcript_with_route", None)
         if callable(routed_callback):
-            await routed_callback(
+            accepted = await routed_callback(
                 transcript,
                 source_game_route_identity=identity,
             )
-            return
+            return accepted is not False
         if self.on_input_transcript:
-            await self.on_input_transcript(transcript)
+            accepted = await self.on_input_transcript(transcript)
+            return accepted is not False
+        return False
 
     async def connect(self, instructions: str, native_audio=True) -> None:
         """Establish WebSocket connection with the Realtime API."""
@@ -416,6 +420,7 @@ class _TransportMixin:
         # response's events cannot arrive on the new socket) — reset anyway,
         # because 'connection-scoped' should be true by construction.
         self._idless_quarantine = False
+        self._idless_quarantine_scope = None
 
         # ``close()`` releases RNNoise/soxr state. The client object is reused
         # across sessions, so recreate that session-owned processor on demand.
@@ -2242,6 +2247,7 @@ class _TransportMixin:
         # a fail-open release; ordered socket delivery puts this evidence
         # before any later id-less event from the successor.
         self._idless_quarantine = False
+        self._idless_quarantine_scope = None
         self._is_first_text_chunk = self._is_first_transcript_chunk = True
         self._output_transcript_buffer = ""
         self._current_response_transcript = ""
@@ -2441,6 +2447,12 @@ class _TransportMixin:
                 raise
             except Exception as exc:
                 logger.warning("turn-finished speech-id rotation failed: %s", exc)
+            else:
+                if connection_still_ours is None or connection_still_ours():
+                    # Some no-VAD compatibility proxies omit response.created
+                    # and response ids. The sid produced by this rotation is
+                    # therefore the only stable owner for their next response.
+                    self._current_turn_host_id = self._read_host_turn_id()
 
     async def _on_arbiter_stuck_release(
         self, reason: str, response_id: str | None = None
@@ -2516,6 +2528,10 @@ class _TransportMixin:
                 # instead. Containing an abandoned turn must not mute a live
                 # one.
                 self._idless_quarantine = True
+                self._idless_quarantine_scope = (
+                    self._tool_scope_generation,
+                    False,
+                )
             logger.info(
                 "Arbiter released %s but this turn is tracking %s; leaving it "
                 "alone",
@@ -2614,6 +2630,10 @@ class _TransportMixin:
             # id-less can be attributed. Clearing _current_response_id above
             # quarantines its ID-BEARING events; this covers the rest.
             self._idless_quarantine = True
+            self._idless_quarantine_scope = (
+                self._tool_scope_generation,
+                False,
+            )
             return
         logger.info("Ending abandoned turn after arbiter release: %s", reason)
         # Both release paths raise it: the abandoned response may still be
@@ -2621,6 +2641,10 @@ class _TransportMixin:
         # id-less can be attributed. Clearing _current_response_id above
         # quarantines its ID-BEARING events; this covers the rest.
         self._idless_quarantine = True
+        self._idless_quarantine_scope = (
+            self._tool_scope_generation,
+            False,
+        )
 
         # Captured before the reset, which is what clears the buffer: a stalled
         # lifecycle is exactly the case where the terminal that would normally
@@ -2970,6 +2994,20 @@ class _TransportMixin:
                             self._current_response_id,
                         )
                         continue
+                if (
+                    event_type in ID_BEARING_RESPONSE_CONTENT_EVENT_TYPES
+                    and event_type
+                    not in {
+                        "response.function_call_arguments.delta",
+                        "response.function_call_arguments.done",
+                    }
+                    and self._idless_quarantine
+                    and self._idless_quarantine_scope
+                    == (self._tool_scope_generation, True)
+                ):
+                    # Only content that survived the response-id ownership
+                    # filter can prove the accepted successor has started.
+                    self._idless_quarantine_scope = None
                 # ── Tool calling events ────────────────────────────
                 # Three providers, three flavours of the same idea:
                 #   - OpenAI Realtime (gpt): the canonical event is the
@@ -3087,14 +3125,14 @@ class _TransportMixin:
                     # Ahead of the finalize branches below on purpose: several
                     # of them `continue`, and a stale or non-finalizing
                     # terminal still proves the response is over.
-                    self.close_raw_tool_batch(
-                        _response_id_text(event.get("response_id"))
-                        or _response_id_text(
+                    terminal_response_id = _response_id_text(
+                        event.get("response_id")
+                    ) or _response_id_text(
                             (event.get("response") or {}).get("id")
                             if isinstance(event.get("response"), dict)
                             else None
-                        )
                     )
+                    self.close_raw_tool_batch(terminal_response_id)
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)
                     )
@@ -3102,6 +3140,17 @@ class _TransportMixin:
                     self._last_response_done_time = time.time()
                     # 解析实时 API 返回的 token 用量
                     self._record_response_usage(event.get("response"))
+                    if self._idless_quarantine and terminal_response_id is None:
+                        successor_has_content = (
+                            self._idless_quarantine_scope is None
+                        )
+                        self._idless_quarantine = False
+                        self._idless_quarantine_scope = None
+                        if not successor_has_content:
+                            # The abandoned turn was already finalized. Its
+                            # unidentifiable late terminal may release the
+                            # arbiter lane, but must not finalize the host again.
+                            continue
                     if finalize_response is False:
                         continue
                     self._clear_turn_response_state()
@@ -3226,6 +3275,7 @@ class _TransportMixin:
                     self._client_vad_last_speech_time = _now
                     self._user_recent_activity_time = _now
                 elif event_type == "conversation.item.input_audio_transcription.completed":
+                    transcript_host_turn_id = self._read_host_turn_id()
                     already_scoped = self._raw_transcript_was_already_scoped(
                         event.get("item_id")
                     )
@@ -3238,12 +3288,28 @@ class _TransportMixin:
                     self._print_input_transcript = True
                     transcript = event.get("transcript", "")
                     if self.on_input_transcript or self.on_input_transcript_with_route:
-                        await self._deliver_input_transcript(
+                        accepted = await self._deliver_input_transcript(
                             transcript,
                             item_id=event.get("item_id"),
                         )
                         if await retire_if_replaced():
                             return
+                        quarantine_scope = self._idless_quarantine_scope
+                        if (
+                            accepted
+                            and self._idless_quarantine
+                            and quarantine_scope is not None
+                            and self._tool_scope_generation != quarantine_scope[0]
+                            and (
+                                self.get_host_turn_id is None
+                                or self._read_host_turn_id()
+                                == transcript_host_turn_id
+                            )
+                        ):
+                            self._idless_quarantine_scope = (
+                                self._tool_scope_generation,
+                                True,
+                            )
                 elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
                     self._print_input_transcript = False
                     # [ISSUE4b] Voice-without-text fix. Audio deltas and transcript

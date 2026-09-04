@@ -106,8 +106,10 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         on_audio_done: Optional[Callable[[], Awaitable[None]]] = None,
         on_new_message: Optional[Callable[[], Awaitable[None]]] = None,
         on_sid_rotate: Optional[Callable[[], Awaitable[None]]] = None,
-        on_input_transcript: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_input_transcript_with_route: Optional[Callable[..., Awaitable[None]]] = None,
+        on_input_transcript: Optional[Callable[[str], Awaitable[bool | None]]] = None,
+        on_input_transcript_with_route: Optional[
+            Callable[..., Awaitable[bool | None]]
+        ] = None,
         get_input_route_identity: Optional[Callable[[], "tuple[str, str, str] | None"]] = None,
         on_output_transcript: Optional[Callable[[str, bool], Awaitable[None]]] = None,
         on_connection_error: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -289,6 +291,7 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # effects rather than merely wrong words. Never set on the default
         # fail-closed path, which has no release.
         self._idless_quarantine = False
+        self._idless_quarantine_scope: tuple[int, bool] | None = None
         # Latched the first time this connection sees a response.created.
         # Until then the stale-event filter has no identity to compare
         # against, and an id-bearing terminal cannot belong to anyone but
