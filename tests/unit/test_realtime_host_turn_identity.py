@@ -721,6 +721,27 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
         "sid_rotate",
     ]
 
+    client._start_raw_tool_call = lambda *_args, **_kwargs: None
+    socket.feed(
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "tool-call",
+            "name": "lookup",
+            "arguments": "{}",
+        }
+    )
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
+
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)
 

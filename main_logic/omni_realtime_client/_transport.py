@@ -3042,6 +3042,9 @@ class _TransportMixin:
                         rid = event.get("response_id") or ""
                         idx = event.get("output_index", 0)
                         call_id = f"glm_{rid}_{idx}" if rid else f"glm_call_{int(time.time()*1000)}"
+                    # A function call is a response output item even on
+                    # compatibility proxies that omit output_item.added.
+                    self._current_item_id = event.get("item_id") or call_id
                     # Prefer accumulated delta args if delta path was used.
                     accumulated = self._inflight_tool_args.pop(call_id, None)
                     if accumulated and accumulated.get("arguments"):
@@ -3112,6 +3115,7 @@ class _TransportMixin:
                         and terminal_response_id is None
                         and self._audio_delta_count == 0
                         and not self._current_response_transcript
+                        and self._current_item_id is None
                         and self._is_first_text_chunk
                         and self._is_first_transcript_chunk
                     ):
