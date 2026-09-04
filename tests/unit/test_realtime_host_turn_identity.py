@@ -701,99 +701,22 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
 
     assert host.calls == ["response_done", "sid_rotate"]
 
+    empty_ticket = await client._response_arbiter.enqueue(
+        source="empty-idless-response",
+        response_started_timeout=0.5,
+        response_done_timeout=0.5,
+    )
+    await asyncio.wait_for(empty_ticket.sent, timeout=1)
     socket.feed({"type": "response.done", "response": {"status": "completed"}})
     await _settle()
 
-    assert host.calls == ["response_done", "sid_rotate"]
-
-    socket.feed({"type": "response.text.delta", "delta": "text reply"})
-    socket.feed({"type": "response.done", "response": {"status": "completed"}})
-    await _settle()
-
+    assert empty_ticket.done.done()
     assert host.calls == [
         "response_done",
         "sid_rotate",
         "response_done",
         "sid_rotate",
     ]
-
-    client._start_raw_tool_call = lambda *_args, **_kwargs: None
-    socket.feed(
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "tool-call",
-            "name": "lookup",
-            "arguments": "{}",
-        }
-    )
-    socket.feed({"type": "response.done", "response": {"status": "completed"}})
-    await _settle()
-
-    assert host.calls == [
-        "response_done",
-        "sid_rotate",
-        "response_done",
-        "sid_rotate",
-        "response_done",
-        "sid_rotate",
-    ]
-
-    socket.finish()
-    await asyncio.wait_for(receive_loop, timeout=1)
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_never_announcing_no_vad_connection_ignores_a_duplicate_terminal():
-    """A repeated id-less terminal cannot rotate a never-announced turn twice."""
-
-    host = _Host()
-    client = _free_client(host, get_host_turn_id=host.read_speech_id)
-    socket = _RecordingSocket()
-    client.ws = socket
-    receive_loop = asyncio.create_task(client.handle_messages())
-
-    socket.feed({"type": "response.audio.delta", "delta": ""})
-    socket.feed({"type": "response.done", "response": {"status": "completed"}})
-    await _settle()
-
-    assert client._announces_responses is False
-    assert host.calls == ["response_done", "sid_rotate"]
-
-    socket.feed({"type": "response.done", "response": {"status": "completed"}})
-    await _settle()
-
-    assert host.calls == ["response_done", "sid_rotate"]
-
-    socket.finish()
-    await asyncio.wait_for(receive_loop, timeout=1)
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_idless_cancelled_terminal_reaches_the_arbiter_without_content():
-    """Cancellation is lifecycle evidence, not a duplicate completed terminal."""
-
-    host = _Host()
-    client = _free_client(host, get_host_turn_id=host.read_speech_id)
-    socket = _RecordingSocket()
-    client.ws = socket
-    receive_loop = asyncio.create_task(client.handle_messages())
-
-    socket.feed({"type": "response.created", "response": {"id": "first"}})
-    socket.feed(
-        {
-            "type": "response.done",
-            "response": {"id": "first", "status": "completed"},
-        }
-    )
-    await _settle()
-    host.calls.clear()
-
-    socket.feed({"type": "response.done", "response": {"status": "canceled"}})
-    await _settle()
-
-    assert host.calls == ["response_done", "sid_rotate"]
 
     socket.finish()
     await asyncio.wait_for(receive_loop, timeout=1)

@@ -3042,9 +3042,6 @@ class _TransportMixin:
                         rid = event.get("response_id") or ""
                         idx = event.get("output_index", 0)
                         call_id = f"glm_{rid}_{idx}" if rid else f"glm_call_{int(time.time()*1000)}"
-                    # A function call is a response output item even on
-                    # compatibility proxies that omit output_item.added.
-                    self._current_item_id = event.get("item_id") or call_id
                     # Prefer accumulated delta args if delta path was used.
                     accumulated = self._inflight_tool_args.pop(call_id, None)
                     if accumulated and accumulated.get("arguments"):
@@ -3100,35 +3097,14 @@ class _TransportMixin:
                     # Ahead of the finalize branches below on purpose: several
                     # of them `continue`, and a stale or non-finalizing
                     # terminal still proves the response is over.
-                    terminal_response_id = _response_id_text(
-                        event.get("response_id")
-                    ) or _response_id_text(
+                    self.close_raw_tool_batch(
+                        _response_id_text(event.get("response_id"))
+                        or _response_id_text(
                             (event.get("response") or {}).get("id")
                             if isinstance(event.get("response"), dict)
                             else None
+                        )
                     )
-                    terminal_response = event.get("response")
-                    terminal_status = (
-                        str(terminal_response.get("status") or "").strip().lower()
-                        if isinstance(terminal_response, dict)
-                        else ""
-                    )
-                    self.close_raw_tool_batch(terminal_response_id)
-                    if (
-                        not self._has_server_vad
-                        and self._current_response_id is None
-                        and terminal_response_id is None
-                        and terminal_status in {"", "completed", "success", "succeeded"}
-                        and self._audio_delta_count == 0
-                        and not self._current_response_transcript
-                        and self._current_item_id is None
-                        and self._is_first_text_chunk
-                        and self._is_first_transcript_chunk
-                    ):
-                        # The mixed proxy's real id-less reply streams audio or
-                        # text/transcript content first. With no new content,
-                        # this is only a duplicate terminal from the completed turn.
-                        continue
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)
                     )
@@ -3307,16 +3283,13 @@ class _TransportMixin:
 
                 if not self._skip_until_next_response and not self._interrupted:
                     if event_type in ["response.text.delta", "response.output_text.delta"]:
-                        if "glm" not in self._model_lower:
-                            is_first_text_chunk = self._is_first_text_chunk
-                            self._is_first_text_chunk = False
-                            if self.on_text_delta:
+                        if self.on_text_delta:
+                            if "glm" not in self._model_lower:
                                 self._ai_recent_activity_time = time.time()
-                                await self.on_text_delta(
-                                    event["delta"], is_first_text_chunk
-                                )
+                                await self.on_text_delta(event["delta"], self._is_first_text_chunk)
                                 if await retire_if_replaced():
                                     return
+                                self._is_first_text_chunk = False
                     elif event_type in ["response.audio.delta", "response.output_audio.delta"]:
                         self._audio_delta_count += 1
                         self._audio_delta_total += 1
