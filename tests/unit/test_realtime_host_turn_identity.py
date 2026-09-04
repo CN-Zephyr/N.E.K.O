@@ -1045,6 +1045,42 @@ async def test_unreadable_host_id_does_not_hide_an_accepted_successor():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_callbackless_transcript_still_proves_an_idless_successor():
+    """A client without a transcript sink still owns its completed turn."""
+
+    host = _Host()
+    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._begin_response_lifecycle("stuck")
+
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "callbackless-user",
+            "transcript": "next",
+        }
+    )
+    socket.feed({"type": "response.audio_transcript.delta", "delta": "reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
+    assert client._idless_quarantine is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_released_id_content_is_stale_before_any_response_announcement():
     """The released response id stays authoritative on no-created routes."""
 

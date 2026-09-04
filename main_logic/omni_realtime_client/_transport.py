@@ -3365,6 +3365,7 @@ class _TransportMixin:
                     transcript_scope_generation = self._tool_scope_generation
                     self._print_input_transcript = True
                     transcript = event.get("transcript", "")
+                    accepted = True
                     if self.on_input_transcript or self.on_input_transcript_with_route:
                         accepted = await self._deliver_input_transcript(
                             transcript,
@@ -3372,40 +3373,40 @@ class _TransportMixin:
                         )
                         if await retire_if_replaced():
                             return
-                        quarantine_scope = self._idless_quarantine_scope
-                        live_host_turn_id = self._read_host_turn_id()
-                        quarantine_armed_during_callback = bool(
-                            not quarantine_at_ingress
-                            and self._idless_quarantine
-                            and quarantine_scope is not None
-                            and quarantine_scope[0] == transcript_scope_generation
+                    quarantine_scope = self._idless_quarantine_scope
+                    live_host_turn_id = self._read_host_turn_id()
+                    quarantine_armed_during_callback = bool(
+                        not quarantine_at_ingress
+                        and self._idless_quarantine
+                        and quarantine_scope is not None
+                        and quarantine_scope[0] == transcript_scope_generation
+                    )
+                    if (
+                        accepted
+                        and self._idless_quarantine
+                        and quarantine_scope is not None
+                        and self._tool_scope_generation
+                        == transcript_scope_generation
+                        and (
+                            transcript_scope_generation != quarantine_scope[0]
+                            or quarantine_armed_during_callback
                         )
-                        if (
-                            accepted
-                            and self._idless_quarantine
-                            and quarantine_scope is not None
-                            and self._tool_scope_generation
-                            == transcript_scope_generation
-                            and (
-                                transcript_scope_generation != quarantine_scope[0]
-                                or quarantine_armed_during_callback
+                        and (
+                            live_host_turn_id is None
+                            or live_host_turn_id == transcript_host_turn_id
+                            or (
+                                quarantine_armed_during_callback
+                                and live_host_turn_id
+                                == self._current_turn_host_id
                             )
-                            and (
-                                live_host_turn_id is None
-                                or live_host_turn_id == transcript_host_turn_id
-                                or (
-                                    quarantine_armed_during_callback
-                                    and live_host_turn_id
-                                    == self._current_turn_host_id
-                                )
-                            )
-                        ):
-                            self._idless_quarantine_scope = (
-                                transcript_scope_generation,
-                                True,
-                                False,
-                                quarantine_scope[3],
-                            )
+                        )
+                    ):
+                        self._idless_quarantine_scope = (
+                            transcript_scope_generation,
+                            True,
+                            False,
+                            quarantine_scope[3],
+                        )
                 elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
                     self._print_input_transcript = False
                     # [ISSUE4b] Voice-without-text fix. Audio deltas and transcript
