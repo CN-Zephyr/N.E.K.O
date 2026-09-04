@@ -746,6 +746,39 @@ async def test_stuck_release_does_not_carry_ownership_to_a_late_terminal():
     await asyncio.wait_for(receive_loop, timeout=1)
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["canceled", "failed", "incomplete"])
+async def test_abnormal_terminal_does_not_carry_host_turn_forward(status):
+    """Only successful completion may own a later unannounced response."""
+
+    host = _Host()
+    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+    socket = _RecordingSocket()
+    client.ws = socket
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "abnormal"}})
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "abnormal", "status": status},
+        }
+    )
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
+    assert client._current_turn_host_id == "sid-turn-1"
+    assert host.speech_id == "sid-rotated-by-hook"
+
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+    assert host.calls == ["response_done", "sid_rotate"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
 # ---------------------------------------------------------------------------
 # Contract 1: the host moved on before the notification ran.
 # ---------------------------------------------------------------------------

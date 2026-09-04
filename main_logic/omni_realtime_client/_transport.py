@@ -3105,6 +3105,12 @@ class _TransportMixin:
                             else None
                         )
                     )
+                    response = event.get("response")
+                    response_status = (
+                        str(response.get("status") or "").strip().lower()
+                        if isinstance(response, dict)
+                        else ""
+                    )
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)
                     )
@@ -3144,7 +3150,8 @@ class _TransportMixin:
                     self._reset_per_turn_output_state()
                     await self._notify_turn_finished(
                         connection_still_ours=receive_owner_is_current,
-                        carry_host_turn_forward=True,
+                        carry_host_turn_forward=response_status
+                        in {"", "completed", "success", "succeeded"},
                     )
                     if await retire_if_replaced():
                         return
