@@ -291,7 +291,13 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # effects rather than merely wrong words. Never set on the default
         # fail-closed path, which has no release.
         self._idless_quarantine = False
-        self._idless_quarantine_scope: tuple[int, bool] | None = None
+        # (tool-scope generation, accepted successor, successor content,
+        # abandoned response id).  This remains one connection-local marker;
+        # the response id only keeps identified late events from being used as
+        # evidence for the successor on never-announcing compatibility routes.
+        self._idless_quarantine_scope: (
+            tuple[int, bool, bool, str | None] | None
+        ) = None
         # Latched the first time this connection sees a response.created.
         # Until then the stale-event filter has no identity to compare
         # against, and an id-bearing terminal cannot belong to anyone but

@@ -999,6 +999,226 @@ async def test_quarantined_idless_tool_cannot_release_terminal_quarantine():
     await asyncio.wait_for(receive_loop, timeout=1)
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_unreadable_host_id_does_not_hide_an_accepted_successor():
+    """An unavailable host accessor keeps the legacy fail-open behaviour."""
+
+    host = _Host()
+
+    async def accept_transcript(_text, **_kwargs):
+        return True
+
+    client = _free_client(
+        host,
+        get_host_turn_id=lambda: None,
+        on_input_transcript_with_route=accept_transcript,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._begin_response_lifecycle("stuck")
+
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "accepted-user",
+            "transcript": "next",
+        }
+    )
+    socket.feed({"type": "response.audio_transcript.delta", "delta": "reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
+    assert client._idless_quarantine is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_released_id_content_is_stale_before_any_response_announcement():
+    """The released response id stays authoritative on no-created routes."""
+
+    host = _Host()
+
+    async def accept_transcript(_text, **_kwargs):
+        return True
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_input_transcript_with_route=accept_transcript,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._begin_response_lifecycle("stuck")
+
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    assert client._announces_responses is False
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "accepted-user",
+            "transcript": "next",
+        }
+    )
+    socket.feed(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "stuck",
+            "delta": "old reply",
+        }
+    )
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
+    assert client._idless_quarantine is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_identified_successor_terminal_closes_idless_quarantine():
+    """A different response id ends the successor and its quarantine window."""
+
+    host = _Host()
+
+    async def accept_transcript(_text, **_kwargs):
+        return True
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_input_transcript_with_route=accept_transcript,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._announces_responses = True
+    client._begin_response_lifecycle("stuck")
+
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "accepted-user",
+            "transcript": "next",
+        }
+    )
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "successor", "status": "completed"},
+        }
+    )
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
+    assert client._idless_quarantine is False
+    assert client._idless_quarantine_scope is None
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_successor_transcript_survives_a_concurrent_stuck_release():
+    """A release during the accepted callback cannot erase that successor."""
+
+    host = _Host()
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def block_transcript(_text, **_kwargs):
+        callback_started.set()
+        await callback_release.wait()
+        return True
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_input_transcript_with_route=block_transcript,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._begin_response_lifecycle("stuck")
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "successor-user",
+            "transcript": "next",
+        }
+    )
+    await asyncio.wait_for(callback_started.wait(), timeout=1)
+
+    await client._on_arbiter_stuck_release("probe", response_id="stuck")
+    assert host.calls == ["response_done", "sid_rotate"]
+    callback_release.set()
+    await _settle()
+    socket.feed({"type": "response.audio_transcript.delta", "delta": "reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == [
+        "response_done",
+        "sid_rotate",
+        "response_done",
+        "sid_rotate",
+    ]
+    assert client._idless_quarantine is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_explicit_create_captures_an_external_no_vad_turn():
+    """The wire send owns a host turn even when no created event follows."""
+
+    host = _Host()
+    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._begin_response_lifecycle("first")
+    await client._notify_turn_finished()
+    host.calls.clear()
+
+    host.starts_a_new_turn()
+    await client.send_event({"type": "response.create"})
+    assert client._current_turn_host_id == "sid-turn-2"
+
+    receive_loop = asyncio.create_task(client.handle_messages())
+    socket.feed({"type": "response.audio_transcript.delta", "delta": "reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
 # ---------------------------------------------------------------------------
 # Contract 1: the host moved on before the notification ran.
 # ---------------------------------------------------------------------------
