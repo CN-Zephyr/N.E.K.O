@@ -3095,14 +3095,26 @@ class _TransportMixin:
                     # Ahead of the finalize branches below on purpose: several
                     # of them `continue`, and a stale or non-finalizing
                     # terminal still proves the response is over.
-                    self.close_raw_tool_batch(
-                        _response_id_text(event.get("response_id"))
-                        or _response_id_text(
+                    terminal_response_id = _response_id_text(
+                        event.get("response_id")
+                    ) or _response_id_text(
                             (event.get("response") or {}).get("id")
                             if isinstance(event.get("response"), dict)
                             else None
-                        )
                     )
+                    self.close_raw_tool_batch(terminal_response_id)
+                    if (
+                        not self._has_server_vad
+                        and self._announces_responses
+                        and self._current_response_id is None
+                        and terminal_response_id is None
+                        and self._audio_delta_count == 0
+                        and not self._current_response_transcript
+                    ):
+                        # The mixed proxy's real id-less reply streams audio or
+                        # transcript content first. With no new content, this is
+                        # only a duplicate terminal from the completed turn.
+                        continue
                     finalize_response = (
                         self._response_arbiter.notify_response_terminal(event)
                     )

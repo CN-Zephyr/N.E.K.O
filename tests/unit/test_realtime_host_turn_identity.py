@@ -664,7 +664,15 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
     """An id-less no-VAD response still finishes under the rotated host turn."""
 
     host = _Host()
-    client = _free_client(host, get_host_turn_id=host.read_speech_id)
+
+    async def deliver_transcript(_text, _is_first):
+        return None
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_output_transcript=deliver_transcript,
+    )
     socket = _RecordingSocket()
     client.ws = socket
     receive_loop = asyncio.create_task(client.handle_messages())
@@ -688,6 +696,11 @@ async def test_no_vad_rotation_owns_the_next_unannounced_response():
         }
     )
     socket.feed({"type": "response.audio_transcript.delta", "delta": "reply"})
+    socket.feed({"type": "response.done", "response": {"status": "completed"}})
+    await _settle()
+
+    assert host.calls == ["response_done", "sid_rotate"]
+
     socket.feed({"type": "response.done", "response": {"status": "completed"}})
     await _settle()
 
