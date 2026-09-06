@@ -65,6 +65,8 @@ def test_export_filter_rejects_invalid_suffix(tmp_path: Path):
     # 能通过 *.log* 初筛但会被二次过滤拒绝
     (tmp_path / "N.E.K.O_Plugin_demo_20260906X.log").touch()  # 日期后有非法字符
     (tmp_path / "N.E.K.O_Plugin_demo_errorX.log").touch()  # error 后有非法字符
+    (tmp_path / "N.E.K.O_Plugin_demo_20260906.log.tmp").touch()  # .log 后有非数字后缀
+    (tmp_path / "N.E.K.O_Plugin_demo_error.logX").touch()  # .log 后有非数字后缀
 
     files = list_plugin_log_files_for_export(tmp_path, "demo")
     names = {f.name for f in files}
@@ -75,3 +77,5 @@ def test_export_filter_rejects_invalid_suffix(tmp_path: Path):
     assert "N.E.K.O_Plugin_demo_20260906" not in names
     assert "N.E.K.O_Plugin_demo_20260906X.log" not in names
     assert "N.E.K.O_Plugin_demo_errorX.log" not in names
+    assert "N.E.K.O_Plugin_demo_20260906.log.tmp" not in names
+    assert "N.E.K.O_Plugin_demo_error.logX" not in names
