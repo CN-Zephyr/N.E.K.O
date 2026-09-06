@@ -268,9 +268,12 @@ def list_plugin_log_files_for_export(log_dir: Path, plugin_id: str) -> list[Path
         # 匹配 N.E.K.O_Plugin_{safe_id}_{YYYYMMDD}.log[.轮转后缀]
         # 或     N.E.K.O_Plugin_{safe_id}_error.log[.轮转后缀]
         # 轮转后缀：RotatingFileHandler 使用 .1, .2, ... 纯数字后缀
+        #           TimedRotatingFileHandler 使用 .YYYY-MM-DD 日期后缀
         expected_prefix = f"N.E.K.O_Plugin_{safe_id}_"
-        date_pattern = re.compile(r"^\d{8}\.log(?:\.\d+)?$")  # YYYYMMDD.log 或 YYYYMMDD.log.1
-        error_pattern = re.compile(r"^error\.log(?:\.\d+)?$")  # error.log 或 error.log.1
+        # YYYYMMDD.log 或 YYYYMMDD.log.1 或 YYYYMMDD.log.2026-04-21
+        date_pattern = re.compile(r"^\d{8}\.log(?:\.\d+|\.\d{4}-\d{2}-\d{2})?$")
+        # error.log 或 error.log.1 或 error.log.2026-04-21
+        error_pattern = re.compile(r"^error\.log(?:\.\d+|\.\d{4}-\d{2}-\d{2})?$")
 
         filtered = []
         for p in candidates:

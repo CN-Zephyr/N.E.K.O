@@ -27,18 +27,22 @@ def test_export_filter_prevents_prefix_leak(tmp_path: Path):
 def test_export_filter_includes_rotated_logs(tmp_path: Path):
     """导出应包含轮转日志和错误日志"""
     (tmp_path / "N.E.K.O_Plugin_demo_20260906.log").touch()
-    (tmp_path / "N.E.K.O_Plugin_demo_20260905.log.1").touch()
+    (tmp_path / "N.E.K.O_Plugin_demo_20260905.log.1").touch()  # RotatingFileHandler 数字后缀
+    (tmp_path / "N.E.K.O_Plugin_demo_20260904.log.2026-09-04").touch()  # TimedRotatingFileHandler 日期后缀
     (tmp_path / "N.E.K.O_Plugin_demo_error.log").touch()
-    (tmp_path / "N.E.K.O_Plugin_demo_error.log.2").touch()
+    (tmp_path / "N.E.K.O_Plugin_demo_error.log.2").touch()  # RotatingFileHandler 数字后缀
+    (tmp_path / "N.E.K.O_Plugin_demo_error.log.2026-09-03").touch()  # TimedRotatingFileHandler 日期后缀
 
     files = list_plugin_log_files_for_export(tmp_path, "demo")
     names = {f.name for f in files}
 
-    assert len(names) == 4
+    assert len(names) == 6
     assert "N.E.K.O_Plugin_demo_20260906.log" in names
     assert "N.E.K.O_Plugin_demo_20260905.log.1" in names
+    assert "N.E.K.O_Plugin_demo_20260904.log.2026-09-04" in names
     assert "N.E.K.O_Plugin_demo_error.log" in names
     assert "N.E.K.O_Plugin_demo_error.log.2" in names
+    assert "N.E.K.O_Plugin_demo_error.log.2026-09-03" in names
 
 
 def test_export_filter_uses_sanitized_id(tmp_path: Path):
