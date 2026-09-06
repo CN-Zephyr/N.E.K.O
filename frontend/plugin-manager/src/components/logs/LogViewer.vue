@@ -211,7 +211,11 @@ async function handleExportLog() {
     console.error('Failed to export log:', error)
     ElMessage.error(t('logs.exportFailed'))
   } finally {
-    if (objectUrl) URL.revokeObjectURL(objectUrl)
+    // 延迟撤销 Blob URL，避免浏览器尚未解析 href 时就撤销导致下载失败
+    if (objectUrl) {
+      const urlToRevoke = objectUrl
+      setTimeout(() => URL.revokeObjectURL(urlToRevoke), 0)
+    }
   }
 }
 
