@@ -111,23 +111,30 @@ const hasDesktopBridge = computed(() => {
 // 客户端无法打开或可能错误打开本地同名路径。
 const isLocalBackend = computed(() => {
   const baseUrl = API_BASE_URL.replace(/\/$/, '')
-  // 空字符串表示通过 Vite 代理，但 VITE_BACKEND_URL 可能指向远程服务器，
-  // 运行时无法获取构建时环境变量。为安全起见，开发模式下禁用目录打开功能。
-  if (!baseUrl) return false
 
-  // 解析 URL 来提取 hostname，支持带路径的 URL（如 http://localhost:8000/api）
-  try {
-    const url = new URL(baseUrl, window.location.origin)
-    const hostname = url.hostname.toLowerCase()
-    // 只允许回环地址：localhost, 127.0.0.1, 0.0.0.0, ::1
-    return hostname === 'localhost' ||
-           hostname === '127.0.0.1' ||
-           hostname === '0.0.0.0' ||
-           hostname === '::1'
-  } catch {
-    // URL 解析失败，视为非本地
-    return false
+  let hostname: string
+  if (!baseUrl) {
+    // 空字符串表示通过 Vite 代理。从构建时注入的变量获取代理目标的 hostname。
+    // 生产环境中该变量未定义，默认为 'localhost'（但生产环境 baseUrl 不会为空）。
+    hostname = (typeof __VITE_PROXY_TARGET_HOSTNAME__ !== 'undefined'
+                ? __VITE_PROXY_TARGET_HOSTNAME__
+                : 'localhost').toLowerCase()
+  } else {
+    // 有明确的 API_BASE_URL，解析它来提取 hostname
+    try {
+      const url = new URL(baseUrl, window.location.origin)
+      hostname = url.hostname.toLowerCase()
+    } catch {
+      // URL 解析失败，视为非本地
+      return false
+    }
   }
+
+  // 只允许回环地址：localhost, 127.0.0.1, 0.0.0.0, ::1
+  return hostname === 'localhost' ||
+         hostname === '127.0.0.1' ||
+         hostname === '0.0.0.0' ||
+         hostname === '::1'
 })
 
 // 只有同时满足：有桌面桥接 AND 后端是本地时，才能安全打开目录
