@@ -81,7 +81,13 @@ export function openLocalPath(path: string): Promise<void> {
     })
   }
   if (host.electronShell && typeof host.electronShell.openPath === 'function') {
-    return Promise.resolve(host.electronShell.openPath(target)).then(() => undefined)
+    return Promise.resolve(host.electronShell.openPath(target)).then((result) => {
+      // Electron shell.openPath 返回 Promise<string>：空字符串表示成功，非空字符串是错误消息
+      if (typeof result === 'string' && result !== '') {
+        throw new Error(result)
+      }
+      return undefined
+    })
   }
   if (host.electronShell && typeof host.electronShell.showItemInFolder === 'function') {
     return Promise.resolve(host.electronShell.showItemInFolder(target)).then(() => undefined)

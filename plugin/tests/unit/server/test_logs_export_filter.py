@@ -62,6 +62,9 @@ def test_export_filter_rejects_invalid_suffix(tmp_path: Path):
     (tmp_path / "N.E.K.O_Plugin_demo_20260906.log").touch()
     (tmp_path / "N.E.K.O_Plugin_demo_badfile.txt").touch()  # 不符合规范
     (tmp_path / "N.E.K.O_Plugin_demo_20260906").touch()  # 缺少 .log
+    # 能通过 *.log* 初筛但会被二次过滤拒绝
+    (tmp_path / "N.E.K.O_Plugin_demo_20260906X.log").touch()  # 日期后有非法字符
+    (tmp_path / "N.E.K.O_Plugin_demo_errorX.log").touch()  # error 后有非法字符
 
     files = list_plugin_log_files_for_export(tmp_path, "demo")
     names = {f.name for f in files}
@@ -70,3 +73,5 @@ def test_export_filter_rejects_invalid_suffix(tmp_path: Path):
     assert "N.E.K.O_Plugin_demo_20260906.log" in names
     assert "N.E.K.O_Plugin_demo_badfile.txt" not in names
     assert "N.E.K.O_Plugin_demo_20260906" not in names
+    assert "N.E.K.O_Plugin_demo_20260906X.log" not in names
+    assert "N.E.K.O_Plugin_demo_errorX.log" not in names
