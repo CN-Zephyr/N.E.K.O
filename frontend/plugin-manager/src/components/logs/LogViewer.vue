@@ -131,10 +131,12 @@ const isLocalBackend = computed(() => {
   }
 
   // 只允许回环地址：localhost, 127.0.0.1, 0.0.0.0, ::1
+  // 注意：URL 解析 IPv6 地址时会保留方括号，所以需要检查 [::1]
   return hostname === 'localhost' ||
          hostname === '127.0.0.1' ||
          hostname === '0.0.0.0' ||
-         hostname === '::1'
+         hostname === '::1' ||
+         hostname === '[::1]'
 })
 
 // 只有同时满足：有桌面桥接 AND 后端是本地时，才能安全打开目录
