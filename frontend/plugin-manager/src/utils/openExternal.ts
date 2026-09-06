@@ -58,9 +58,9 @@ export function openExternalUrl(url: string): void {
   window.open(href, '_blank', 'noopener,noreferrer')
 }
 
-export function openLocalPath(path: string): void {
+export function openLocalPath(path: string): Promise<void> {
   const raw = String(path || '').trim()
-  if (!isLocalPath(raw)) return
+  if (!isLocalPath(raw)) return Promise.reject(new Error('Not a valid local path'))
   const target = normalizeLocalPath(raw)
   const host = (window as unknown as {
     nekoHost?: { openPath?: (payload: { path: string }) => void | Promise<unknown> }
@@ -71,28 +71,19 @@ export function openLocalPath(path: string): void {
     }
   })
   if (host.nekoHost && typeof host.nekoHost.openPath === 'function') {
-    Promise.resolve(host.nekoHost.openPath({ path: target })).catch((err) => {
-      console.warn('[openLocalPath] nekoHost.openPath failed:', err)
-    })
-    return
+    return Promise.resolve(host.nekoHost.openPath({ path: target })).then(() => undefined)
   }
   if (host.electronShell && typeof host.electronShell.openPath === 'function') {
-    Promise.resolve(host.electronShell.openPath(target)).catch((err) => {
-      console.warn('[openLocalPath] electronShell.openPath failed:', err)
-    })
-    return
+    return Promise.resolve(host.electronShell.openPath(target)).then(() => undefined)
   }
   if (host.electronShell && typeof host.electronShell.showItemInFolder === 'function') {
-    Promise.resolve(host.electronShell.showItemInFolder(target)).catch((err) => {
-      console.warn('[openLocalPath] electronShell.showItemInFolder failed:', err)
-    })
-    return
+    return Promise.resolve(host.electronShell.showItemInFolder(target)).then(() => undefined)
   }
   if (host.electronShell && typeof host.electronShell.openExternal === 'function') {
-    Promise.resolve(host.electronShell.openExternal(localPathToFileUrl(target))).catch((err) => {
-      console.warn('[openLocalPath] electronShell.openExternal(file://) failed:', err)
-    })
+    return Promise.resolve(host.electronShell.openExternal(localPathToFileUrl(target))).then(() => undefined)
   }
+  // 纯浏览器环境：没有桌面桥接
+  return Promise.reject(new Error('No desktop bridge available'))
 }
 
 function isLocalPath(value: string): boolean {

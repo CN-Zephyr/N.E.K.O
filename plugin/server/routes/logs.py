@@ -91,43 +91,64 @@ async def export_plugin_log_endpoint(plugin_id: str, _: str = require_admin) -> 
         result = log_query_service.get_plugin_log_directory(plugin_id)
         log_dir = Path(result["directory"])
 
-        # 创建临时目录用于存放日志文件副本和 zip
+        # 创建临时目录用于打包
         temp_dir = Path(tempfile.mkdtemp())
         temp_log_dir = temp_dir / "logs"
         temp_log_dir.mkdir()
 
-        # 只收集当前插件自己的日志文件：logs/plugin/ 是所有插件共享的，
-        # 直接打包整个目录会把别的插件日志一起泄漏出去。
-        copied_count = 0
-        for log_file in list_plugin_log_files_for_export(log_dir, plugin_id):
-            shutil.copy2(log_file, temp_log_dir / log_file.name)
-            copied_count += 1
+        # 确保异常路径也会清理临时目录
+        temp_needs_cleanup = True
 
-        if copied_count == 0:
-            cleanup_temp_path(str(temp_dir))
-            raise ServerDomainError(
-                code="NO_LOG_FILES",
-                message="No log files found for this plugin",
-                status_code=404,
-                details={"plugin_id": plugin_id}
+        try:
+            # 只收集当前插件自己的日志文件：logs/plugin/ 是所有插件共享的，
+            # 直接打包整个目录会把别的插件日志一起泄漏出去。
+            log_files = list_plugin_log_files_for_export(log_dir, plugin_id)
+
+            if not log_files:
+                raise ServerDomainError(
+                    code="NO_LOG_FILES",
+                    message="No log files found for this plugin",
+                    status_code=404,
+                    details={"plugin_id": plugin_id}
+                )
+
+            # 在线程池中执行文件复制和打包，避免阻塞事件循环
+            import asyncio
+            loop = asyncio.get_event_loop()
+
+            def _copy_and_archive():
+                """在线程池中执行同步文件操作"""
+                copied_count = 0
+                for log_file in log_files:
+                    shutil.copy2(log_file, temp_log_dir / log_file.name)
+                    copied_count += 1
+
+                # 打包临时日志目录
+                zip_filename = f"{plugin_id}_logs"
+                zip_path = temp_dir / zip_filename
+                archive_path = shutil.make_archive(
+                    str(zip_path),
+                    'zip',
+                    temp_log_dir
+                )
+                return archive_path
+
+            archive_path = await loop.run_in_executor(None, _copy_and_archive)
+
+            # 成功创建响应，清理责任移交给 BackgroundTask
+            temp_needs_cleanup = False
+
+            # 使用流式响应 + 后台清理任务（复用主程序模式）
+            return StreamingResponse(
+                file_iterator(Path(archive_path)),
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="{plugin_id}_logs.zip"'},
+                background=BackgroundTask(cleanup_temp_path, str(temp_dir))
             )
-
-        # 打包临时日志目录
-        zip_filename = f"{plugin_id}_logs"
-        zip_path = temp_dir / zip_filename
-        archive_path = shutil.make_archive(
-            str(zip_path),
-            'zip',
-            temp_log_dir
-        )
-
-        # 使用流式响应 + 后台清理任务（复用主程序模式）
-        return StreamingResponse(
-            file_iterator(Path(archive_path)),
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{plugin_id}_logs.zip"'},
-            background=BackgroundTask(cleanup_temp_path, str(temp_dir))
-        )
+        finally:
+            # 如果在复制、打包或构造响应时失败，立即清理临时目录
+            if temp_needs_cleanup:
+                cleanup_temp_path(str(temp_dir))
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 

@@ -187,7 +187,10 @@ function handleOpenDirectory() {
         ElMessage.warning(t('logs.noLogFileToExport'))
         return
       }
-      openLocalPath(response.directory)
+      return openLocalPath(response.directory)
+    })
+    .then(() => {
+      // 成功打开目录，不显示任何消息
     })
     .catch((error) => {
       console.error('Failed to open log directory:', error)
