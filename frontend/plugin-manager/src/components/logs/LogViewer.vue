@@ -24,7 +24,7 @@
         {{ $t('logs.exportLog') }}
       </el-button>
 
-      <el-button v-if="hasDesktopBridge" data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
+      <el-button v-if="canOpenDirectory" data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
         <el-icon><Folder /></el-icon>
         {{ $t('logs.openLogDirectory') }}
       </el-button>
@@ -77,6 +77,7 @@ import { useLogsStore } from '@/stores/logs'
 import { useLogStream } from '@/composables/useLogStream'
 import { getPluginLogDirectory, getPluginLogExportUrl } from '@/api/logs'
 import { openLocalPath } from '@/utils/openExternal'
+import { API_BASE_URL } from '@/utils/constants'
 
 const props = defineProps<{
   pluginId: string
@@ -104,6 +105,20 @@ const hasDesktopBridge = computed(() => {
     ))
   )
 })
+
+// 检测后端是否为本地
+// 即使有桌面桥接，如果后端在远程机器上，返回的路径也是远程服务器的绝对路径，
+// 客户端无法打开或可能错误打开本地同名路径。
+const isLocalBackend = computed(() => {
+  const baseUrl = API_BASE_URL.replace(/\/$/, '')
+  // 空字符串表示使用相对路径或 Vite 代理，假定为本地开发环境
+  if (!baseUrl) return true
+  // 检测 localhost / 127.0.0.1 / 0.0.0.0
+  return !!baseUrl.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/)
+})
+
+// 只有同时满足：有桌面桥接 AND 后端是本地时，才能安全打开目录
+const canOpenDirectory = computed(() => hasDesktopBridge.value && isLocalBackend.value)
 
 const levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 const levelFilter = ref('')
