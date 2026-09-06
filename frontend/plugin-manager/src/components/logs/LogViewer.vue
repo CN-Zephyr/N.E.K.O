@@ -111,8 +111,9 @@ const hasDesktopBridge = computed(() => {
 // 客户端无法打开或可能错误打开本地同名路径。
 const isLocalBackend = computed(() => {
   const baseUrl = API_BASE_URL.replace(/\/$/, '')
-  // 空字符串表示使用相对路径或 Vite 代理，假定为本地开发环境
-  if (!baseUrl) return true
+  // 空字符串表示通过 Vite 代理，但 VITE_BACKEND_URL 可能指向远程服务器，
+  // 运行时无法获取构建时环境变量。为安全起见，开发模式下禁用目录打开功能。
+  if (!baseUrl) return false
   // 检测 localhost / 127.0.0.1 / 0.0.0.0
   return !!baseUrl.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/)
 })
