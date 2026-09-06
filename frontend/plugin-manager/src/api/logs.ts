@@ -55,6 +55,8 @@ export function getPluginLogDirectory(pluginId: string): Promise<{
  * 导出插件日志文件（返回下载 URL）
  */
 export function getPluginLogExportUrl(pluginId: string): string {
-  return `${API_BASE_URL}/plugin/${encodeURIComponent(pluginId)}/logs/export`
+  // 移除尾部斜杠避免双斜杠路径
+  const baseUrl = API_BASE_URL.replace(/\/$/, '')
+  return `${baseUrl}/plugin/${encodeURIComponent(pluginId)}/logs/export`
 }
 

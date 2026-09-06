@@ -133,8 +133,8 @@ async def export_plugin_log_endpoint(plugin_id: str, _: str = require_admin) -> 
                     copied_count += 1
 
                 # 打包临时日志目录
-                zip_filename = f"{plugin_id}_logs"
-                zip_path = temp_dir / zip_filename
+                # 使用固定文件名避免超长 plugin_id 导致超过文件系统 NAME_MAX 限制
+                zip_path = temp_dir / "export"
                 archive_path = shutil.make_archive(
                     str(zip_path),
                     'zip',

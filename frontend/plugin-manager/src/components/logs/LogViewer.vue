@@ -24,7 +24,7 @@
         {{ $t('logs.exportLog') }}
       </el-button>
 
-      <el-button data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
+      <el-button v-if="!isRemoteBackend" data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
         <el-icon><Folder /></el-icon>
         {{ $t('logs.openLogDirectory') }}
       </el-button>
@@ -77,6 +77,7 @@ import { useLogsStore } from '@/stores/logs'
 import { useLogStream } from '@/composables/useLogStream'
 import { getPluginLogDirectory, getPluginLogExportUrl } from '@/api/logs'
 import { openLocalPath } from '@/utils/openExternal'
+import { API_BASE_URL } from '@/utils/constants'
 
 const props = defineProps<{
   pluginId: string
@@ -86,6 +87,12 @@ const { t } = useI18n()
 const logsStore = useLogsStore()
 const pluginIdRef = toRef(props, 'pluginId')
 const { isConnected } = useLogStream(pluginIdRef)
+
+// 检测是否为远程后端（非本地）
+const isRemoteBackend = computed(() => {
+  const baseUrl = API_BASE_URL.replace(/\/$/, '')
+  return baseUrl && !baseUrl.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/)
+})
 
 const levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 const levelFilter = ref('')
