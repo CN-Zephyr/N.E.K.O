@@ -24,7 +24,7 @@
         {{ $t('logs.exportLog') }}
       </el-button>
 
-      <el-button v-if="!isRemoteBackend" data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
+      <el-button v-if="hasDesktopBridge" data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
         <el-icon><Folder /></el-icon>
         {{ $t('logs.openLogDirectory') }}
       </el-button>
@@ -77,7 +77,6 @@ import { useLogsStore } from '@/stores/logs'
 import { useLogStream } from '@/composables/useLogStream'
 import { getPluginLogDirectory, getPluginLogExportUrl } from '@/api/logs'
 import { openLocalPath } from '@/utils/openExternal'
-import { API_BASE_URL } from '@/utils/constants'
 
 const props = defineProps<{
   pluginId: string
@@ -88,10 +87,22 @@ const logsStore = useLogsStore()
 const pluginIdRef = toRef(props, 'pluginId')
 const { isConnected } = useLogStream(pluginIdRef)
 
-// 检测是否为远程后端（非本地）
-const isRemoteBackend = computed(() => {
-  const baseUrl = API_BASE_URL.replace(/\/$/, '')
-  return baseUrl && !baseUrl.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/)
+// 检测是否有桌面桥接（Electron 环境）
+// 只有在桌面环境中才能打开本地路径；即使后端是本地的，
+// 如果运行在浏览器中也无法调用系统文件管理器。
+const hasDesktopBridge = computed(() => {
+  const w = window as unknown as {
+    nekoHost?: { openPath?: unknown }
+    electronShell?: { openPath?: unknown; showItemInFolder?: unknown; openExternal?: unknown }
+  }
+  return !!(
+    (w.nekoHost && typeof w.nekoHost.openPath === 'function') ||
+    (w.electronShell && (
+      typeof w.electronShell.openPath === 'function' ||
+      typeof w.electronShell.showItemInFolder === 'function' ||
+      typeof w.electronShell.openExternal === 'function'
+    ))
+  )
 })
 
 const levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
