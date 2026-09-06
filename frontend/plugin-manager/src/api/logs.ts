@@ -2,6 +2,7 @@
  * 日志相关 API
  */
 import { get } from './index'
+import { API_BASE_URL } from '@/utils/constants'
 import type { LogEntry, LogFile } from '@/types/api'
 
 /**
@@ -37,5 +38,23 @@ export function getPluginLogFiles(pluginId: string): Promise<{
   time: string
 }> {
   return get(`/plugin/${encodeURIComponent(pluginId)}/logs/files`)
+}
+
+/**
+ * 获取插件日志目录路径
+ */
+export function getPluginLogDirectory(pluginId: string): Promise<{
+  plugin_id: string
+  directory: string
+  time: string
+}> {
+  return get(`/plugin/${encodeURIComponent(pluginId)}/logs/directory`)
+}
+
+/**
+ * 导出插件日志文件（返回下载 URL）
+ */
+export function getPluginLogExportUrl(pluginId: string): string {
+  return `${API_BASE_URL}/plugin/${encodeURIComponent(pluginId)}/logs/export`
 }
 

@@ -19,6 +19,16 @@
 
       <el-button :loading="loading" data-yui-guide-id="log-refresh" @click="refreshLogs">{{ $t('common.refresh') }}</el-button>
 
+      <el-button data-yui-guide-id="log-export" @click="handleExportLog">
+        <el-icon><Download /></el-icon>
+        {{ $t('logs.exportLog') }}
+      </el-button>
+
+      <el-button data-yui-guide-id="log-open-directory" @click="handleOpenDirectory">
+        <el-icon><Folder /></el-icon>
+        {{ $t('logs.openLogDirectory') }}
+      </el-button>
+
       <el-switch v-model="autoScroll" data-yui-guide-id="log-auto-scroll" :active-text="$t('logs.autoScroll')" />
     </div>
 
@@ -61,8 +71,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { ElMessage } from 'element-plus'
+import { Download, Folder } from '@element-plus/icons-vue'
 import { useLogsStore } from '@/stores/logs'
 import { useLogStream } from '@/composables/useLogStream'
+import { getPluginLogDirectory, getPluginLogExportUrl } from '@/api/logs'
+import { openLocalPath } from '@/utils/openExternal'
 
 const props = defineProps<{
   pluginId: string
@@ -137,6 +151,48 @@ async function scrollToBottom() {
   if (logContainerRef.value) {
     logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
   }
+}
+
+async function handleExportLog() {
+  let objectUrl = ''
+  try {
+    // 用 fetch 而不是直接 <a href> 触发下载：后者拿不到响应状态，
+    // 服务端返回 404（该插件没有日志）时也会弹成功提示。
+    const response = await fetch(getPluginLogExportUrl(props.pluginId))
+    if (!response.ok) {
+      ElMessage.error(response.status === 404 ? t('logs.noLogFileToExport') : t('logs.exportFailed'))
+      return
+    }
+    const blob = await response.blob()
+    objectUrl = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = objectUrl
+    link.download = `${props.pluginId}_logs.zip`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    ElMessage.success(t('logs.exportSuccess'))
+  } catch (error) {
+    console.error('Failed to export log:', error)
+    ElMessage.error(t('logs.exportFailed'))
+  } finally {
+    if (objectUrl) URL.revokeObjectURL(objectUrl)
+  }
+}
+
+function handleOpenDirectory() {
+  getPluginLogDirectory(props.pluginId)
+    .then((response) => {
+      if (!response.directory) {
+        ElMessage.warning(t('logs.noLogFileToExport'))
+        return
+      }
+      openLocalPath(response.directory)
+    })
+    .catch((error) => {
+      console.error('Failed to open log directory:', error)
+      ElMessage.error(t('logs.openDirectoryFailed'))
+    })
 }
 
 watch(

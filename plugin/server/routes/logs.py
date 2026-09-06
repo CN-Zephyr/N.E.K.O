@@ -3,12 +3,18 @@
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Query, WebSocket
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from plugin.logging_config import get_logger
 from plugin.server.application.logs import LogQueryService
+from plugin.server.logs import list_plugin_log_files_for_export
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.auth import require_admin
 from plugin.server.logs import log_stream_endpoint
@@ -17,6 +23,26 @@ from plugin.server.infrastructure.error_mapping import raise_http_from_domain
 router = APIRouter()
 logger = get_logger("server.routes.logs")
 log_query_service = LogQueryService()
+
+
+def file_iterator(file_path: Path, chunk_size: int = 65536):
+    """流式读取文件，避免一次性加载到内存"""
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(chunk_size):
+            yield chunk
+
+
+def cleanup_temp_path(path: str):
+    """清理临时文件或目录"""
+    try:
+        p = Path(path)
+        if p.is_file():
+            p.unlink(missing_ok=True)
+        elif p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception as e:
+        logger.warning(f"Failed to cleanup temp path {path}: {e}")
+
 
 
 @router.get("/plugin/{plugin_id}/logs")
@@ -46,6 +72,62 @@ async def get_plugin_logs_endpoint(
 async def get_plugin_log_files_endpoint(plugin_id: str, _: str = require_admin) -> dict[str, object]:
     try:
         return log_query_service.get_plugin_log_files(plugin_id)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.get("/plugin/{plugin_id}/logs/directory")
+async def get_plugin_log_directory_endpoint(plugin_id: str, _: str = require_admin) -> dict[str, object]:
+    try:
+        return log_query_service.get_plugin_log_directory(plugin_id)
+    except ServerDomainError as error:
+        raise_http_from_domain(error, logger=logger)
+
+
+@router.get("/plugin/{plugin_id}/logs/export")
+async def export_plugin_log_endpoint(plugin_id: str, _: str = require_admin) -> StreamingResponse:
+    try:
+        # 获取日志目录
+        result = log_query_service.get_plugin_log_directory(plugin_id)
+        log_dir = Path(result["directory"])
+
+        # 创建临时目录用于存放日志文件副本和 zip
+        temp_dir = Path(tempfile.mkdtemp())
+        temp_log_dir = temp_dir / "logs"
+        temp_log_dir.mkdir()
+
+        # 只收集当前插件自己的日志文件：logs/plugin/ 是所有插件共享的，
+        # 直接打包整个目录会把别的插件日志一起泄漏出去。
+        copied_count = 0
+        for log_file in list_plugin_log_files_for_export(log_dir, plugin_id):
+            shutil.copy2(log_file, temp_log_dir / log_file.name)
+            copied_count += 1
+
+        if copied_count == 0:
+            cleanup_temp_path(str(temp_dir))
+            raise ServerDomainError(
+                code="NO_LOG_FILES",
+                message="No log files found for this plugin",
+                status_code=404,
+                details={"plugin_id": plugin_id}
+            )
+
+        # 打包临时日志目录
+        zip_filename = f"{plugin_id}_logs"
+        zip_path = temp_dir / zip_filename
+        archive_path = shutil.make_archive(
+            str(zip_path),
+            'zip',
+            temp_log_dir
+        )
+
+        # 使用流式响应 + 后台清理任务（复用主程序模式）
+        return StreamingResponse(
+            file_iterator(Path(archive_path)),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{plugin_id}_logs.zip"'},
+            background=BackgroundTask(cleanup_temp_path, str(temp_dir))
+        )
     except ServerDomainError as error:
         raise_http_from_domain(error, logger=logger)
 

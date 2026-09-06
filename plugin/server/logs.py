@@ -237,6 +237,37 @@ def get_plugin_log_files(plugin_id: str) -> list[dict[str, object]]:
     return log_files
 
 
+def list_plugin_log_files_for_export(log_dir: Path, plugin_id: str) -> list[Path]:
+    """返回该 plugin 自己的全部日志文件，用于打包导出。
+
+    与 ``_list_plugin_log_files_for_tail`` 的区别：导出要保留 ``_error.log``
+    系列，用户排障时错误流往往才是关键。pattern 末尾的 ``*`` 覆盖轮转后缀。
+    """
+    if plugin_id == SERVER_LOG_ID:
+        pattern = "N.E.K.O_PluginServer_*.log*"
+    else:
+        pattern = f"N.E.K.O_Plugin_{plugin_id}_*.log*"
+
+    return [p for p in log_dir.glob(pattern) if p.is_file()]
+
+
+def get_plugin_log_directory_path(plugin_id: str) -> str:
+    """
+    获取插件日志目录的绝对路径
+
+    Args:
+        plugin_id: 插件ID（或 SERVER_LOG_ID 表示服务器日志）
+
+    Returns:
+        日志目录的绝对路径字符串
+
+    Raises:
+        HTTPException: 如果 plugin_id 不安全
+    """
+    log_dir = get_plugin_log_dir(plugin_id)
+    return str(log_dir.resolve())
+
+
 def parse_log_line(line: str) -> dict[str, object] | None:
     """
     解析日志行
