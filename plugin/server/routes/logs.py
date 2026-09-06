@@ -87,6 +87,15 @@ async def get_plugin_log_directory_endpoint(plugin_id: str, _: str = require_adm
 @router.get("/plugin/{plugin_id}/logs/export")
 async def export_plugin_log_endpoint(plugin_id: str, _: str = require_admin) -> StreamingResponse:
     try:
+        # 拒绝包含换行符的 plugin_id，防止 HTTP 响应头注入
+        if '\n' in plugin_id or '\r' in plugin_id:
+            raise ServerDomainError(
+                code="INVALID_PLUGIN_ID",
+                message="Plugin ID cannot contain newline characters",
+                status_code=400,
+                details={"plugin_id": plugin_id}
+            )
+
         # 获取日志目录
         result = log_query_service.get_plugin_log_directory(plugin_id)
         log_dir = Path(result["directory"])
