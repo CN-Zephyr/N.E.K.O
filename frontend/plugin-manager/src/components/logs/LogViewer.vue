@@ -154,11 +154,13 @@ async function scrollToBottom() {
 }
 
 async function handleExportLog() {
+  // 在开始导出前捕获 pluginId，防止用户在下载期间切换插件导致文件名错误
+  const pluginId = props.pluginId
   let objectUrl = ''
   try {
     // 用 fetch 而不是直接 <a href> 触发下载：后者拿不到响应状态，
     // 服务端返回 404（该插件没有日志）时也会弹成功提示。
-    const response = await fetch(getPluginLogExportUrl(props.pluginId))
+    const response = await fetch(getPluginLogExportUrl(pluginId))
     if (!response.ok) {
       ElMessage.error(response.status === 404 ? t('logs.noLogFileToExport') : t('logs.exportFailed'))
       return
@@ -167,7 +169,7 @@ async function handleExportLog() {
     objectUrl = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = objectUrl
-    link.download = `${props.pluginId}_logs.zip`
+    link.download = `${pluginId}_logs.zip`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)

@@ -71,7 +71,14 @@ export function openLocalPath(path: string): Promise<void> {
     }
   })
   if (host.nekoHost && typeof host.nekoHost.openPath === 'function') {
-    return Promise.resolve(host.nekoHost.openPath({ path: target })).then(() => undefined)
+    return Promise.resolve(host.nekoHost.openPath({ path: target })).then((result) => {
+      // nekoHost.openPath 可能返回 {ok: false, error: ...} 结构化失败
+      if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+        const error = 'error' in result && result.error ? String(result.error) : 'Failed to open path'
+        throw new Error(error)
+      }
+      return undefined
+    })
   }
   if (host.electronShell && typeof host.electronShell.openPath === 'function') {
     return Promise.resolve(host.electronShell.openPath(target)).then(() => undefined)
