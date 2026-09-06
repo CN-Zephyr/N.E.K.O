@@ -114,8 +114,20 @@ const isLocalBackend = computed(() => {
   // 空字符串表示通过 Vite 代理，但 VITE_BACKEND_URL 可能指向远程服务器，
   // 运行时无法获取构建时环境变量。为安全起见，开发模式下禁用目录打开功能。
   if (!baseUrl) return false
-  // 检测 localhost / 127.0.0.1 / 0.0.0.0
-  return !!baseUrl.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/)
+
+  // 解析 URL 来提取 hostname，支持带路径的 URL（如 http://localhost:8000/api）
+  try {
+    const url = new URL(baseUrl, window.location.origin)
+    const hostname = url.hostname.toLowerCase()
+    // 只允许回环地址：localhost, 127.0.0.1, 0.0.0.0, ::1
+    return hostname === 'localhost' ||
+           hostname === '127.0.0.1' ||
+           hostname === '0.0.0.0' ||
+           hostname === '::1'
+  } catch {
+    // URL 解析失败，视为非本地
+    return false
+  }
 })
 
 // 只有同时满足：有桌面桥接 AND 后端是本地时，才能安全打开目录
