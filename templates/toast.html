@@ -143,7 +143,11 @@
                 && !statusToast.matches(':focus-within')) {
                 statusToast._resumeAutoHide();
             }
-            if (!keepCurrentMouseState && !prominentNoticeInteractive) {
+            if (!keepCurrentMouseState
+                && !prominentNoticeInteractive
+                && !(api
+                    && api.supportsStatusPointerTracking === false
+                    && typeof api.setStatusInputRegion === 'function')) {
                 setToastMouseThrough(true);
             }
         }
@@ -226,10 +230,15 @@
             stopStatusPointerTracking(true);
             if (prominentNoticeInteractive) return;
 
-            // 旧版 Electron preload、普通网页环境和 Niri 小窗均安全降级为全程穿透。
-            if (!api
-                || api.supportsStatusPointerTracking === false
-                || typeof api.getCursorPoint !== 'function') {
+            // 旧版 Electron preload 和普通网页环境安全降级为全程穿透。Niri 小窗
+            // 不做全局光标轮询，而是由 setStatusInputRegion 精确开放气泡区域。
+            if (!api || api.supportsStatusPointerTracking === false) {
+                if (!api || typeof api.setStatusInputRegion !== 'function') {
+                    setToastMouseThrough(true);
+                }
+                return;
+            }
+            if (typeof api.getCursorPoint !== 'function') {
                 setToastMouseThrough(true);
                 return;
             }
@@ -240,8 +249,25 @@
             pollStatusPointer(generation);
         }
 
+        function updateCompactStatusInputRegion(visible) {
+            if (!api
+                || api.supportsStatusPointerTracking !== false
+                || typeof api.setStatusInputRegion !== 'function') return;
+            if (!visible) {
+                api.setStatusInputRegion(null);
+                return;
+            }
+            api.setStatusInputRegion({
+                x: statusToast.offsetLeft,
+                y: statusToast.offsetTop,
+                width: statusToast.offsetWidth,
+                height: statusToast.offsetHeight,
+            });
+        }
+
         var toastRemaining = 3000; var toastStart = 0; var showTimer = null;
         function hideStatusNow() {
+            updateCompactStatusInputRegion(false);
             stopStatusPointerTracking(false);
             if (showTimer) { clearTimeout(showTimer); showTimer = null; }
             if (statusTimeout) { clearTimeout(statusTimeout); statusTimeout = null; }
@@ -261,9 +287,34 @@
             toastRemaining = ms; toastStart = Date.now();
             statusTimeout = setTimeout(hideStatusNow, ms);
         }
+        function copyStatusToastText(value) {
+            if (!value) return Promise.resolve(false);
+            try {
+                if (api && typeof api.copyText === 'function') {
+                    return Promise.resolve(api.copyText(value)).then(function(result) {
+                        return result !== false;
+                    }).catch(function() { return false; });
+                }
+                if (typeof navigator !== 'undefined'
+                    && navigator.clipboard
+                    && typeof navigator.clipboard.writeText === 'function') {
+                    return navigator.clipboard.writeText(value).then(function() { return true; }).catch(function() { return false; });
+                }
+            } catch (_) {
+                return Promise.resolve(false);
+            }
+            return Promise.resolve(false);
+        }
+        function showStatusToastCopyFeedback(textEl) {
+            textEl.classList.remove('status-toast-copy-success');
+            void textEl.offsetWidth;
+            textEl.classList.add('status-toast-copy-success');
+            setTimeout(function() { textEl.classList.remove('status-toast-copy-success'); }, 450);
+        }
         function showStatusToast(message, duration) {
             if (duration == null) duration = 3000;
             if (!message || !message.trim()) {
+                updateCompactStatusInputRegion(false);
                 stopStatusPointerTracking(false);
                 if (showTimer) { clearTimeout(showTimer); showTimer=null; }
                 if (statusTimeout) { clearTimeout(statusTimeout); statusTimeout = null; }
@@ -287,6 +338,15 @@
             Array.from(statusToast.childNodes).forEach(function(n){ if(n!==textEl && n.nodeType===3) n.textContent=''; });
             if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
             textEl.textContent = message;
+            textEl.title = (typeof window.t === 'function')
+                ? window.t('chat.copyToClipboard', { defaultValue: 'Copy to clipboard' })
+                : 'Copy to clipboard';
+            textEl.onclick = function(e) {
+                e.stopPropagation();
+                copyStatusToastText(message).then(function(copied) {
+                    if (copied) showStatusToastCopyFeedback(textEl);
+                });
+            };
             var closeBtn = statusToast.querySelector('#status-toast-close');
             if (!closeBtn) {
                 closeBtn = document.createElement('button');
@@ -311,6 +371,7 @@
             showTimer = setTimeout(function() {
                 statusToast.classList.add('show');
                 showTimer=null;
+                updateCompactStatusInputRegion(true);
                 startStatusPointerTracking();
             }, 10);
             if (statusToast._enter) statusToast.removeEventListener('mouseenter', statusToast._enter);
@@ -675,12 +736,18 @@
         }
 
         document.addEventListener('visibilitychange', function() {
-            if (document.hidden) stopStatusPointerTracking(false);
-            else if (isStatusToastVisible() && !prominentNoticeInteractive) startStatusPointerTracking();
+            if (document.hidden) {
+                updateCompactStatusInputRegion(false);
+                stopStatusPointerTracking(false);
+            } else if (isStatusToastVisible() && !prominentNoticeInteractive) {
+                updateCompactStatusInputRegion(true);
+                startStatusPointerTracking();
+            }
         });
 
         window.addEventListener('beforeunload', function() {
             prominentNoticeInteractive = false;
+            updateCompactStatusInputRegion(false);
             stopStatusPointerTracking(true);
             setToastMouseThrough(true, true);
         });

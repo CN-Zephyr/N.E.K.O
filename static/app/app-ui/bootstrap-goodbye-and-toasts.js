@@ -371,6 +371,75 @@ I.mod = window.appUi;
             I.S.statusToastTimeout = setTimeout(hideNow, ms);
         }
 
+        function copyStatusToastTextLegacy(value) {
+            if (!document.body || typeof document.execCommand !== 'function') return false;
+            const activeElement = document.activeElement;
+            const selectionStart = activeElement && typeof activeElement.selectionStart === 'number'
+                ? activeElement.selectionStart
+                : null;
+            const selectionEnd = activeElement && typeof activeElement.selectionEnd === 'number'
+                ? activeElement.selectionEnd
+                : null;
+            const textArea = document.createElement('textarea');
+            textArea.value = value;
+            textArea.setAttribute('readonly', '');
+            textArea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+            document.body.appendChild(textArea);
+            let copied = false;
+            try {
+                textArea.focus({ preventScroll: true });
+                textArea.select();
+                copied = document.execCommand('copy') === true;
+            } catch (_) {
+                copied = false;
+            }
+            textArea.remove();
+            try {
+                if (activeElement && typeof activeElement.focus === 'function') {
+                    activeElement.focus({ preventScroll: true });
+                    if (selectionStart !== null
+                        && selectionEnd !== null
+                        && typeof activeElement.setSelectionRange === 'function') {
+                        activeElement.setSelectionRange(selectionStart, selectionEnd);
+                    }
+                }
+            } catch (_) {}
+            return copied;
+        }
+
+        function copyStatusToastText(value) {
+            if (!value) return Promise.resolve(false);
+            const copyWithWebClipboard = () => {
+                try {
+                    if (typeof navigator !== 'undefined'
+                        && navigator.clipboard
+                        && typeof navigator.clipboard.writeText === 'function') {
+                        return navigator.clipboard.writeText(value)
+                            .then(() => true)
+                            .catch(() => copyStatusToastTextLegacy(value));
+                    }
+                } catch (_) {}
+                return Promise.resolve(copyStatusToastTextLegacy(value));
+            };
+            try {
+                if (I.mod.api && typeof I.mod.api.copyText === 'function') {
+                    return Promise.resolve(I.mod.api.copyText(value))
+                        .then(result => result !== false ? true : copyWithWebClipboard())
+                        .catch(copyWithWebClipboard);
+                }
+            } catch (_) {
+                return copyWithWebClipboard();
+            }
+            return copyWithWebClipboard();
+        }
+
+        function showStatusToastCopyFeedback(textEl) {
+            textEl.classList.remove('status-toast-copy-success');
+            void textEl.offsetWidth;
+            textEl.classList.add('status-toast-copy-success');
+            setTimeout(() => textEl.classList.remove('status-toast-copy-success'), 450);
+        }
+
         function hideNow() {
             if (I.S._statusToastShowTimer) { clearTimeout(I.S._statusToastShowTimer); I.S._statusToastShowTimer = null; }
             if (I.S.statusToastTimeout) { clearTimeout(I.S.statusToastTimeout); I.S.statusToastTimeout = null; }
@@ -427,6 +496,15 @@ I.mod = window.appUi;
         }
         Array.from(statusToast.childNodes).forEach(n => { if (n !== textEl && n !== closeBtn && n.nodeType === 3) n.textContent = ''; });
         textEl.textContent = message;
+        textEl.title = typeof window.t === 'function'
+            ? window.t('chat.copyToClipboard', { defaultValue: 'Copy to clipboard' })
+            : 'Copy to clipboard';
+        textEl.onclick = (e) => {
+            e.stopPropagation();
+            copyStatusToastText(message).then((copied) => {
+                if (copied) showStatusToastCopyFeedback(textEl);
+            });
+        };
         closeBtn.disabled = false; closeBtn.tabIndex = 0; closeBtn.removeAttribute('aria-hidden');
         closeBtn.onclick = (e) => { e.stopPropagation(); hideNow(); };
         if (I.mod.api && I.mod.api.setMouseThrough) I.mod.api.setMouseThrough(false);

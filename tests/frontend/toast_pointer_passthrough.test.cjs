@@ -97,6 +97,8 @@ function createDeferred() {
 function createHarness(options = {}) {
   const callbacks = {};
   const mouseThrough = [];
+  const copied = [];
+  const statusInputRegions = [];
   const timers = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
@@ -108,6 +110,10 @@ function createHarness(options = {}) {
   const head = createElement('head');
   const statusToast = createElement('div');
   statusToast.id = 'status-toast';
+  statusToast.offsetLeft = 100;
+  statusToast.offsetTop = 40;
+  statusToast.offsetWidth = 200;
+  statusToast.offsetHeight = 60;
   statusToast.getBoundingClientRect = () => ({
     left: 100,
     top: 40,
@@ -141,9 +147,11 @@ function createHarness(options = {}) {
   };
 
   const api = {
+    copyText(value) { copied.push(value); return true; },
     supportsStatusPointerTracking: options.supportsStatusPointerTracking !== false,
     getCursorPoint() { return cursorProvider(); },
     setMouseThrough(ignore) { mouseThrough.push(ignore); },
+    setStatusInputRegion(rect) { statusInputRegions.push(rect); return true; },
     onShowStatusToast(callback) { callbacks.status = callback; },
     onShowVoicePreparing(callback) { callbacks.voicePreparing = callback; },
     onHideVoicePreparing(callback) { callbacks.voiceHide = callback; },
@@ -180,6 +188,8 @@ function createHarness(options = {}) {
   return {
     statusToast,
     mouseThrough,
+    copied,
+    statusInputRegions,
     setCursor(point) { cursorPoint = point; },
     setCursorProvider(provider) { cursorProvider = provider; },
     emitStatus(message = 'saved') { callbacks.status({ message, duration: 3000 }); },
@@ -220,6 +230,19 @@ async function flushPromises() {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+test('clicking status text copies the complete toast without changing mouse-through state', async () => {
+  const harness = createHarness();
+  harness.emitStatus('API request failed: 401');
+
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.onclick({ stopPropagation() {} });
+  await flushPromises();
+
+  assert.deepEqual(harness.copied, ['API request failed: 401']);
+  assert.deepEqual(harness.mouseThrough, []);
+  assert.equal(text.classList.contains('status-toast-copy-success'), true);
+});
 
 test('ordinary status toast only captures input while the cursor is inside its rectangle', async () => {
   const harness = createHarness();
@@ -346,8 +369,8 @@ test('a real DOM mouseenter does not double-count the poll-driven pause', async 
   );
 });
 
-// Niri 小窗与非 Electron 环境走 supportsStatusPointerTracking === false，
-// 此时轮询不启动，hover 判定必须退回纯 DOM 语义。
+// Niri 小窗走 supportsStatusPointerTracking === false，不做不可靠的全局光标轮询；
+// 由 preload 把真实气泡矩形交给合成器，透明余量仍保持穿透。
 test('with pointer tracking unsupported the DOM hover path still governs', async () => {
   const harness = createHarness({ supportsStatusPointerTracking: false });
   harness.setCursor({ x: 150, y: 60 });
@@ -356,7 +379,10 @@ test('with pointer tracking unsupported the DOM hover path still governs', async
   harness.runTimer(10);
   await flushPromises();
 
-  assert.deepEqual(harness.mouseThrough, [true], '不支持时应全程穿透，不发起轮询');
+  assert.deepEqual(harness.mouseThrough, [], 'Niri 精确输入区域不应再切换整窗穿透状态');
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.statusInputRegions)), [
+    { x: 100, y: 40, width: 200, height: 60 },
+  ]);
   assert.equal(harness.hasTimer(50), false);
   assert.equal(
     harness.hasAutoHideTimer(),
@@ -366,6 +392,19 @@ test('with pointer tracking unsupported the DOM hover path still governs', async
 
   harness.statusToast.dispatch('mouseenter', {});
   assert.equal(harness.hasAutoHideTimer(), false, 'DOM hover 仍应能暂停');
+});
+
+test('Niri compact status input region is cleared as soon as the toast closes', () => {
+  const harness = createHarness({ supportsStatusPointerTracking: false });
+
+  harness.emitStatus();
+  harness.runTimer(10);
+  harness.statusToast.querySelector('#status-toast-close').onclick({ stopPropagation() {} });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.statusInputRegions)), [
+    { x: 100, y: 40, width: 200, height: 60 },
+    null,
+  ]);
 });
 
 // 连发场景：光标全程停在矩形上不动。第二条提示必须重新 pin —— 若 inside 标志位
