@@ -433,14 +433,19 @@ I.mod = window.appUi;
             return copyWithWebClipboard();
         }
 
-        function showStatusToastCopyFeedback(textEl) {
+        function showStatusToastCopyFeedback(textEl, copyRevision) {
             textEl.classList.remove('status-toast-copy-success');
             void textEl.offsetWidth;
             textEl.classList.add('status-toast-copy-success');
-            setTimeout(() => textEl.classList.remove('status-toast-copy-success'), 450);
+            setTimeout(() => {
+                if (statusToast._copyRevision === copyRevision) {
+                    textEl.classList.remove('status-toast-copy-success');
+                }
+            }, 450);
         }
 
         function hideNow() {
+            statusToast._copyRevision = (Number(statusToast._copyRevision) || 0) + 1;
             if (I.S._statusToastShowTimer) { clearTimeout(I.S._statusToastShowTimer); I.S._statusToastShowTimer = null; }
             if (I.S.statusToastTimeout) { clearTimeout(I.S.statusToastTimeout); I.S.statusToastTimeout = null; }
             if (I.S._statusToastCleanupTimer) { clearTimeout(I.S._statusToastCleanupTimer); I.S._statusToastCleanupTimer = null; }
@@ -450,12 +455,15 @@ I.mod = window.appUi;
             if (statusToast._toastFocusOut) { statusToast.removeEventListener('focusout', statusToast._toastFocusOut); statusToast._toastFocusOut = null; }
             statusToast.classList.remove('show');
             statusToast.classList.add('hide');
+            const _copyText = statusToast.querySelector('#status-toast-text');
+            if (_copyText) { _copyText.classList.remove('status-toast-copy-success'); _copyText.tabIndex = -1; _copyText.setAttribute('aria-hidden', 'true'); if (document.activeElement === _copyText) _copyText.blur(); }
             const _cb3 = statusToast.querySelector('#status-toast-close');
             if (_cb3) { _cb3.disabled = true; _cb3.tabIndex = -1; _cb3.setAttribute('aria-hidden','true'); }
             I.S._statusToastCleanupTimer = setTimeout(() => { const t = statusToast.querySelector('#status-toast-text'); if (t) t.textContent = ''; Array.from(statusToast.childNodes).forEach(n => { if (n.nodeType === 3) n.textContent = ''; }); I.S._statusToastPriority = 0; I.S._statusToastCleanupTimer = null; if (I.mod.api && I.mod.api.setMouseThrough && !document.getElementById('prominent-notice-overlay')) I.mod.api.setMouseThrough(true); }, 400);
         }
 
         if (!message || message.trim() === '') {
+            statusToast._copyRevision = (Number(statusToast._copyRevision) || 0) + 1;
             if (I.S._statusToastShowTimer) { clearTimeout(I.S._statusToastShowTimer); I.S._statusToastShowTimer = null; }
             if (I.S.statusToastTimeout) { clearTimeout(I.S.statusToastTimeout); I.S.statusToastTimeout = null; }
             if (I.S._statusToastCleanupTimer) { clearTimeout(I.S._statusToastCleanupTimer); I.S._statusToastCleanupTimer = null; }
@@ -465,6 +473,8 @@ I.mod = window.appUi;
             if (statusToast._toastFocusOut) { statusToast.removeEventListener('focusout', statusToast._toastFocusOut); statusToast._toastFocusOut = null; }
             const _cb2 = statusToast.querySelector('#status-toast-close');
             if (_cb2) { _cb2.disabled = true; _cb2.tabIndex = -1; _cb2.setAttribute('aria-hidden','true'); if (document.activeElement === _cb2) _cb2.blur(); }
+            const _copyText2 = statusToast.querySelector('#status-toast-text');
+            if (_copyText2) { _copyText2.classList.remove('status-toast-copy-success'); _copyText2.tabIndex = -1; _copyText2.setAttribute('aria-hidden', 'true'); if (document.activeElement === _copyText2) _copyText2.blur(); }
             statusToast.classList.remove('show');
             statusToast.classList.add('hide');
             I.S._statusToastCleanupTimer = setTimeout(() => { const t = statusToast.querySelector('#status-toast-text'); if (t) t.textContent = ''; Array.from(statusToast.childNodes).forEach(n => { if (n.nodeType === 3) n.textContent = ''; }); I.S._statusToastCleanupTimer = null; if (I.mod.api && I.mod.api.setMouseThrough && !document.getElementById('prominent-notice-overlay')) I.mod.api.setMouseThrough(true); }, 400);
@@ -495,15 +505,29 @@ I.mod = window.appUi;
             I.S._statusToastCleanupTimer = null;
         }
         Array.from(statusToast.childNodes).forEach(n => { if (n !== textEl && n !== closeBtn && n.nodeType === 3) n.textContent = ''; });
+        const copyRevision = (Number(statusToast._copyRevision) || 0) + 1;
+        statusToast._copyRevision = copyRevision;
+        textEl.classList.remove('status-toast-copy-success');
         textEl.textContent = message;
         textEl.title = typeof window.t === 'function'
             ? window.t('chat.copyToClipboard', { defaultValue: 'Copy to clipboard' })
             : 'Copy to clipboard';
-        textEl.onclick = (e) => {
+        textEl.setAttribute('role', 'button');
+        textEl.setAttribute('aria-hidden', 'false');
+        textEl.tabIndex = 0;
+        const copyCurrentMessage = (e) => {
             e.stopPropagation();
             copyStatusToastText(message).then((copied) => {
-                if (copied) showStatusToastCopyFeedback(textEl);
+                if (copied && statusToast._copyRevision === copyRevision) {
+                    showStatusToastCopyFeedback(textEl, copyRevision);
+                }
             });
+        };
+        textEl.onclick = copyCurrentMessage;
+        textEl.onkeydown = (e) => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            copyCurrentMessage(e);
         };
         closeBtn.disabled = false; closeBtn.tabIndex = 0; closeBtn.removeAttribute('aria-hidden');
         closeBtn.onclick = (e) => { e.stopPropagation(); hideNow(); };

@@ -70,6 +70,9 @@
         var statusPointerPollTimer = null;
         var statusPointerPollGeneration = 0;
         var STATUS_POINTER_POLL_MS = 50;
+        var compactStatusInputRegionFrame = null;
+        var compactStatusInputRegionGeneration = 0;
+        var statusCopyRevision = 0;
         // 命中检测开着时，轮询结果是「光标在不在提示上」的唯一权威。
         // 窗口在穿透态收不到任何鼠标事件，所以「光标跨进矩形」这一刻必然发生在
         // 渲染进程失聪期间：若用户在窗口恢复命中前就停稳，mouseenter 永远不会补发，
@@ -257,16 +260,47 @@
                 api.setStatusInputRegion(null);
                 return;
             }
+            var rect = statusToast.getBoundingClientRect();
             api.setStatusInputRegion({
-                x: statusToast.offsetLeft,
-                y: statusToast.offsetTop,
-                width: statusToast.offsetWidth,
-                height: statusToast.offsetHeight,
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
             });
+        }
+
+        function stopCompactStatusInputRegionTracking() {
+            compactStatusInputRegionGeneration += 1;
+            if (compactStatusInputRegionFrame !== null
+                && typeof window.cancelAnimationFrame === 'function') {
+                window.cancelAnimationFrame(compactStatusInputRegionFrame);
+            }
+            compactStatusInputRegionFrame = null;
+        }
+
+        function trackCompactStatusInputRegionThroughTransition() {
+            stopCompactStatusInputRegionTracking();
+            var generation = compactStatusInputRegionGeneration;
+            var startedAt = Date.now();
+            function sync() {
+                if (generation !== compactStatusInputRegionGeneration
+                    || prominentNoticeInteractive
+                    || !isStatusToastVisible()) return;
+                updateCompactStatusInputRegion(true);
+                if (Date.now() - startedAt >= 450
+                    || typeof window.requestAnimationFrame !== 'function') {
+                    compactStatusInputRegionFrame = null;
+                    return;
+                }
+                compactStatusInputRegionFrame = window.requestAnimationFrame(sync);
+            }
+            sync();
         }
 
         var toastRemaining = 3000; var toastStart = 0; var showTimer = null;
         function hideStatusNow() {
+            statusCopyRevision += 1;
+            stopCompactStatusInputRegionTracking();
             updateCompactStatusInputRegion(false);
             stopStatusPointerTracking(false);
             if (showTimer) { clearTimeout(showTimer); showTimer = null; }
@@ -278,6 +312,8 @@
             if (statusToast._focusOut) { statusToast.removeEventListener('focusout', statusToast._focusOut); statusToast._focusOut = null; }
             var _cb = statusToast.querySelector('#status-toast-close');
             if (_cb) { _cb.disabled = true; _cb.tabIndex = -1; _cb.setAttribute('aria-hidden','true'); if (document.activeElement === _cb) _cb.blur(); }
+            var _copyText = statusToast.querySelector('#status-toast-text');
+            if (_copyText) { _copyText.classList.remove('status-toast-copy-success'); _copyText.tabIndex = -1; _copyText.setAttribute('aria-hidden','true'); if (document.activeElement === _copyText) _copyText.blur(); }
             statusToast.classList.remove('show');
             statusToast.classList.add('hide');
             cleanupTimer = setTimeout(function() { var t=statusToast.querySelector('#status-toast-text'); if(t) t.textContent=''; Array.from(statusToast.childNodes).forEach(function(n){ if(n.nodeType===3) n.textContent=''; }); cleanupTimer=null; }, 400);
@@ -289,31 +325,42 @@
         }
         function copyStatusToastText(value) {
             if (!value) return Promise.resolve(false);
+            function copyWithWebClipboard() {
+                try {
+                    if (typeof navigator !== 'undefined'
+                        && navigator.clipboard
+                        && typeof navigator.clipboard.writeText === 'function') {
+                        return navigator.clipboard.writeText(value).then(function() { return true; }).catch(function() { return false; });
+                    }
+                } catch (_) { }
+                return Promise.resolve(false);
+            }
             try {
                 if (api && typeof api.copyText === 'function') {
                     return Promise.resolve(api.copyText(value)).then(function(result) {
-                        return result !== false;
-                    }).catch(function() { return false; });
-                }
-                if (typeof navigator !== 'undefined'
-                    && navigator.clipboard
-                    && typeof navigator.clipboard.writeText === 'function') {
-                    return navigator.clipboard.writeText(value).then(function() { return true; }).catch(function() { return false; });
+                        return result !== false ? true : copyWithWebClipboard();
+                    }).catch(copyWithWebClipboard);
                 }
             } catch (_) {
-                return Promise.resolve(false);
+                return copyWithWebClipboard();
             }
-            return Promise.resolve(false);
+            return copyWithWebClipboard();
         }
-        function showStatusToastCopyFeedback(textEl) {
+        function showStatusToastCopyFeedback(textEl, copyRevision) {
             textEl.classList.remove('status-toast-copy-success');
             void textEl.offsetWidth;
             textEl.classList.add('status-toast-copy-success');
-            setTimeout(function() { textEl.classList.remove('status-toast-copy-success'); }, 450);
+            setTimeout(function() {
+                if (statusCopyRevision === copyRevision) {
+                    textEl.classList.remove('status-toast-copy-success');
+                }
+            }, 450);
         }
         function showStatusToast(message, duration) {
             if (duration == null) duration = 3000;
             if (!message || !message.trim()) {
+                statusCopyRevision += 1;
+                stopCompactStatusInputRegionTracking();
                 updateCompactStatusInputRegion(false);
                 stopStatusPointerTracking(false);
                 if (showTimer) { clearTimeout(showTimer); showTimer=null; }
@@ -324,6 +371,7 @@
                 if (statusToast._focusIn) { statusToast.removeEventListener('focusin', statusToast._focusIn); statusToast._focusIn = null; }
                 if (statusToast._focusOut) { statusToast.removeEventListener('focusout', statusToast._focusOut); statusToast._focusOut = null; }
                 var _cb2=statusToast.querySelector('#status-toast-close'); if(_cb2){ _cb2.disabled=true; _cb2.tabIndex=-1; _cb2.setAttribute('aria-hidden','true'); if(document.activeElement===_cb2) _cb2.blur(); }
+                var _copyText2=statusToast.querySelector('#status-toast-text'); if(_copyText2){ _copyText2.classList.remove('status-toast-copy-success'); _copyText2.tabIndex=-1; _copyText2.setAttribute('aria-hidden','true'); if(document.activeElement===_copyText2) _copyText2.blur(); }
                 statusToast.classList.remove('show');
                 statusToast.classList.add('hide');
                 cleanupTimer = setTimeout(function() { var t=statusToast.querySelector('#status-toast-text'); if(t) t.textContent=''; Array.from(statusToast.childNodes).forEach(function(n){ if(n.nodeType===3) n.textContent=''; }); cleanupTimer=null; }, 400);
@@ -337,15 +385,29 @@
             if (!textEl) { textEl=document.createElement('span'); textEl.id='status-toast-text'; textEl.style.cssText='position:relative;z-index:1;flex:1;min-width:0;overflow-wrap:anywhere;'; statusToast.appendChild(textEl); }
             Array.from(statusToast.childNodes).forEach(function(n){ if(n!==textEl && n.nodeType===3) n.textContent=''; });
             if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
+            statusCopyRevision += 1;
+            var copyRevision = statusCopyRevision;
+            textEl.classList.remove('status-toast-copy-success');
             textEl.textContent = message;
             textEl.title = (typeof window.t === 'function')
                 ? window.t('chat.copyToClipboard', { defaultValue: 'Copy to clipboard' })
                 : 'Copy to clipboard';
-            textEl.onclick = function(e) {
+            textEl.setAttribute('role', 'button');
+            textEl.setAttribute('aria-hidden', 'false');
+            textEl.tabIndex = 0;
+            function copyCurrentMessage(e) {
                 e.stopPropagation();
                 copyStatusToastText(message).then(function(copied) {
-                    if (copied) showStatusToastCopyFeedback(textEl);
+                    if (copied && statusCopyRevision === copyRevision) {
+                        showStatusToastCopyFeedback(textEl, copyRevision);
+                    }
                 });
+            }
+            textEl.onclick = copyCurrentMessage;
+            textEl.onkeydown = function(e) {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                e.preventDefault();
+                copyCurrentMessage(e);
             };
             var closeBtn = statusToast.querySelector('#status-toast-close');
             if (!closeBtn) {
@@ -371,7 +433,7 @@
             showTimer = setTimeout(function() {
                 statusToast.classList.add('show');
                 showTimer=null;
-                updateCompactStatusInputRegion(true);
+                trackCompactStatusInputRegionThroughTransition();
                 startStatusPointerTracking();
             }, 10);
             if (statusToast._enter) statusToast.removeEventListener('mouseenter', statusToast._enter);
@@ -737,16 +799,18 @@
 
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) {
+                stopCompactStatusInputRegionTracking();
                 updateCompactStatusInputRegion(false);
                 stopStatusPointerTracking(false);
             } else if (isStatusToastVisible() && !prominentNoticeInteractive) {
-                updateCompactStatusInputRegion(true);
+                trackCompactStatusInputRegionThroughTransition();
                 startStatusPointerTracking();
             }
         });
 
         window.addEventListener('beforeunload', function() {
             prominentNoticeInteractive = false;
+            stopCompactStatusInputRegionTracking();
             updateCompactStatusInputRegion(false);
             stopStatusPointerTracking(true);
             setToastMouseThrough(true, true);

@@ -57,6 +57,12 @@ function createElement(tagName) {
 
 let document;
 
+function createDeferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 function createHarness(navigatorClipboard) {
   const statusToast = createElement('div');
   statusToast.id = 'status-toast';
@@ -128,4 +134,20 @@ test('ordinary web toast falls back when Clipboard API rejects', async () => {
   await clickToastText(harness);
 
   assert.deepEqual(harness.copied, ['copy']);
+});
+
+test('a delayed web copy cannot flash success on a newer toast', async () => {
+  const pendingCopy = createDeferred();
+  const harness = createHarness({ writeText: () => pendingCopy.promise });
+  harness.window.showStatusToast('first error');
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.onclick({ stopPropagation() {} });
+
+  harness.window.showStatusToast('second error');
+  pendingCopy.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(text.textContent, 'second error');
+  assert.equal(text.classList.contains('status-toast-copy-success'), false);
 });
