@@ -65,6 +65,7 @@ function createElement(tagName = 'div') {
     },
     focus() { document.activeElement = this; },
     blur() { if (document.activeElement === this) document.activeElement = null; },
+    select() {},
     getBoundingClientRect() {
       return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
     },
@@ -99,6 +100,7 @@ function createHarness(options = {}) {
   const mouseThrough = [];
   const copied = [];
   const statusInputRegions = [];
+  const legacyCopies = [];
   const timers = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
@@ -143,6 +145,10 @@ function createHarness(options = {}) {
         ));
       }
       return null;
+    },
+    execCommand(command) {
+      legacyCopies.push(command);
+      return command === 'copy';
     },
     addEventListener(type, listener) { documentListeners.set(type, listener); },
   };
@@ -200,6 +206,7 @@ function createHarness(options = {}) {
     statusToast,
     mouseThrough,
     copied,
+    legacyCopies,
     statusInputRegions,
     setStatusRect(rect) { statusRect = { ...rect }; },
     setCursor(point) { cursorPoint = point; },
@@ -306,6 +313,35 @@ test('dedicated toast falls back to the web clipboard when its bridge declines',
 
   assert.deepEqual(webCopies, ['bridge fallback']);
   assert.equal(text.classList.contains('status-toast-copy-success'), true);
+});
+
+test('dedicated toast falls back to legacy copy when bridge and web clipboard fail', async () => {
+  const harness = createHarness({
+    copyText: () => false,
+    navigatorClipboard: { writeText() { return Promise.reject(new Error('denied')); } },
+  });
+  harness.emitStatus('legacy fallback');
+
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.onclick({ stopPropagation() {} });
+  await flushPromises();
+
+  assert.deepEqual(harness.legacyCopies, ['copy']);
+  assert.equal(text.classList.contains('status-toast-copy-success'), true);
+});
+
+test('pointer copy releases focus and resumes auto-hide', () => {
+  const harness = createHarness();
+  harness.emitStatus('copy and close later');
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.focus();
+  harness.statusToast.dispatch('focusin');
+  assert.equal(harness.hasAutoHideTimer(), false);
+
+  text.onclick({ stopPropagation() {} });
+
+  assert.equal(document.activeElement, null);
+  assert.equal(harness.hasAutoHideTimer(), true);
 });
 
 test('ordinary status toast only captures input while the cursor is inside its rectangle', async () => {

@@ -523,7 +523,13 @@ I.mod = window.appUi;
                 }
             });
         };
-        textEl.onclick = copyCurrentMessage;
+        textEl.onclick = (e) => {
+            copyCurrentMessage(e);
+            if (document.activeElement === textEl) textEl.blur();
+            if (!I.S.statusToastTimeout && !statusToast.classList.contains('hide')) {
+                scheduleHide(I.S._statusToastRemaining != null ? I.S._statusToastRemaining : duration);
+            }
+        };
         textEl.onkeydown = (e) => {
             if (e.key !== 'Enter' && e.key !== ' ') return;
             e.preventDefault();

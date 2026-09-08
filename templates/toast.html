@@ -323,6 +323,41 @@
             toastRemaining = ms; toastStart = Date.now();
             statusTimeout = setTimeout(hideStatusNow, ms);
         }
+        function copyStatusToastTextLegacy(value) {
+            if (!document.body || typeof document.execCommand !== 'function') return false;
+            var activeElement = document.activeElement;
+            var selectionStart = activeElement && typeof activeElement.selectionStart === 'number'
+                ? activeElement.selectionStart
+                : null;
+            var selectionEnd = activeElement && typeof activeElement.selectionEnd === 'number'
+                ? activeElement.selectionEnd
+                : null;
+            var textArea = document.createElement('textarea');
+            textArea.value = value;
+            textArea.setAttribute('readonly', '');
+            textArea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+            document.body.appendChild(textArea);
+            var copied = false;
+            try {
+                textArea.focus({ preventScroll: true });
+                textArea.select();
+                copied = document.execCommand('copy') === true;
+            } catch (_) {
+                copied = false;
+            }
+            textArea.remove();
+            try {
+                if (activeElement && typeof activeElement.focus === 'function') {
+                    activeElement.focus({ preventScroll: true });
+                    if (selectionStart !== null
+                        && selectionEnd !== null
+                        && typeof activeElement.setSelectionRange === 'function') {
+                        activeElement.setSelectionRange(selectionStart, selectionEnd);
+                    }
+                }
+            } catch (_) { }
+            return copied;
+        }
         function copyStatusToastText(value) {
             if (!value) return Promise.resolve(false);
             function copyWithWebClipboard() {
@@ -330,10 +365,12 @@
                     if (typeof navigator !== 'undefined'
                         && navigator.clipboard
                         && typeof navigator.clipboard.writeText === 'function') {
-                        return navigator.clipboard.writeText(value).then(function() { return true; }).catch(function() { return false; });
+                        return navigator.clipboard.writeText(value)
+                            .then(function() { return true; })
+                            .catch(function() { return copyStatusToastTextLegacy(value); });
                     }
                 } catch (_) { }
-                return Promise.resolve(false);
+                return Promise.resolve(copyStatusToastTextLegacy(value));
             }
             try {
                 if (api && typeof api.copyText === 'function') {
@@ -403,7 +440,11 @@
                     }
                 });
             }
-            textEl.onclick = copyCurrentMessage;
+            textEl.onclick = function(e) {
+                copyCurrentMessage(e);
+                if (document.activeElement === textEl) textEl.blur();
+                if (statusToast._resumeAutoHide) statusToast._resumeAutoHide();
+            };
             textEl.onkeydown = function(e) {
                 if (e.key !== 'Enter' && e.key !== ' ') return;
                 e.preventDefault();

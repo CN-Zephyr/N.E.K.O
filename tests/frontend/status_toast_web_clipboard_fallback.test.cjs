@@ -136,6 +136,19 @@ test('ordinary web toast falls back when Clipboard API rejects', async () => {
   assert.deepEqual(harness.copied, ['copy']);
 });
 
+test('ordinary pointer copy releases focus and resumes auto-hide', () => {
+  const harness = createHarness(null);
+  harness.window.showStatusToast('copy and close later');
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.focus();
+  harness.window.appState.statusToastTimeout = null;
+
+  text.onclick({ stopPropagation() {} });
+
+  assert.equal(document.activeElement, null);
+  assert.notEqual(harness.window.appState.statusToastTimeout, null);
+});
+
 test('a delayed web copy cannot flash success on a newer toast', async () => {
   const pendingCopy = createDeferred();
   const harness = createHarness({ writeText: () => pendingCopy.promise });
