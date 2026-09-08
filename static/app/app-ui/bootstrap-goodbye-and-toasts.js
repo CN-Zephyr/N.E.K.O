@@ -434,14 +434,18 @@ I.mod = window.appUi;
         }
 
         function showStatusToastCopyFeedback(textEl, copyRevision) {
+            if (textEl._copyFeedbackTimer) clearTimeout(textEl._copyFeedbackTimer);
             textEl.classList.remove('status-toast-copy-success');
             void textEl.offsetWidth;
             textEl.classList.add('status-toast-copy-success');
-            setTimeout(() => {
+            const feedbackTimer = setTimeout(() => {
+                if (textEl._copyFeedbackTimer !== feedbackTimer) return;
                 if (statusToast._copyRevision === copyRevision) {
                     textEl.classList.remove('status-toast-copy-success');
                 }
+                textEl._copyFeedbackTimer = null;
             }, 450);
+            textEl._copyFeedbackTimer = feedbackTimer;
         }
 
         function hideNow() {
@@ -526,9 +530,7 @@ I.mod = window.appUi;
         textEl.onclick = (e) => {
             copyCurrentMessage(e);
             if (document.activeElement === textEl) textEl.blur();
-            if (!I.S.statusToastTimeout && !statusToast.classList.contains('hide')) {
-                scheduleHide(I.S._statusToastRemaining != null ? I.S._statusToastRemaining : duration);
-            }
+            if (statusToast._toastFocusOut) statusToast._toastFocusOut();
         };
         textEl.onkeydown = (e) => {
             if (e.key !== 'Enter' && e.key !== ' ') return;

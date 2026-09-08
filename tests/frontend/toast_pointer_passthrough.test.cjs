@@ -222,6 +222,9 @@ function createHarness(options = {}) {
     hasTimer(delay) {
       return Array.from(timers.values()).some((timer) => timer.delay === delay);
     },
+    countTimers(delay) {
+      return Array.from(timers.values()).filter((timer) => timer.delay === delay).length;
+    },
     // 自动消失计时器是唯一延迟大于 1s 的：show=10ms、轮询=50ms、cleanup=400ms。
     // 按区间而不是精确值判定，因为暂停/恢复会把剩余时长按实际经过时间扣掉。
     hasAutoHideTimer() {
@@ -342,6 +345,40 @@ test('pointer copy releases focus and resumes auto-hide', () => {
 
   assert.equal(document.activeElement, null);
   assert.equal(harness.hasAutoHideTimer(), true);
+});
+
+test('pointer copy keeps auto-hide paused while the toast remains hovered', () => {
+  const harness = createHarness();
+  harness.emitStatus('keep reading');
+  const text = harness.statusToast.querySelector('#status-toast-text');
+  text.focus();
+  harness.statusToast.dispatch('focusin');
+  harness.setHover(true);
+
+  text.onclick({ stopPropagation() {} });
+
+  assert.equal(document.activeElement, null);
+  assert.equal(harness.hasAutoHideTimer(), false);
+
+  harness.setHover(false);
+  harness.statusToast.dispatch('mouseleave');
+  assert.equal(harness.hasAutoHideTimer(), true);
+});
+
+test('dedicated repeated copies reset the success feedback timer', async () => {
+  const harness = createHarness();
+  harness.emitStatus('copy twice');
+  const text = harness.statusToast.querySelector('#status-toast-text');
+
+  text.onclick({ stopPropagation() {} });
+  await flushPromises();
+  text.onclick({ stopPropagation() {} });
+  await flushPromises();
+
+  assert.equal(harness.countTimers(450), 1);
+  assert.equal(text.classList.contains('status-toast-copy-success'), true);
+  harness.runTimer(450);
+  assert.equal(text.classList.contains('status-toast-copy-success'), false);
 });
 
 test('ordinary status toast only captures input while the cursor is inside its rectangle', async () => {

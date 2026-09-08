@@ -384,14 +384,18 @@
             return copyWithWebClipboard();
         }
         function showStatusToastCopyFeedback(textEl, copyRevision) {
+            if (textEl._copyFeedbackTimer) clearTimeout(textEl._copyFeedbackTimer);
             textEl.classList.remove('status-toast-copy-success');
             void textEl.offsetWidth;
             textEl.classList.add('status-toast-copy-success');
-            setTimeout(function() {
+            var feedbackTimer = setTimeout(function() {
+                if (textEl._copyFeedbackTimer !== feedbackTimer) return;
                 if (statusCopyRevision === copyRevision) {
                     textEl.classList.remove('status-toast-copy-success');
                 }
+                textEl._copyFeedbackTimer = null;
             }, 450);
+            textEl._copyFeedbackTimer = feedbackTimer;
         }
         function showStatusToast(message, duration) {
             if (duration == null) duration = 3000;
@@ -443,7 +447,7 @@
             textEl.onclick = function(e) {
                 copyCurrentMessage(e);
                 if (document.activeElement === textEl) textEl.blur();
-                if (statusToast._resumeAutoHide) statusToast._resumeAutoHide();
+                if (statusToast._focusOut) statusToast._focusOut();
             };
             textEl.onkeydown = function(e) {
                 if (e.key !== 'Enter' && e.key !== ' ') return;
