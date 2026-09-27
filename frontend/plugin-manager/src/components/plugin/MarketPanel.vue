@@ -253,6 +253,13 @@
           :title="t('market.rollbackIncomplete')"
         />
         <el-alert
+          v-if="installTaskWarnings.length > 0"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="t('package.install.completedWithWarnings', { plugin: activeInstallPluginName, reasons: installTaskWarnings.join('; ') })"
+        />
+        <el-alert
           v-if="activeInstallTask?.error"
           type="error"
           :closable="false"
@@ -345,6 +352,7 @@ import {
   type MarketPluginAction,
 } from '@/utils/marketPluginInstallState'
 import { resolvePluginInstallErrorKey } from '@/utils/pluginInstallError'
+import { collectPluginInstallWarnings, notifyPluginInstallOutcome } from '@/utils/pluginInstallResult'
 import {
   confirmBuiltinOverride,
   confirmManualTakeover,
@@ -405,6 +413,8 @@ interface MarketInstallTask {
   error?: string | null
   error_code?: string | null
   cancel_requested?: boolean
+  install_source_warning?: string | null
+  result?: { rollback_status?: string | null } | null
   rollback?: {
     running?: boolean
     restored?: boolean
@@ -445,9 +455,17 @@ const showInstallResumeBar = computed(
 const installTaskStatus = computed(() => {
   const status = activeInstallTask.value?.status
   if (status === 'failed') return 'exception'
-  if (status === 'completed') return 'success'
+  if (status === 'completed') {
+    return installTaskWarnings.value.length > 0 ? 'warning' : 'success'
+  }
   return undefined
 })
+
+const installTaskWarnings = computed(() =>
+  activeInstallTask.value?.status === 'completed'
+    ? collectPluginInstallWarnings(activeInstallTask.value)
+    : [],
+)
 
 const installRollbackIncomplete = computed(() => {
   const task = activeInstallTask.value
@@ -1089,10 +1107,19 @@ async function pollInstallTask(
         activeInstallTask.value = task
 
         if (task.status === 'completed') {
-          ElMessage.success(
-            mode !== 'install'
-              ? t('market.upgradeSuccess', { name: pluginName })
-              : t('market.installSuccess', { name: pluginName }),
+          notifyPluginInstallOutcome(
+            {
+              install_source_warning: task.install_source_warning,
+              rollback_status: task.result?.rollback_status,
+            },
+            t,
+            ElMessage,
+            {
+              plugin: pluginName,
+              successMessage: mode !== 'install'
+                ? t('market.upgradeSuccess', { name: pluginName })
+                : t('market.installSuccess', { name: pluginName }),
+            },
           )
           await pluginStore.syncRegistryAndFetch().catch(() => undefined)
           await yankSweep().catch(() => undefined)
