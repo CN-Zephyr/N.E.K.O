@@ -83,6 +83,10 @@ class MetricsCollector:
         self._cache: list[dict[str, object]] = []
         self._cache_timestamp: float = 0.0
         self._cache_ttl: float = 0.5  # 500ms 缓存
+
+        # 按 plugin_id 复用 psutil.Process（值为 (pid, Process)），
+        # 以便 cpu_percent(interval=None) 基于上次采样计算差值而不阻塞。
+        self._ps_processes: dict[str, tuple[int, object]] = {}
     
     async def start(self, plugin_hosts_getter: Callable[[], dict[str, object]]) -> None:
         """启动指标收集任务"""
@@ -114,6 +118,7 @@ class MetricsCollector:
                     continue
                 
                 plugin_hosts = self._plugin_hosts_getter()
+                self._prune_ps_processes(plugin_hosts or {})
                 if not plugin_hosts:
                     if PLUGIN_LOG_SERVER_DEBUG:
                         logger.debug("No plugin hosts available for metrics collection")
@@ -161,6 +166,27 @@ class MetricsCollector:
             
             await asyncio.sleep(self.interval)
     
+    def _prune_ps_processes(self, plugin_hosts: dict[str, object]) -> None:
+        """丢弃已不在 plugin_hosts 中的插件的 psutil.Process 缓存"""
+        with self._lock:
+            for stale_id in [cached_id for cached_id in self._ps_processes if cached_id not in plugin_hosts]:
+                del self._ps_processes[stale_id]
+
+    def _drop_ps_process(self, plugin_id: str) -> None:
+        with self._lock:
+            self._ps_processes.pop(plugin_id, None)
+
+    def _get_ps_process(self, plugin_id: str, pid: int) -> object:
+        """获取（或新建并缓存）plugin_id 对应 pid 的 psutil.Process；pid 变化时重建"""
+        with self._lock:
+            cached = self._ps_processes.get(plugin_id)
+            if cached is not None and cached[0] == pid:
+                return cached[1]
+        ps_process = psutil.Process(pid)
+        with self._lock:
+            self._ps_processes[plugin_id] = (pid, ps_process)
+        return ps_process
+
     def _collect_plugin_metrics_sync(self, plugin_id: str, host: object) -> PluginMetrics | None:
         """收集单个插件的性能指标"""
         if not PSUTIL_AVAILABLE:
@@ -172,10 +198,12 @@ class MetricsCollector:
             # 获取进程信息
             process = getattr(host, "process", None)
             if not process:
+                self._drop_ps_process(plugin_id)
                 logger.debug(f"No process object for plugin {plugin_id}")
                 return None
             
             if not process.is_alive():
+                self._drop_ps_process(plugin_id)
                 if PLUGIN_LOG_SERVER_DEBUG:
                     logger.debug(f"Process for plugin {plugin_id} is not alive (pid: {process.pid})")
                 return None
@@ -184,13 +212,16 @@ class MetricsCollector:
             
             # 使用psutil获取进程信息
             try:
-                ps_process = psutil.Process(pid)
-                cpu_percent = ps_process.cpu_percent(interval=0.1)
+                ps_process = self._get_ps_process(plugin_id, pid)
+                # 非阻塞采样：返回自上次调用以来的 CPU 占用。
+                # 新进程（或 pid 变化后）的首次调用仅用于建立基线，返回 0.0。
+                cpu_percent = ps_process.cpu_percent(interval=None)
                 memory_info = ps_process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
                 memory_percent = ps_process.memory_percent()
                 num_threads = ps_process.num_threads()
             except psutil.NoSuchProcess:
+                self._drop_ps_process(plugin_id)
                 if PLUGIN_LOG_SERVER_DEBUG:
                     logger.debug(f"Process {pid} for plugin {plugin_id} no longer exists (NoSuchProcess)")
                 return None
