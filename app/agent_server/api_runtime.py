@@ -740,9 +740,12 @@ async def startup():
 
     try:
         async def _http_plugin_provider(force_refresh: bool = False):
+            # Returns the running plugin list on success (may be empty when no
+            # plugin is running), or None when the fetch failed / timed out /
+            # returned a bad payload, so the caller keeps its last good cache.
+            # force_refresh only bypasses the caller-side cache: GET /plugins
+            # reads no refresh parameter (only ``locale``), so none is sent.
             url = f"http://127.0.0.1:{USER_PLUGIN_SERVER_PORT}/plugins"
-            if force_refresh:
-                url += "?refresh=true"
             try:
                 async with httpx.AsyncClient(timeout=1.0, proxy=None, trust_env=False) as client:
                     r = await client.get(url)
@@ -751,8 +754,11 @@ async def startup():
                             data = r.json()
                         except Exception as parse_err:
                             logger.debug(f"[Agent] plugin_list_provider parse error: {parse_err}")
-                            data = {}
-                        raw = data.get("plugins", []) or []
+                            return None
+                        raw = data.get("plugins") if isinstance(data, dict) else None
+                        if not isinstance(raw, list):
+                            logger.debug("[Agent] plugin_list_provider got malformed payload")
+                            return None
                         # ISOLATION BOUNDARY: only expose RUNNING plugins to the
                         # analyzer / plugin LLM. Without this filter, every plugin
                         # the host knows about (including disabled, stopped,
@@ -807,14 +813,23 @@ async def startup():
                                     )
                                 ]
                         return running
+                    logger.debug(f"[Agent] plugin_list_provider http status {r.status_code}")
             except Exception as e:
                 logger.debug(f"[Agent] plugin_list_provider http fetch failed: {e}")
-            return []
+            return None
 
         # inject http-based provider so DirectTaskExecutor can pick up user_plugin_server plugins
         try:
             Modules.task_executor.set_plugin_list_provider(_http_plugin_provider)
             logger.debug("[Agent] Registered http plugin_list_provider for task_executor")
+            # The plugin server is embedded in this process, so its lifecycle
+            # bus revision (bumped on every start/stop/reload/delete/load event)
+            # is a free in-process change signal for the analyze-turn cache.
+            from plugin.core.state import state as _plugin_state
+
+            Modules.task_executor.set_plugin_list_change_token(
+                lambda: _plugin_state.get_bus_rev("lifecycle")
+            )
         except Exception as e:
             logger.warning(f"[Agent] Failed to inject plugin_list_provider into task_executor: {e}")
     except Exception as e:
