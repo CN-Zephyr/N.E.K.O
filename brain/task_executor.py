@@ -75,6 +75,13 @@ from .plugin_filter import (
 
 logger = get_module_logger(__name__, "Agent")
 _TIMEOUT_UNSET = object()
+# analyze 回合复用插件列表缓存的最长时间。变更信号（见
+# set_plugin_list_change_token）覆盖启停/重载/卸载；TTL 兜底覆盖没有事件的
+# 变化（插件进程崩溃、registry refresh 后 manifest 变更）。
+_PLUGIN_LIST_CACHE_TTL_SECONDS = 30.0
+# 单独引用，便于测试注入确定性时钟。
+_monotonic = time.monotonic
+_PLUGIN_LIST_TOKEN_UNAVAILABLE = object()
 
 
 def _normalize_timeout_value(value: Any) -> float | None | object:
@@ -242,7 +249,7 @@ class DirectTaskExecutor:
         self._config_manager = get_config_manager()
         self.plugin_list = []
         self.user_plugin_enabled_default = False
-        self._external_plugin_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None
+        self._external_plugin_provider: Optional[Callable[[bool], Awaitable[Optional[List[Dict[str, Any]]]]]] = None
         # ChatOpenAI instance cache: keyed by (api_key, base_url, model, temperature, max_completion_tokens)
         self._cached_llms: dict[tuple, ChatOpenAI] = {}
         self._cached_llm_config_key: tuple = ()  # tracks (api_key, base_url, model) to detect config changes
@@ -256,10 +263,14 @@ class DirectTaskExecutor:
         self._short_desc_cache_filename = "plugin_short_desc_cache.json"
         self._short_desc_cache: dict[str, tuple[str, str]] = self._load_short_desc_cache()
         # plugin ids currently being generated in a background prewarm task —
-        # dedupes the per-analyze force_refresh so we don't pile up duplicate
+        # dedupes the per-analyze refresh so we don't pile up duplicate
         # generation tasks. The tasks set holds strong refs to prevent GC.
         self._short_desc_prewarm_inflight: set[str] = set()
         self._short_desc_prewarm_tasks: set = set()
+        # analyze 回合的插件列表缓存新鲜度：上次成功拉取的时间与变更信号值。
+        self._plugin_list_change_token: Optional[Callable[[], Any]] = None
+        self._plugin_list_fetched_at: Optional[float] = None
+        self._plugin_list_fetched_token: Any = None
         self._correction_memory_filename = "correction_memory.json"
         self._search_term_allowlist = {"id", "os", "db", "ui", "ux", "qa"}
         # 白名单 + alias 归一化，防止任意字符串被写进 correction_memory.json
@@ -302,8 +313,12 @@ class DirectTaskExecutor:
             )
         return set_active_character(master_name, lanlan_name or "")
 
-    def set_plugin_list_provider(self, provider: Callable[[bool], Awaitable[List[Dict[str, Any]]]]):
-        """Allow agent_server to inject a custom async provider for plugin discovery."""
+    def set_plugin_list_provider(self, provider: Callable[[bool], Awaitable[Optional[List[Dict[str, Any]]]]]):
+        """Allow agent_server to inject a custom async provider for plugin discovery.
+
+        The provider returns a list on a successful fetch (an empty list means
+        no plugin is running and clears the cache) and None when the fetch
+        failed, in which case the previous cache is kept."""
         self._external_plugin_provider = provider
 
     @staticmethod
@@ -312,6 +327,36 @@ class DirectTaskExecutor:
         only while the *full* description is unchanged; hashing keeps the key
         small (a plugin's raw description is uncapped)."""
         return hashlib.sha256((desc or "").encode("utf-8")).hexdigest()
+
+    def set_plugin_list_change_token(self, token_fn: Optional[Callable[[], Any]]) -> None:
+        """Inject a cheap, synchronous change signal for the plugin list.
+
+        ``token_fn`` returns a value that changes whenever the plugin list may
+        have changed (agent_server wires the embedded plugin server's lifecycle
+        revision). A cached list is reused only while the token is unchanged
+        and younger than ``_PLUGIN_LIST_CACHE_TTL_SECONDS``."""
+        self._plugin_list_change_token = token_fn
+
+    def _read_plugin_list_change_token(self) -> Any:
+        token_fn = getattr(self, "_plugin_list_change_token", None)
+        if token_fn is None:
+            return None
+        try:
+            return token_fn()
+        except Exception as e:
+            logger.debug("[Agent] plugin list change token failed: %s", e)
+            return _PLUGIN_LIST_TOKEN_UNAVAILABLE  # 读不到信号 → 视为已变化，强制刷新
+
+    def _plugin_list_cache_is_fresh(self) -> bool:
+        fetched_at = getattr(self, "_plugin_list_fetched_at", None)
+        if not self.plugin_list or fetched_at is None:
+            return False
+        if _monotonic() - fetched_at >= _PLUGIN_LIST_CACHE_TTL_SECONDS:
+            return False
+        token = self._read_plugin_list_change_token()
+        if token is _PLUGIN_LIST_TOKEN_UNAVAILABLE:
+            return False
+        return token == getattr(self, "_plugin_list_fetched_token", None)
 
     def _apply_cached_short_descriptions(self, plugins: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Apply manifest-provided or previously-generated short_description
@@ -355,7 +400,7 @@ class DirectTaskExecutor:
         lands in ``_short_desc_cache`` for subsequent analyze runs.
 
         Deduped by plugin id via ``_short_desc_prewarm_inflight`` so the
-        per-analyze ``force_refresh`` doesn't pile up duplicate generation tasks.
+        per-analyze refresh doesn't pile up duplicate generation tasks.
         """
         missing = self._apply_cached_short_descriptions(plugins)
         if not missing:
@@ -448,28 +493,42 @@ class DirectTaskExecutor:
             self._persist_generated_short_descriptions(generated)  # noqa: ASYNC_BLOCK — 无锁读-改-写 + 取消路径 finally，加 await 会引入互相覆盖/漏落盘
 
     async def plugin_list_provider(self, force_refresh: bool = True) -> List[Dict[str, Any]]:
-        # return cached list when allowed
-        if self.plugin_list and not force_refresh:
+        # return cached list when allowed and still fresh (no change signal,
+        # TTL not expired). An empty cache always fetches.
+        if not force_refresh and self._plugin_list_cache_is_fresh():
             return self.plugin_list
 
         # try external provider first (e.g., injected by agent_server)
         if self._external_plugin_provider is not None:
             try:
+                # 拉取前读信号：拉取期间发生的变更会让下一轮再刷新一次。
+                token_before = self._read_plugin_list_change_token()
                 plugins = await self._external_plugin_provider(force_refresh)
                 if isinstance(plugins, list):
                     self.plugin_list = plugins
+                    self._plugin_list_fetched_at = _monotonic()
+                    self._plugin_list_fetched_token = token_before
                     # Apply cached/manifest short_descriptions synchronously
                     # (zero LLM) and prewarm any missing ones in the background —
                     # never generate on the analyze hot path.
                     self._schedule_short_desc_prewarm(self.plugin_list)
                     logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
                     return self.plugin_list
+                if plugins is None:
+                    # Fetch failed / timed out: keep the last good cache rather
+                    # than wiping it for this (and later) turns.
+                    logger.debug(
+                        "[Agent] external plugin_list_provider fetch failed; keeping %d cached plugins",
+                        len(self.plugin_list),
+                    )
+                    return self.plugin_list
             except Exception as e:
                 logger.warning(f"[Agent] external plugin_list_provider failed: {e}")
 
         # fallback to built-in HTTP fetcher
-        if (self.plugin_list == []) or force_refresh:
+        if (self.plugin_list == []) or force_refresh or not self._plugin_list_cache_is_fresh():
             try:
+                token_before = self._read_plugin_list_change_token()
                 url = f"http://127.0.0.1:{USER_PLUGIN_SERVER_PORT}/plugins"
                 # increase timeout and avoid awaiting a non-awaitable .json()
                 timeout = httpx.Timeout(5.0, connect=2.0)
@@ -479,11 +538,14 @@ class DirectTaskExecutor:
                         data = resp.json()
                     except Exception:
                         logger.warning("[Agent] Failed to parse plugins response as JSON")
-                        data = {}
-                    plugin_list = data.get("plugins", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                    # only update cache when we obtained a non-empty list
-                    if plugin_list:
+                        data = None
+                    plugin_list = data.get("plugins") if isinstance(data, dict) else (data if isinstance(data, list) else None)
+                    # Only a successful response replaces the cache (an empty
+                    # list legitimately clears it); failures keep the last good one.
+                    if resp.status_code == 200 and isinstance(plugin_list, list):
                         self.plugin_list = plugin_list  # 更新实例变量
+                        self._plugin_list_fetched_at = _monotonic()
+                        self._plugin_list_fetched_token = token_before
                         # 同步应用缓存/manifest 的 short_description（零 LLM），
                         # 缺失的放后台预热，绝不在 analyze 热路径上现生成。
                         self._schedule_short_desc_prewarm(self.plugin_list)
@@ -2042,7 +2104,8 @@ class DirectTaskExecutor:
         # Plugin 支路
         plugins = []
         if user_plugin_enabled:
-            await self.plugin_list_provider()
+            # 普通回合复用缓存；列表可能变化（生命周期信号 / TTL）时才重新拉取。
+            await self.plugin_list_provider(force_refresh=False)
             plugins = self.plugin_list
         if user_plugin_enabled and plugins:
             parallel_tasks.append(('up', self._assess_user_plugin(conversation, plugins, lang=lang)))
