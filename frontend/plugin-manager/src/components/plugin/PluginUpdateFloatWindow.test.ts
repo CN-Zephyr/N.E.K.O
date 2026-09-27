@@ -10,9 +10,10 @@ type UpdatesStore = ReturnType<typeof usePluginUpdatesStore>
 const mocks = vi.hoisted(() => ({
   store: null as unknown as Record<string, unknown>,
   messages: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+  t: vi.fn((key: string, _params?: Record<string, unknown>) => key),
 }))
 
-vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
+vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: mocks.t }) }))
 vi.mock('element-plus', () => ({ ElMessage: mocks.messages }))
 vi.mock('@/stores/pluginUpdates', () => ({
   usePluginUpdatesStore: () => mocks.store as unknown as UpdatesStore,
@@ -264,6 +265,10 @@ describe('plugin update float window', () => {
 
       expect(mocks.messages.success).not.toHaveBeenCalled()
       expect(mocks.messages.warning).toHaveBeenCalledWith('package.install.completedWithWarnings')
+      expect(mocks.t).toHaveBeenCalledWith('package.install.completedWithWarnings', {
+        plugin: 'Alpha',
+        reasons: 'source record not saved',
+      })
     } finally {
       installTask.owner = null
       installTask.context = null
