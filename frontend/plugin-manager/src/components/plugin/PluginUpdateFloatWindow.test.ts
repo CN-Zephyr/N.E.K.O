@@ -21,7 +21,7 @@ vi.mock('@/stores/pluginUpdates', () => ({
 // The shared install-task store is exercised by its own spec; here it only has
 // to look idle so the progress panel stays hidden.
 // Reactive so the popup's close watcher sees slot / task changes like production.
-const installTask = reactive({ task: null as unknown, owner: null as string | null, reservation: null as string | null, running: false, done: false, dismiss: vi.fn(), percent: 0, warnings: [] as string[] })
+const installTask = reactive({ task: null as unknown, owner: null as string | null, reservation: null as string | null, context: null as { pluginId: string } | null, running: false, done: false, dismiss: vi.fn(), percent: 0, warnings: [] as string[] })
 vi.mock('@/stores/marketInstallTask', () => ({
   useMarketInstallTaskStore: () => installTask,
 }))
@@ -245,6 +245,30 @@ describe('plugin update float window', () => {
 
     expect(store.updateOne).toHaveBeenCalledWith('alpha')
     expect(mocks.messages.success).toHaveBeenCalledWith('pluginUpdates.updateSucceeded')
+  })
+
+  it('reports a warned upgrade as a warning, not a clean success', async () => {
+    const store = makeStore({ candidates: [candidate()] })
+    store.updateOne.mockImplementation(async () => {
+      installTask.owner = 'float'
+      installTask.context = { pluginId: 'alpha' }
+      installTask.warnings = ['source record not saved']
+      store.candidates = []
+      return true
+    })
+    try {
+      const root = mount()
+
+      ;(root.querySelector('.update-item__button') as HTMLButtonElement).click()
+      await nextTick()
+
+      expect(mocks.messages.success).not.toHaveBeenCalled()
+      expect(mocks.messages.warning).toHaveBeenCalledWith('package.install.completedWithWarnings')
+    } finally {
+      installTask.owner = null
+      installTask.context = null
+      installTask.warnings = []
+    }
   })
 
   it('stays quiet when the row is dropped without an upgrade', async () => {
