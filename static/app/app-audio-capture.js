@@ -3870,16 +3870,22 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                 });
             }
 
-            function openMicActionPanel(actionKey, openFn) {
+            function openMicActionPanel(actionKey, openFn, triggerEvent) {
                 clearMicActionHoverCollapseTimer();
                 var existing = getOwnedMicSubwindow();
                 if (activeMicActionKey === actionKey && existing && existing.isConnected) {
                     wireMicSubwindowHoverBridge(existing);
+                    // A click on a row whose panel was opened by hover finishes
+                    // any work that hover deferred (screen-source enumeration).
+                    if (triggerEvent && triggerEvent.type === 'click'
+                        && typeof existing._nekoOnExplicitOpen === 'function') {
+                        existing._nekoOnExplicitOpen();
+                    }
                     return Promise.resolve(existing);
                 }
                 activeMicActionKey = actionKey;
                 var generation = ++micActionHoverOpenGeneration;
-                return Promise.resolve(openFn()).then(function () {
+                return Promise.resolve(openFn(triggerEvent)).then(function () {
                     if (generation !== micActionHoverOpenGeneration || activeMicActionKey !== actionKey) return null;
                     var panel = getOwnedMicSubwindow();
                     if (panel) {
@@ -3891,21 +3897,55 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
             }
 
             function positionMicSubwindow(panel) {
-                if (!panel || !micPopup || !micPopup.isConnected) return;
+                if (!panel || !panel.isConnected || !micPopup || !micPopup.isConnected) return;
+                var anchor = leftColumn.querySelector('[data-neko-mic-main-action="' + activeMicActionKey + '"]') || micPopup;
+                if (window.AvatarPopupUI && typeof window.AvatarPopupUI.positionSidePanel === 'function') {
+                    panel._popupElement = micPopup;
+                    window.AvatarPopupUI.positionSidePanel(panel, anchor);
+                    // These panels appear immediately; keep the shared scale
+                    // without the entry-animation offset used by other menus.
+                    window.AvatarPopupUI.applySidePanelTransform(panel, 'none');
+                    return;
+                }
+                // Standalone pages without the shared helper still follow the
+                // owner's direction, shrinking instead of flipping by width.
                 var rect = micPopup.getBoundingClientRect();
+                var gap = 8;
+                var opensLeft = micPopup.dataset && micPopup.dataset.opensLeft === 'true';
+                var availableWidth = opensLeft ? rect.left - gap * 2 : window.innerWidth - rect.right - gap * 2;
+                var viewportWidth = Math.max(1, window.innerWidth - gap * 2);
+                var stackPanel = availableWidth < Math.min(240, viewportWidth);
+                panel.style.maxWidth = (stackPanel ? viewportWidth : availableWidth) + 'px';
+                if (panel._originalMaxHeight === undefined) {
+                    panel._originalMaxHeight = panel.style.maxHeight;
+                    panel._originalOverflowY = panel.style.overflowY;
+                } else {
+                    panel.style.maxHeight = panel._originalMaxHeight;
+                    panel.style.overflowY = panel._originalOverflowY;
+                }
                 var panelWidth = panel.offsetWidth || 320;
                 var panelHeight = panel.offsetHeight || 360;
-                var gap = 8;
-                var left = rect.right + gap;
-                var opensLeft = micPopup.dataset && micPopup.dataset.opensLeft === 'true';
-                if (opensLeft || left + panelWidth > window.innerWidth - gap) {
-                    left = rect.left - panelWidth - gap;
+                var left = opensLeft ? rect.left - panelWidth - gap : rect.right + gap;
+                var desiredTop = rect.top;
+                if (stackPanel) {
+                    left = Math.min(rect.left, window.innerWidth - panelWidth - gap);
+                    var above = Math.max(0, rect.top - gap * 2);
+                    var below = Math.max(0, window.innerHeight - rect.bottom - gap * 2);
+                    var placeBelow = below >= panelHeight || (above < panelHeight && below >= above);
+                    panel.style.maxHeight = Math.max(1, Math.min(panelHeight, placeBelow ? below : above)) + 'px';
+                    panel.style.overflowY = 'auto';
+                    panelHeight = panel.offsetHeight;
+                    desiredTop = placeBelow ? rect.bottom + gap : rect.top - panelHeight - gap;
                 }
-                left = Math.max(gap, Math.min(left, window.innerWidth - panelWidth - gap));
-                var top = Math.max(gap, Math.min(rect.top, window.innerHeight - panelHeight - gap));
+                left = Math.max(gap, left);
+                var top = Math.max(gap, Math.min(desiredTop, window.innerHeight - panelHeight - gap));
                 panel.style.left = left + 'px';
                 panel.style.top = top + 'px';
             }
+
+            addVoiceWindowListener('resize', function () {
+                positionMicSubwindow(getOwnedMicSubwindow());
+            });
 
             function createMicSubwindow(title, iconText, width) {
                 // Keep activeMicActionKey; only tear down the previous DOM panel.
@@ -4086,25 +4126,24 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
 
                 function openActionPanel(event) {
                     actionSurface().style.background = 'var(--neko-popup-hover)';
-                    return openMicActionPanel(actionKey, onClick).catch(function (error) {
+                    return openMicActionPanel(actionKey, onClick, event).catch(function (error) {
                         console.error('[麦克风弹窗] 子窗口打开失败:', error);
                     });
                 }
 
-                // Most settings side panels may expand on hover. Screen-source
-                // enumeration is different: on Linux it can invoke
-                // xdg-desktop-portal and show an OS sharing dialog, so that
-                // action must require an explicit click/user gesture.
-                if (interactionOptions.openOnHover !== false) {
-                    button.addEventListener('mouseenter', function (event) {
+                // Resolve hover permission at event time: desktop bridges may
+                // arrive after rendering.
+                button.addEventListener('mouseenter', function (event) {
+                    var openOnHover = typeof interactionOptions.openOnHover === 'function'
+                        ? interactionOptions.openOnHover()
+                        : interactionOptions.openOnHover !== false;
+                    if (openOnHover) {
                         openActionPanel(event);
-                    });
-                } else {
-                    button.addEventListener('mouseenter', function () {
+                    } else {
                         clearMicActionHoverCollapseTimer();
                         actionSurface().style.background = 'var(--neko-popup-hover)';
-                    });
-                }
+                    }
+                });
                 button.addEventListener('mouseleave', function () {
                     // Shared rows own the full hover surface, including any
                     // sibling toggle. Their mouseleave handler closes the panel.
@@ -4393,12 +4432,59 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                 requestAnimationFrame(function () { positionMicSubwindow(panel); });
             }
 
-            async function openScreenSourceSubwindow() {
+            async function openScreenSourceSubwindow(triggerEvent) {
                 var panel = createMicSubwindow(
                     window.t ? window.t('buttons.screenShare') : 'Screen Share',
                     null,
                     '360px'
                 );
+                var provider = typeof window.getDesktopCaptureProvider === 'function'
+                    ? window.getDesktopCaptureProvider() : null;
+                var mobileCamera = window.appUtils && typeof window.appUtils.isMobile === 'function'
+                    && window.appUtils.isMobile();
+                var browserCaptureAvailable = navigator.mediaDevices && (mobileCamera
+                    ? typeof navigator.mediaDevices.getUserMedia === 'function'
+                    : typeof navigator.mediaDevices.getDisplayMedia === 'function');
+                if ((mobileCamera || !provider) && browserCaptureAvailable) {
+                    var browserBody = panel._nekoMicSubwindowBody;
+                    var hint = document.createElement('div');
+                    var hintKey = mobileCamera ? 'app.screenSource.mobileCameraHint' : 'app.screenSource.browserPickerHint';
+                    hint.textContent = window.t ? window.t(hintKey)
+                        : (mobileCamera ? 'When sharing starts, your camera will be used.'
+                            : 'When sharing starts, your browser will ask you to choose a tab, window, or screen.');
+                    Object.assign(hint.style, { padding: '8px', fontSize: '13px', color: 'var(--neko-popup-text-sub)' });
+                    var browserShareButton = document.createElement('button');
+                    browserShareButton.type = 'button';
+                    browserShareButton.dataset.nekoBrowserScreenShare = '';
+                    browserShareButton.textContent = shareToggleButton.getAttribute('aria-label')
+                        || (window.t ? window.t('buttons.screenShare') : 'Screen Share');
+                    Object.assign(browserShareButton.style, {
+                        padding: '10px', border: 'none', borderRadius: '6px', cursor: 'pointer',
+                        color: 'var(--neko-popup-text)', background: 'var(--neko-popup-selected-bg)'
+                    });
+                    browserShareButton.addEventListener('click', function (event) {
+                        event.stopPropagation();
+                        var currentProvider = typeof window.getDesktopCaptureProvider === 'function'
+                            ? window.getDesktopCaptureProvider() : null;
+                        var startPending = typeof window.isScreenSharingStartPending === 'function'
+                            && window.isScreenSharingStartPending();
+                        if (!mobileCamera && currentProvider && !isScreenShareActive() && !startPending) {
+                            // The bridge can arrive after this browser panel opens.
+                            // Show its sources before allowing a new capture start.
+                            closeMicSubwindow();
+                            openMicActionPanel('screen', openScreenSourceSubwindow);
+                            return;
+                        }
+                        closeMicSubwindow();
+                        // Preserve the click gesture and reuse voice gating,
+                        // cancellation and stream cleanup from the main switch.
+                        shareToggleButton.click();
+                    });
+                    browserBody.appendChild(hint);
+                    browserBody.appendChild(browserShareButton);
+                    positionMicSubwindow(panel);
+                    return;
+                }
                 var headerActions = panel._nekoMicSubwindowHeaderActions;
                 if (headerActions
                     && typeof window.isScreenSourceTitleMatchEnabled === 'function'
@@ -4446,7 +4532,24 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                 // （createScreenShareToggleButton），子窗口仅保留屏幕/窗口源列表。
                 positionMicSubwindow(panel);
                 if (typeof window.renderFloatingScreenSourceList === 'function') {
-                    await window.renderFloatingScreenSourceList(screenSourceList, { requireVisible: false });
+                    // Linux source enumeration can show an OS sharing dialog
+                    // (xdg-desktop-portal). Hover only opens the panel; the
+                    // user clicks the row or the panel's button to enumerate.
+                    // Providers that predate the flag are treated as prompting.
+                    var deferEnumeration = !!(triggerEvent && triggerEvent.type === 'mouseenter'
+                        && provider && provider.sourceEnumerationMayPrompt !== false);
+                    panel._nekoOnExplicitOpen = function () {
+                        var loadButton = screenSourceList.querySelector(
+                            '[data-neko-screen-source-deferred-load]'
+                        );
+                        if (loadButton) loadButton.click();
+                    };
+                    await window.renderFloatingScreenSourceList(screenSourceList, {
+                        requireVisible: false,
+                        deferEnumeration: deferEnumeration,
+                        retryOnFailure: true,
+                        onDeferredRender: function () { positionMicSubwindow(panel); }
+                    });
                     positionMicSubwindow(panel);
                 }
             }
@@ -4483,14 +4586,26 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
             }
             var currentSpeakerLabel = getCurrentSpeakerLabel();
 
+            function getCurrentScreenSourceLabel() {
+                var sourceLabel = typeof window.getSelectedScreenSourceLabel === 'function'
+                    ? window.getSelectedScreenSourceLabel() : '';
+                // 未选择来源时同样用单数的「屏幕」，不用来源列表的复数分组标题。
+                return sourceLabel || (window.t ? window.t('app.screenSource.genericScreen') : 'Screen');
+            }
+            var currentScreenSourceLabel = getCurrentScreenSourceLabel();
+
             var firstContent = leftColumn.firstChild;
             var screenActionButton = createMainActionButton(
                 null,
                 screenButtonLabel,
-                window.t ? window.t('app.screenSource.screens') : 'Screens',
+                currentScreenSourceLabel,
                 'screen',
                 openScreenSourceSubwindow,
-                { openOnHover: false }
+                { openOnHover: function () {
+                    var provider = typeof window.getDesktopCaptureProvider === 'function'
+                        ? window.getDesktopCaptureProvider() : null;
+                    return !provider || typeof provider.getSources === 'function';
+                } }
             );
             var shareToggleButton = createScreenShareToggleButton({ mini: true });
             var screenActionRow = createMainActionRow(
@@ -4498,6 +4613,17 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                 shareToggleButton
             );
             leftColumn.insertBefore(screenActionRow, firstContent);
+            var screenSummary = screenActionButton.querySelector('.neko-mic-action-sub-label');
+            if (screenSummary) {
+                screenSummary.setAttribute('aria-live', 'polite');
+                screenSummary.title = currentScreenSourceLabel;
+                // 选择、自动回退和其他窗口的选择都会派发该事件。
+                addVoiceWindowListener('neko:screen-source-changed', function () {
+                    var nextLabel = getCurrentScreenSourceLabel();
+                    screenSummary.textContent = nextLabel;
+                    screenSummary.title = nextLabel;
+                });
+            }
             // 主按钮展开屏幕源，右侧独立按钮开始/停止共享；二者共用行级悬停生命周期。
             // 屏幕共享行：标题允许换行显示（去掉省略号截断），
             // 保证葡语 "Compartilhamento de tela"、俄语 "Демонстрация экрана" 等长文案也能完整显示
