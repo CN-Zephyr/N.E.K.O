@@ -29,8 +29,8 @@
     const SUPPORTED_LANGUAGES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt'];
 
     // locale 资源版本（用于 cache-busting，避免客户端长期缓存旧语言包导致新增 key 不生效）
-    // 合入主分支屏幕授权等待提示、唤醒词/插件 HTML 卡片提示与独立 ASR 恢复提示，递增版本让长期缓存重新拉取完整语言包。
-    const LOCALE_VERSION = '2026-09-27-asr-recovery-main-merge';
+    // 在 GLM 声音复刻、声纹四段录入等主分支 key 之上，新增屏幕来源「点击选择」「重新选择」按钮、单数的「屏幕/窗口」兜底文案与「当前来源」摘要，递增版本让长期缓存重新拉取完整语言包。
+    const LOCALE_VERSION = '2026-09-29-screen-source-current-summary';
     function initDecorativeImageDragGuard() {
         const markImage = (img) => {
             if (!(img instanceof HTMLImageElement)) return;
