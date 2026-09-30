@@ -364,9 +364,13 @@ export const usePluginStore = defineStore('plugin', () => {
     // failed refetch, and the switch reads the cached detail first, so it
     // would otherwise keep showing the old preference after a success toast.
     const saved = typeof result?.auto_start === 'boolean' ? result.auto_start : autoStart
-    // A detail request started before the PUT (e.g. a cached-entry revalidation)
-    // carries the old preference; fence it off so it cannot overwrite this value.
+    // Detail and summary requests started before the PUT (e.g. a cached-entry
+    // revalidation) carry the old preference; fence them off so they cannot
+    // overwrite this value.
     invalidateDetail(pluginId)
+    fetchSummariesSeq += 1
+    pendingFetchSummaries = null
+    pendingFetchSummariesLocale = null
     const detail = pluginDetails.value[pluginId]
     if (detail) {
       pluginDetails.value = { ...pluginDetails.value, [pluginId]: { ...detail, runtime_auto_start: saved } }

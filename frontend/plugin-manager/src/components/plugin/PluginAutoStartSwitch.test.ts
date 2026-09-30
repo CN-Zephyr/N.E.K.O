@@ -169,6 +169,22 @@ describe('PluginAutoStartSwitch', () => {
     app.unmount()
   })
 
+  it('ignores a summary request that was already in flight before the save', async () => {
+    let resolveStale: (value: unknown) => void = () => {}
+    apiMocks.getPluginSummaries.mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    const { app } = mount(true)
+    const store = usePluginStore()
+    const stale = store.fetchPluginSummaries(true)
+
+    await store.setAutoStart('demo', false, { refresh: false })
+    resolveStale({ plugins: [{ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true }] })
+    await stale
+
+    expect(store.getPluginById('demo')?.autoStart).toBe(false)
+    app.unmount()
+  })
+
   it('shows a read-only switch for development plugins', async () => {
     const { app, button } = mount(false, { source: 'development' })
     await flushPromises()
