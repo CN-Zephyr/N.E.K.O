@@ -170,6 +170,9 @@ def _plugin_list_change_token() -> tuple:
     ``running`` (``runtime_source_missing`` / ``runtime_load_state == "failed"``,
     see ``_resolve_plugin_status``) is left out of the alive set, so marking
     it moves the token and a failed refresh cannot keep offering it.
+
+    The handlers revision covers dynamic entry register/unregister (e.g.
+    ``disable_entry``), which changes ``/plugins`` without a lifecycle event.
     """
     from plugin.core.state import state as plugin_state
 
@@ -190,7 +193,8 @@ def _plugin_list_change_token() -> tuple:
                 alive.append(str(plugin_id))
         except Exception:
             continue
-    return plugin_state.get_bus_rev("lifecycle"), tuple(sorted(alive))
+    revision = (plugin_state.get_bus_rev("lifecycle"), plugin_state.get_event_handlers_revision())
+    return revision, tuple(sorted(alive))
 
 
 def _check_agent_api_gate() -> Dict[str, Any]:

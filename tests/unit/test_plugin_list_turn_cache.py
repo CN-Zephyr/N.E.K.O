@@ -438,3 +438,72 @@ def test_stale_hosts_snapshot_does_not_overwrite_invalidated_cache(monkeypatch, 
     monkeypatch.setattr(lock, "release_read", real_release, raising=False)
     # The stale snapshot must not have been cached as fresh.
     assert set(read()) == {"demo", "late"}
+
+
+def _entry_handler(entry_id: str):
+    from plugin._types.events import EventHandler, EventMeta
+
+    meta = EventMeta(event_type="plugin_entry", id=entry_id, name=entry_id)
+    return EventHandler(meta=meta, handler=lambda *a, **k: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["register", "unregister"])
+async def test_dynamic_entry_change_moves_token_and_refetches(monkeypatch, clock, change):
+    # enable_entry / disable_entry of a dynamic entry emits ENTRY_UPDATE, which
+    # only touches event_handlers: no lifecycle event, host still alive.
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    st.plugin_hosts["demo"] = _AliveHost()
+    st.plugins["demo"] = {"id": "demo"}
+    if change == "unregister":
+        st.register_event_handler("demo", _entry_handler("dynamic"))
+
+    provider = _Provider()
+    ex = _executor(monkeypatch, provider, token_fn=srv._plugin_list_change_token)
+    await _turns(ex, 2)
+    assert provider.calls == 1
+    before = srv._plugin_list_change_token()
+
+    if change == "register":
+        st.register_event_handler("demo", _entry_handler("dynamic"))
+    else:
+        st.unregister_event_handler("demo", "dynamic")
+
+    after = srv._plugin_list_change_token()
+    assert after[0][0] == before[0][0]  # lifecycle revision unchanged
+    assert after[1] == before[1] == ("demo",)
+    assert after != before
+    await _turns(ex, 1)
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executing_entry_leaves_handlers_revision_unchanged(monkeypatch):
+    # The token must stay put across ordinary entry runs, or the cache is useless.
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+    from plugin.runs import trigger_service
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    monkeypatch.setattr(trigger_service, "state", st)
+    st.plugin_hosts["demo"] = _AliveHost()
+    st.plugins["demo"] = {"id": "demo"}
+    st.register_event_handler("demo", _entry_handler("run"))
+
+    class _TriggerHost:
+        async def trigger(self, entry_id, args, timeout):
+            return {"ok": True}
+
+    before = srv._plugin_list_change_token()
+    revision = st.get_event_handlers_revision()
+    for _ in range(3):
+        await trigger_service._execute_trigger(
+            host=_TriggerHost(), plugin_id="demo", entry_id="run", args={}, trace_id="t",
+        )
+    assert st.get_event_handlers_revision() == revision
+    assert srv._plugin_list_change_token() == before

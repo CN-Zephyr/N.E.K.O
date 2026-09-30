@@ -397,6 +397,13 @@ class GlobalState:
         with self._snapshot_cache_lock:
             return self._snapshot_cache_gen[cache_type]
 
+    def get_event_handlers_revision(self) -> int:
+        """entry 注册/注销（含动态 entry 启停）时递增；执行 entry 不变。
+
+        只拿短的快照缓存锁、不碰 handlers 读写锁，可在事件循环上同步调用。
+        """
+        return self._snapshot_cache_generation("handlers")
+
     def _store_snapshot_cache(self, cache_type: str, snapshot: Dict[str, Any], now: float, generation: int) -> None:
         """仅当取快照期间缓存未被失效时写回缓存。"""
         with self._snapshot_cache_lock:

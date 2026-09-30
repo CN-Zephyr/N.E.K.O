@@ -261,6 +261,10 @@ class DirectTaskExecutor:
         self._plugin_list_change_token: Optional[Callable[[], Any]] = None
         self._plugin_list_fetched_at: Optional[float] = None
         self._plugin_list_fetched_token: Any = None
+        # 刷新序号：/plugin/execute 不持 analyze_lock，并发刷新时先发起、后返回的
+        # 旧结果不得覆盖已发布的新结果。
+        self._plugin_list_request_seq = 0
+        self._plugin_list_published_seq = 0
         self._correction_memory_filename = "correction_memory.json"
         self._search_term_allowlist = {"id", "os", "db", "ui", "ux", "qa"}
         # 白名单 + alias 归一化，防止任意字符串被写进 correction_memory.json
@@ -531,6 +535,29 @@ class DirectTaskExecutor:
             # analyze 热路径上。
             self._persist_generated_short_descriptions(generated)  # noqa: ASYNC_BLOCK — 无锁读-改-写 + 取消路径 finally，加 await 会引入互相覆盖/漏落盘
 
+    def _next_plugin_list_request_seq(self) -> int:
+        seq = getattr(self, "_plugin_list_request_seq", 0) + 1
+        self._plugin_list_request_seq = seq
+        return seq
+
+    def _publish_plugin_list(self, plugins: List[Dict[str, Any]], token_before: Any, request_seq: int) -> List[Dict[str, Any]]:
+        """Publish a successful fetch unless a newer request already published.
+
+        Synchronous on purpose: the compare and the write must not be split by
+        an await. A stale response returns the current cache and skips prewarm.
+        """
+        if request_seq <= getattr(self, "_plugin_list_published_seq", 0):
+            logger.debug("[Agent] discarding stale plugin list response (seq=%d)", request_seq)
+            return self.plugin_list
+        self._plugin_list_published_seq = request_seq
+        self.plugin_list = plugins
+        self._plugin_list_fetched_at = _monotonic()
+        self._plugin_list_fetched_token = token_before
+        # Apply cached/manifest short_descriptions synchronously (zero LLM) and
+        # prewarm missing ones in the background, never on the analyze hot path.
+        self._schedule_short_desc_prewarm(self.plugin_list)
+        return self.plugin_list
+
     async def plugin_list_provider(self, force_refresh: bool = True) -> List[Dict[str, Any]]:
         # return cached list when allowed and still fresh (no change signal,
         # TTL not expired). An empty cache always fetches.
@@ -542,15 +569,10 @@ class DirectTaskExecutor:
             try:
                 # 拉取前读信号：拉取期间发生的变更会让下一轮再刷新一次。
                 token_before = self._read_plugin_list_change_token()
+                request_seq = self._next_plugin_list_request_seq()
                 plugins = await self._external_plugin_provider(force_refresh)
                 if isinstance(plugins, list):
-                    self.plugin_list = plugins
-                    self._plugin_list_fetched_at = _monotonic()
-                    self._plugin_list_fetched_token = token_before
-                    # Apply cached/manifest short_descriptions synchronously
-                    # (zero LLM) and prewarm any missing ones in the background —
-                    # never generate on the analyze hot path.
-                    self._schedule_short_desc_prewarm(self.plugin_list)
+                    self._publish_plugin_list(plugins, token_before, request_seq)
                     logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
                     return self.plugin_list
                 if plugins is None:
@@ -569,6 +591,7 @@ class DirectTaskExecutor:
         if (self.plugin_list == []) or force_refresh or not self._plugin_list_cache_is_fresh():
             try:
                 token_before = self._read_plugin_list_change_token()
+                request_seq = self._next_plugin_list_request_seq()
                 url = f"http://127.0.0.1:{USER_PLUGIN_SERVER_PORT}/plugins"
                 # increase timeout and avoid awaiting a non-awaitable .json()
                 timeout = httpx.Timeout(5.0, connect=2.0)
@@ -586,12 +609,7 @@ class DirectTaskExecutor:
                     if resp.status_code != 200 or not isinstance(plugin_list, list):
                         self._prune_plugin_list_on_fetch_failure()
                     else:
-                        self.plugin_list = plugin_list  # 更新实例变量
-                        self._plugin_list_fetched_at = _monotonic()
-                        self._plugin_list_fetched_token = token_before
-                        # 同步应用缓存/manifest 的 short_description（零 LLM），
-                        # 缺失的放后台预热，绝不在 analyze 热路径上现生成。
-                        self._schedule_short_desc_prewarm(self.plugin_list)
+                        self._publish_plugin_list(plugin_list, token_before, request_seq)
             except Exception as e:
                 logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
                 self._prune_plugin_list_on_fetch_failure()
