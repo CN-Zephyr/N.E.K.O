@@ -2336,29 +2336,31 @@ class DirectTaskExecutor:
                 reason=reason
             )
         
-        # Ensure we have a plugins list to search (use cached self.plugin_list as fallback)
+        def _find_plugin_meta(candidates: List[Any]) -> Optional[Dict[str, Any]]:
+            for p in candidates:
+                try:
+                    if isinstance(p, dict) and p.get("id") == plugin_id:
+                        return p
+                except Exception:
+                    logger.debug(f"[UserPlugin] Skipped malformed plugin entry during lookup: {p}", exc_info=True)
+            return None
+
+        # Search the cached self.plugin_list first.
         try:
             plugins_list = self.plugin_list or []
         except Exception:
             plugins_list = []
-        # If cache is empty, attempt to refresh once
-        if not plugins_list:
+        plugin_meta = _find_plugin_meta(plugins_list)
+        # Refresh once if the plugin is missing, even from a non-empty cache: the
+        # analyze turn may have chosen it from its own (overtaken, unpublished)
+        # fetch, so the shared cache can lag behind that turn's catalog.
+        if plugin_meta is None:
             try:
                 plugins_list = await self.plugin_list_provider(force_refresh=True) or []
             except Exception:
                 plugins_list = []
-        
-        # Find plugin metadata in the resolved plugins list
-        plugin_meta = None
-        for p in plugins_list:
-            try:
-                if isinstance(p, dict) and p.get("id") == plugin_id:
-                    plugin_meta = p
-                    break
-            except Exception:
-                logger.debug(f"[UserPlugin] Skipped malformed plugin entry during lookup: {p}", exc_info=True)
-                continue
-        
+            plugin_meta = _find_plugin_meta(plugins_list)
+
         if plugin_meta is None:
             return TaskResult(
                 task_id=task_id,

@@ -262,3 +262,30 @@ async def test_overtaken_response_keeps_plugin_missing_from_lagging_snapshot(mon
     await task_b
     gate.release[0].set()
     assert await task_a == [{"id": "a"}, {"id": "fresh"}]
+
+
+async def test_execute_refetches_plugin_missing_from_nonempty_cache():
+    # The analyze turn chose "a" from its own overtaken fetch, so the shared
+    # cache only has "b". Execution must refetch instead of reporting not found.
+    provider = AsyncMock(return_value=[{"id": "a", "entries": []}])
+    executor = _make_executor([{"id": "b"}], provider)
+    result = await executor._execute_user_plugin("t1", plugin_id="a")
+    provider.assert_awaited_once()
+    # Found after the refetch; stops at the entry check before any /runs call.
+    assert result.reason == "no_agent_visible_entries"
+
+
+async def test_execute_cache_hit_does_not_refetch():
+    provider = AsyncMock(return_value=[])
+    executor = _make_executor([{"id": "a", "entries": []}], provider)
+    result = await executor._execute_user_plugin("t1", plugin_id="a")
+    provider.assert_not_awaited()
+    assert result.reason == "no_agent_visible_entries"
+
+
+async def test_execute_reports_not_found_after_refetch_misses():
+    provider = AsyncMock(return_value=[{"id": "b"}])
+    executor = _make_executor([{"id": "b"}], provider)
+    result = await executor._execute_user_plugin("t1", plugin_id="a")
+    provider.assert_awaited_once()
+    assert result.error == "Plugin a not found"
