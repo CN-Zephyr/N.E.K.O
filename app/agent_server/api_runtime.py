@@ -160,10 +160,17 @@ def _plugin_list_change_token() -> tuple:
     process that dies on its own emits no event — so the set of hosts whose
     process is still alive (the same check ``GET /plugins`` uses to report
     ``running``) is part of the token too.
+
+    Called synchronously on the event loop, so it must never wait on the
+    plugin-hosts read/write lock: the snapshot is taken without blocking and,
+    when no snapshot is available at all, the token is reported unreadable
+    (the executor then refetches ``/plugins`` asynchronously).
     """
     from plugin.core.state import state as plugin_state
 
-    hosts = plugin_state.get_plugin_hosts_snapshot_cached(timeout=0.5)
+    hosts = plugin_state.get_plugin_hosts_snapshot_nowait()
+    if hosts is None:
+        raise RuntimeError("plugin hosts snapshot unavailable without blocking")
     alive = []
     for plugin_id, host in hosts.items():
         try:

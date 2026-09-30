@@ -17,6 +17,8 @@ every turn; it re-fetches only when the change token moves, the TTL expires,
 or the cache is empty."""
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 import brain.task_executor as te
@@ -238,7 +240,7 @@ def test_agent_change_token_tracks_host_liveness(monkeypatch):
 
     host = _Host(True)
     monkeypatch.setattr(
-        state, "get_plugin_hosts_snapshot_cached", lambda timeout=2.0, force=False: {"demo": host}
+        state, "get_plugin_hosts_snapshot_nowait", lambda: {"demo": host}
     )
     before = srv._plugin_list_change_token()
     assert before[1] == ("demo",)
@@ -257,3 +259,99 @@ def test_lifecycle_event_bumps_change_token():
     before = state.get_bus_rev("lifecycle")
     emit_lifecycle_event({"type": "plugin_started", "plugin_id": "demo"})
     assert state.get_bus_rev("lifecycle") > before
+
+
+def _failing_provider():
+    async def failing(force_refresh):
+        return None  # transient /plugins timeout
+
+    return failing
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_after_ttl_keeps_alive_plugins(monkeypatch, clock):
+    # TTL expiry alone does not mean the plugin stopped: a transient failure
+    # keeps plugins whose host is still alive, and the next turn retries.
+    provider = _Provider()
+    ex = _executor(monkeypatch, provider, token_fn=lambda: (1, ("demo",)))
+    await _turns(ex, 1)
+    ex._external_plugin_provider = _failing_provider()
+    clock.now += te._PLUGIN_LIST_CACHE_TTL_SECONDS + 1
+    assert await ex.plugin_list_provider(force_refresh=False) == PLUGINS
+
+    ex._external_plugin_provider = provider
+    await _turns(ex, 1)
+    assert provider.calls == 2  # pruned list is not treated as fresh
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_after_unrelated_event_keeps_alive_plugins(monkeypatch, clock):
+    token = {"v": (1, ("demo",))}
+    ex = _executor(monkeypatch, _Provider(), token_fn=lambda: token["v"])
+    await _turns(ex, 1)
+    ex._external_plugin_provider = _failing_provider()
+    token["v"] = (2, ("demo", "other"))  # another plugin started
+    assert await ex.plugin_list_provider(force_refresh=False) == PLUGINS
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_removes_only_dead_plugins(monkeypatch, clock):
+    both = [{"id": "demo"}, {"id": "gone"}]
+    token = {"v": (1, ("demo", "gone"))}
+    ex = _executor(monkeypatch, _Provider(result=both), token_fn=lambda: token["v"])
+    await _turns(ex, 1)
+    ex._external_plugin_provider = _failing_provider()
+    token["v"] = (1, ("demo",))  # "gone" crashed: no lifecycle event
+    assert await ex.plugin_list_provider(force_refresh=False) == [{"id": "demo"}]
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_after_stop_removes_stopped_plugin(monkeypatch, clock):
+    token = {"v": (1, ("demo",))}
+    ex = _executor(monkeypatch, _Provider(), token_fn=lambda: token["v"])
+    await _turns(ex, 1)
+    ex._external_plugin_provider = _failing_provider()
+    token["v"] = (2, ())  # stopped normally
+    for _ in range(2):
+        assert await ex.plugin_list_provider(force_refresh=False) == []
+    assert ex.plugin_list == []
+
+
+def test_change_token_never_waits_on_plugin_hosts_lock(monkeypatch):
+    # The token is read synchronously on the event loop. With a writer holding
+    # the plugin-hosts lock it must return immediately (last cached snapshot),
+    # never block on the lock or cache an empty snapshot from lock contention.
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+
+    class _Host:
+        def is_alive(self) -> bool:
+            return True
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    st.plugin_hosts["demo"] = _Host()
+    assert srv._plugin_list_change_token()[1] == ("demo",)
+
+    st.invalidate_snapshot_cache("hosts")
+    assert st._plugin_hosts_rwlock.acquire_write(timeout=1.0)
+    try:
+        # Would deadlock/wait here if the read lock were awaited.
+        assert srv._plugin_list_change_token()[1] == ("demo",)
+        assert st._snapshot_cache["hosts"]["data"]  # contention cached nothing empty
+    finally:
+        st._plugin_hosts_rwlock.release_write()
+
+
+def test_change_token_unreadable_when_no_snapshot_without_blocking(monkeypatch):
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    assert st._plugin_hosts_rwlock.acquire_write(timeout=1.0)
+    try:
+        with pytest.raises(RuntimeError):
+            srv._plugin_list_change_token()
+    finally:
+        st._plugin_hosts_rwlock.release_write()

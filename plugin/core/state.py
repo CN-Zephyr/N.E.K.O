@@ -450,6 +450,31 @@ class GlobalState:
         
         return snapshot
     
+    def get_plugin_hosts_snapshot_nowait(self) -> Optional[Dict[str, Any]]:
+        """获取 plugin_hosts 快照，绝不等待读写锁（可在事件循环线程上调用）。
+
+        缓存新鲜时直接返回缓存；否则只尝试一次非阻塞读锁，成功则刷新缓存。
+        拿不到读锁（写者持有/排队）时返回上一次缓存的快照（可能过期），
+        从未缓存过则返回 None。与 get_plugin_hosts_snapshot_cached 不同，
+        锁竞争不会把空字典写入共享缓存。
+        """
+        now = time.time()
+        with self._snapshot_cache_lock:
+            cache = self._snapshot_cache["hosts"]
+            cached = cache["data"]
+            if cached is not None and (now - cache["timestamp"]) < self._snapshot_cache_ttl:
+                return dict(cached)
+        if not self._plugin_hosts_rwlock.acquire_read(timeout=0):
+            return dict(cached) if cached is not None else None
+        try:
+            snapshot = dict(self.plugin_hosts)
+        finally:
+            self._plugin_hosts_rwlock.release_read()
+        with self._snapshot_cache_lock:
+            self._snapshot_cache["hosts"]["data"] = snapshot
+            self._snapshot_cache["hosts"]["timestamp"] = now
+        return dict(snapshot)
+
     def get_event_handlers_snapshot_cached(self, timeout: float = 2.0, force: bool = False) -> Dict[str, EventHandler]:
         """获取 event_handlers 的快照（带缓存，减少锁竞争）
         

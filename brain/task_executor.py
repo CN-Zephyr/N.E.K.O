@@ -324,7 +324,11 @@ class DirectTaskExecutor:
         ``token_fn`` returns a value that changes whenever the plugin list may
         have changed (agent_server wires the embedded plugin server's lifecycle
         revision plus the set of plugin hosts whose process is alive). A cached
-        list is reused only while the token is unchanged and younger than ``_PLUGIN_LIST_CACHE_TTL_SECONDS``."""
+        list is reused only while the token is unchanged and younger than ``_PLUGIN_LIST_CACHE_TTL_SECONDS``.
+
+        A token shaped ``(revision, alive_plugin_ids)`` also lets a failed
+        refresh keep the cached plugins that are still alive instead of
+        dropping the whole list (see _prune_plugin_list_on_fetch_failure)."""
         self._plugin_list_change_token = token_fn
 
     def _read_plugin_list_change_token(self) -> Any:
@@ -348,15 +352,43 @@ class DirectTaskExecutor:
             return False
         return token == getattr(self, "_plugin_list_fetched_token", None)
 
-    def _drop_stale_plugin_list_on_fetch_failure(self) -> None:
-        """A failed refresh may keep the cache only while it is still fresh
-        (same change token, within TTL). A cache known to be stale (plugin
-        stopped / crashed, TTL expired) must not be handed to the analyzer as
-        available capabilities, so it is dropped for this turn — the same
-        "no plugins" outcome a failed fetch had before caching."""
+    @staticmethod
+    def _alive_plugin_ids_from_token(token: Any) -> Optional[frozenset]:
+        """Alive plugin ids carried by a ``(revision, alive_ids)`` token, or
+        None when the token carries no liveness information."""
+        if not isinstance(token, tuple) or len(token) != 2:
+            return None
+        alive = token[1]
+        if not isinstance(alive, (tuple, list, set, frozenset)):
+            return None
+        return frozenset(str(pid) for pid in alive)
+
+    def _prune_plugin_list_on_fetch_failure(self) -> None:
+        """Decide what a failed refresh may still offer the analyzer.
+
+        A fresh cache (same token, within TTL) is kept as is. Otherwise, when
+        the token reports which plugin processes are alive, only the cached
+        plugins that are no longer alive are removed: an expired TTL or an
+        unrelated plugin's lifecycle event says nothing about the others, so a
+        transient ``/plugins`` failure must not hide healthy plugins, while a
+        stopped / crashed one must never be offered. Without liveness
+        information the stale cache is dropped for this turn — the same "no
+        plugins" outcome a failed fetch had before caching. The pruned list is
+        not marked fresh, so the next turn fetches again."""
         if self._plugin_list_cache_is_fresh():
             return
-        if self.plugin_list:
+        alive = self._alive_plugin_ids_from_token(self._read_plugin_list_change_token())
+        if alive is not None:
+            kept = [p for p in self.plugin_list if isinstance(p, dict) and str(p.get("id")) in alive]
+            if len(kept) != len(self.plugin_list):
+                logger.debug(
+                    "[Agent] plugin list refresh failed; removed %d cached plugins that are no longer running",
+                    len(self.plugin_list) - len(kept),
+                )
+            self.plugin_list = kept
+            if kept:
+                return
+        elif self.plugin_list:
             logger.debug(
                 "[Agent] plugin list refresh failed and cache is stale; dropping %d cached plugins",
                 len(self.plugin_list),
@@ -522,9 +554,9 @@ class DirectTaskExecutor:
                     logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
                     return self.plugin_list
                 if plugins is None:
-                    # Fetch failed / timed out: keep the last good cache only
-                    # while it is still fresh; a known-stale one is dropped.
-                    self._drop_stale_plugin_list_on_fetch_failure()
+                    # Fetch failed / timed out: keep the last good cache, minus
+                    # plugins known to be no longer running.
+                    self._prune_plugin_list_on_fetch_failure()
                     logger.debug(
                         "[Agent] external plugin_list_provider fetch failed; using %d cached plugins",
                         len(self.plugin_list),
@@ -550,9 +582,9 @@ class DirectTaskExecutor:
                     plugin_list = data.get("plugins") if isinstance(data, dict) else (data if isinstance(data, list) else None)
                     # Only a successful response replaces the cache (an empty
                     # list legitimately clears it); failures keep the last good
-                    # one only while it is still fresh.
+                    # one minus plugins known to be no longer running.
                     if resp.status_code != 200 or not isinstance(plugin_list, list):
-                        self._drop_stale_plugin_list_on_fetch_failure()
+                        self._prune_plugin_list_on_fetch_failure()
                     else:
                         self.plugin_list = plugin_list  # 更新实例变量
                         self._plugin_list_fetched_at = _monotonic()
@@ -562,7 +594,7 @@ class DirectTaskExecutor:
                         self._schedule_short_desc_prewarm(self.plugin_list)
             except Exception as e:
                 logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
-                self._drop_stale_plugin_list_on_fetch_failure()
+                self._prune_plugin_list_on_fetch_failure()
         logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins: {[p.get('id', 'unknown') for p in self.plugin_list if isinstance(p, dict)]}")
         return self.plugin_list
 
