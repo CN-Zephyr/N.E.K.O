@@ -96,6 +96,10 @@ def __getattr__(name):
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
+def __dir__():
+    return sorted(set(globals()) | _LAZY_MODEL_EXPORTS)
+
 __all__ = [
     # 版本
     "SDK_VERSION",
