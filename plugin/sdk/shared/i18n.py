@@ -107,13 +107,22 @@ class PluginI18n:
 
 
 def _load_json_file(path: Path) -> dict[str, object]:
-    if not path.is_file() or path.stat().st_size > 512 * 1024:
-        return {}
+    return _load_json_file_checked(path)[0]
+
+
+def _load_json_file_checked(path: Path) -> tuple[dict[str, object], bool]:
+    """Return ``(bundle, readable)``; ``readable`` is False on an I/O error."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    return dict(payload) if isinstance(payload, Mapping) else {}
+        if not path.is_file() or path.stat().st_size > 512 * 1024:
+            return {}, True
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}, False
+    try:
+        payload = json.loads(text)
+    except (UnicodeError, json.JSONDecodeError):
+        return {}, True
+    return (dict(payload) if isinstance(payload, Mapping) else {}), True
 
 
 # Parsed locale bundles keyed by resolved locales dir. Each entry is validated
@@ -151,16 +160,19 @@ def _scan_locale_files(locales_dir: Path) -> tuple[_Signature, list[Path]] | Non
     return signature, [item[1] for item in entries]
 
 
-def _read_locale_bundles(paths: list[Path]) -> dict[str, dict[str, object]]:
+def _read_locale_bundles(paths: list[Path]) -> tuple[dict[str, dict[str, object]], bool]:
+    """Return ``(messages, all_readable)``."""
     messages: dict[str, dict[str, object]] = {}
+    all_readable = True
     for path in paths:
         locale = path.stem.strip()
         if not locale:
             continue
-        bundle = _load_json_file(path)
+        bundle, readable = _load_json_file_checked(path)
+        all_readable = all_readable and readable
         if bundle:
             messages[locale] = bundle
-    return messages
+    return messages, all_readable
 
 
 def _copy_cached_bundles(cached: Mapping[str, _CachedBundle]) -> dict[str, dict[str, object]]:
@@ -191,7 +203,11 @@ def _load_bundles_cached(locales_dir: Path) -> dict[str, dict[str, object]]:
 
     # Read outside the lock. The signature was taken before reading, so a file
     # rewritten mid-read leaves a stale signature and is reloaded next call.
-    messages = _read_locale_bundles(paths)
+    messages, all_readable = _read_locale_bundles(paths)
+    if not all_readable:
+        # A read error (e.g. a transient permission or sharing violation) can
+        # clear up without changing the stat signature, so don't cache it.
+        return messages
     stored: dict[str, _CachedBundle] = {
         locale: (
             copy.deepcopy(bundle),

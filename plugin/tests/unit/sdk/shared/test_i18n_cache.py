@@ -25,13 +25,13 @@ def _isolated_cache():
 @pytest.fixture()
 def read_counter(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     reads: list[str] = []
-    original = i18n_module._load_json_file
+    original = i18n_module._load_json_file_checked
 
-    def counting(path: Path) -> dict[str, object]:
+    def counting(path: Path) -> tuple[dict[str, object], bool]:
         reads.append(path.name)
         return original(path)
 
-    monkeypatch.setattr(i18n_module, "_load_json_file", counting)
+    monkeypatch.setattr(i18n_module, "_load_json_file_checked", counting)
     return reads
 
 
@@ -195,3 +195,28 @@ def test_unstatable_entry_does_not_drop_other_locales(tmp_path: Path) -> None:
         pytest.skip("symlinks not available")
 
     assert set(load_plugin_i18n_from_meta(meta).messages) == {"en", "zh-CN"}
+
+
+def test_transient_read_error_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    locales = tmp_path / "locales"
+    locales.mkdir()
+    _write(locales / "en.json", {"title": "Hello"})
+    _write(locales / "zh-CN.json", {"title": "你好"})
+
+    original_read_text = Path.read_text
+    failing = {"on": True}
+
+    def flaky_read_text(self: Path, *args, **kwargs):
+        if failing["on"] and self.name == "zh-CN.json":
+            raise PermissionError("locked")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    first = load_plugin_i18n_from_dir(locales, default_locale="en")
+    assert first.t("title", locale="zh-CN") == "Hello"
+
+    # Same stat signature after the error clears; the bundle must be re-read.
+    failing["on"] = False
+    second = load_plugin_i18n_from_dir(locales, default_locale="en")
+    assert second.t("title", locale="zh-CN") == "你好"
