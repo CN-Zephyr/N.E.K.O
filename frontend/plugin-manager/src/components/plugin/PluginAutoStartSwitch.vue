@@ -3,12 +3,14 @@
     <el-switch
       :model-value="autoStart"
       :loading="loading"
-      :disabled="loading"
+      :disabled="loading || !supported"
       :aria-label="t('plugins.autoStart')"
       data-testid="plugin-auto-start-switch"
       @change="handleChange"
     />
-    <span class="plugin-auto-start-switch__hint">{{ t('plugins.autoStartHint') }}</span>
+    <span class="plugin-auto-start-switch__hint">
+      {{ supported ? t('plugins.autoStartHint') : t('plugins.autoStartUnsupportedDevelopment') }}
+    </span>
   </div>
 </template>
 
@@ -18,6 +20,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { usePluginStore } from '@/stores/plugin'
 import { formatHttpError } from '@/utils/request'
+import { isOrdinaryPlugin } from '@/utils/pluginDisplay'
 
 interface Props {
   pluginId: string
@@ -32,6 +35,13 @@ const loading = ref(false)
 const autoStart = computed(() => {
   const plugin = pluginStore.getPluginById(props.pluginId)
   return plugin?.autoStart ?? false
+})
+
+// The host never auto-starts development plugins and the API refuses the
+// preference for them (409), so the switch is shown read-only.
+const supported = computed(() => {
+  const plugin = pluginStore.getPluginById(props.pluginId)
+  return plugin ? isOrdinaryPlugin(plugin) : true
 })
 
 // Same reporting rule as PluginActions: the request interceptor already
@@ -54,6 +64,7 @@ function showActionError(error: unknown, fallbackMessage: string) {
 }
 
 async function handleChange(value: string | number | boolean) {
+  if (!supported.value) return
   const next = Boolean(value)
   try {
     loading.value = true

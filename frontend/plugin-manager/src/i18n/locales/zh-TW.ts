@@ -452,6 +452,7 @@ export default {
     autoStart: '自動啟動',
     manualStart: '手動啟動',
     autoStartHint: 'N.E.K.O 啟動時自動啟動此外掛。手動啟動或停止不會改變此設定。',
+    autoStartUnsupportedDevelopment: '開發外掛不會自動啟動，請手動啟動。',
     fetchFailed: '取得外掛列表失敗',
     pluginType: '類型',
     pluginTypeNormal: '外掛',

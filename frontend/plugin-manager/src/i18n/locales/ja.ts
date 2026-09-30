@@ -452,6 +452,7 @@ export default {
     autoStart: '自動起動',
     manualStart: '手動起動',
     autoStartHint: 'N.E.K.O の起動時にこのプラグインを自動で起動します。手動で起動・停止してもこの設定は変わりません。',
+    autoStartUnsupportedDevelopment: '開発中のプラグインは自動起動されません。手動で起動してください。',
     fetchFailed: 'プラグイン一覧の取得に失敗しました',
     pluginType: 'タイプ',
     pluginTypeNormal: 'プラグイン',

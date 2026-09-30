@@ -452,6 +452,7 @@ export default {
     autoStart: 'Auto Start',
     manualStart: 'Manual Start',
     autoStartHint: 'Start automatically when N.E.K.O launches. Starting or stopping manually does not change this.',
+    autoStartUnsupportedDevelopment: 'Development plugins are not started automatically. Start them manually.',
     fetchFailed: 'Failed to fetch plugins',
     pluginType: 'Type',
     pluginTypeNormal: 'Plugin',

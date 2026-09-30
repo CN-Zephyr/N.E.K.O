@@ -452,6 +452,7 @@ export default {
     autoStart: 'Автозапуск',
     manualStart: 'Ручной запуск',
     autoStartHint: 'Запускать плагин автоматически при старте N.E.K.O. Ручной запуск или остановка не меняют эту настройку.',
+    autoStartUnsupportedDevelopment: 'Плагины в разработке не запускаются автоматически. Запустите их вручную.',
     fetchFailed: 'Не удалось получить список плагинов',
     pluginType: 'Тип',
     pluginTypeNormal: 'Плагин',

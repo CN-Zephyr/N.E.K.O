@@ -359,7 +359,18 @@ export const usePluginStore = defineStore('plugin', () => {
   }
 
   async function setAutoStart(pluginId: string, autoStart: boolean, options: PluginMutationOptions = {}) {
-    await setPluginAutoStart(pluginId, autoStart)
+    const result = await setPluginAutoStart(pluginId, autoStart)
+    // Publish the confirmed value right away. refreshAfterMutation swallows a
+    // failed refetch, and the switch reads the cached detail first, so it
+    // would otherwise keep showing the old preference after a success toast.
+    const saved = typeof result?.auto_start === 'boolean' ? result.auto_start : autoStart
+    const detail = pluginDetails.value[pluginId]
+    if (detail) {
+      pluginDetails.value = { ...pluginDetails.value, [pluginId]: { ...detail, runtime_auto_start: saved } }
+    }
+    pluginSummaries.value = pluginSummaries.value.map(item => (
+      item.id === pluginId ? { ...item, runtime_auto_start: saved } : item
+    ))
     if (options.refresh !== false) await refreshAfterMutation(pluginId)
   }
 

@@ -3913,7 +3913,7 @@ async def test_stop_plugin_can_leave_auto_start_unchanged_when_sync_is_disabled(
         )
 
         assert _isolate_runtime_overrides == {
-            "demo_plugin": {"enabled": False, "auto_start": True},
+            "demo_plugin": {"enabled": True, "auto_start": True},
         }
     finally:
         with module.state.acquire_plugins_write_lock():
@@ -3947,6 +3947,8 @@ async def test_stop_plugin_returns_partial_success_on_preference_write_failure(
     try:
         _seed_running_plugin("demo_plugin", config_path)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        # Only the legacy sync mode persists anything on a manual stop.
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", True)
         monkeypatch.setattr(
             module,
             "set_runtime_override",
@@ -4479,13 +4481,14 @@ def test_sync_auto_start_on_toggle_defaults_to_false(monkeypatch: pytest.MonkeyP
 
     import plugin.settings as settings_module
 
-    monkeypatch.delenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", raising=False)
     try:
-        assert importlib.reload(settings_module).PLUGIN_SYNC_AUTO_START_ON_TOGGLE is False
-        monkeypatch.setenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", "1")
-        assert importlib.reload(settings_module).PLUGIN_SYNC_AUTO_START_ON_TOGGLE is True
+        with monkeypatch.context() as patch:
+            patch.delenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", raising=False)
+            assert importlib.reload(settings_module).PLUGIN_SYNC_AUTO_START_ON_TOGGLE is False
+            patch.setenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", "1")
+            assert importlib.reload(settings_module).PLUGIN_SYNC_AUTO_START_ON_TOGGLE is True
     finally:
-        monkeypatch.delenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", raising=False)
+        # Reload only after the context restored the caller's environment.
         importlib.reload(settings_module)
 
 
@@ -4494,7 +4497,8 @@ def test_sync_auto_start_on_toggle_defaults_to_false(monkeypatch: pytest.MonkeyP
     ("sync_enabled", "enabled", "expected"),
     [
         (False, True, {"enabled": True, "auto_start": False}),
-        (False, False, {"enabled": False, "auto_start": True}),
+        # A default manual stop persists nothing: the seed stays as it was.
+        (False, False, {"enabled": True, "auto_start": True}),
         (True, True, {"enabled": True, "auto_start": True}),
         (True, False, {"enabled": False, "auto_start": False}),
     ],
@@ -4537,8 +4541,9 @@ async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
             "demo_plugin", persist_user_intent=True
         )
 
+        # Nothing is persisted, so the next launch still autostarts it.
         assert _isolate_runtime_overrides == {
-            "demo_plugin": {"enabled": False, "auto_start": True},
+            "demo_plugin": {"enabled": True, "auto_start": True},
         }
     finally:
         _restore_lifecycle_state(*backup)
@@ -4547,7 +4552,7 @@ async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_start", [True, False])
-async def test_set_plugin_auto_start_writes_only_auto_start_and_keeps_process(
+async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     _isolate_runtime_overrides: dict,
@@ -4565,7 +4570,12 @@ async def test_set_plugin_auto_start_writes_only_auto_start_and_keeps_process(
             host = module.state.plugin_hosts["demo_plugin"]
 
         pending_calls: list[str] = []
-        monkeypatch.setattr(module, "clear_autostart_pending", pending_calls.append)
+
+        def _clear_pending(plugin_id: str) -> bool:
+            pending_calls.append(plugin_id)
+            return True
+
+        monkeypatch.setattr(module, "clear_autostart_pending", _clear_pending)
 
         async def _must_not_run(*_args, **_kwargs):
             raise AssertionError("auto-start toggle must not start or stop the plugin")
@@ -4578,16 +4588,18 @@ async def test_set_plugin_auto_start_writes_only_auto_start_and_keeps_process(
 
         assert response["success"] is True
         assert response["auto_start"] is auto_start
+        # Turning auto-start on lifts the enabled=false a stop left behind and
+        # the pending approval, or the next launch would still skip it.
         assert _isolate_runtime_overrides == {
-            "demo_plugin": {"enabled": False, "auto_start": auto_start},
+            "demo_plugin": {"enabled": auto_start, "auto_start": auto_start},
         }
-        assert pending_calls == []
+        assert pending_calls == (["demo_plugin"] if auto_start else [])
         with module.state.acquire_plugin_hosts_read_lock():
             assert module.state.plugin_hosts.get("demo_plugin") is host
         with module.state.acquire_plugins_read_lock():
             meta = module.state.plugins["demo_plugin"]
             assert meta["runtime_auto_start"] is auto_start
-            assert meta["runtime_enabled"] is False
+            assert meta["runtime_enabled"] is auto_start
     finally:
         _restore_lifecycle_state(*backup)
 
@@ -4656,5 +4668,27 @@ async def test_set_plugin_auto_start_persist_failure_keeps_registry(
         assert exc_info.value.details["runtime_state_changed"] is False
         with module.state.acquire_plugins_read_lock():
             assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is True
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_reports_unpersisted_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+        assert exc_info.value.status_code == 500
     finally:
         _restore_lifecycle_state(*backup)

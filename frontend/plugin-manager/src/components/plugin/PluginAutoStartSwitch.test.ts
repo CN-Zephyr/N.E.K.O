@@ -51,7 +51,7 @@ async function flushPromises() {
   for (let i = 0; i < 8; i += 1) await nextTick()
 }
 
-function mount(autoStart: boolean) {
+function mount(autoStart: boolean, extra: Record<string, unknown> = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const store = usePluginStore()
@@ -62,6 +62,7 @@ function mount(autoStart: boolean) {
     version: '1.0.0',
     status: 'running',
     runtime_auto_start: autoStart,
+    ...extra,
   } as never]
   const root = document.createElement('div')
   const app = createApp(PluginAutoStartSwitch, { pluginId: 'demo' })
@@ -115,6 +116,38 @@ describe('PluginAutoStartSwitch', () => {
     expect(elementPlusMocks.ElMessage.success).not.toHaveBeenCalled()
     expect(button().dataset.loading).toBe('false')
     expect(button().dataset.checked).toBe('false')
+    app.unmount()
+  })
+
+  it('keeps the confirmed preference when the follow-up refresh fails', async () => {
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    apiMocks.getPluginStatus.mockResolvedValue({})
+    apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
+    const { app, button } = mount(true)
+    usePluginStore().pluginDetails = {
+      demo: { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true },
+    }
+    apiMocks.getPlugin.mockRejectedValue(new Error('offline'))
+    await flushPromises()
+    expect(button().dataset.checked).toBe('true')
+
+    button().click()
+    await vi.waitFor(() => expect(elementPlusMocks.ElMessage.success).toHaveBeenCalledWith('messages.autoStartDisabled'))
+    await flushPromises()
+
+    expect(button().dataset.loading).toBe('false')
+    expect(button().dataset.checked).toBe('false')
+    app.unmount()
+  })
+
+  it('shows a read-only switch for development plugins', async () => {
+    const { app, button } = mount(false, { source: 'development' })
+    await flushPromises()
+
+    expect(button().disabled).toBe(true)
+    button().click()
+    await flushPromises()
+    expect(apiMocks.setPluginAutoStart).not.toHaveBeenCalled()
     app.unmount()
   })
 })

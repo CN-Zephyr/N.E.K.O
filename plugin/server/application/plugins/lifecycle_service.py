@@ -324,6 +324,12 @@ def _persist_user_runtime_intent(
     previous_plugin_ids: tuple[str, ...] = (),
     runtime_state_changed: bool = False,
 ) -> None:
+    if not enabled and not PLUGIN_SYNC_AUTO_START_ON_TOGGLE:
+        # A manual stop is temporary. Persisting enabled=false would make the
+        # autostart selection skip the plugin at the next launch even though
+        # its auto-start switch still says on; whether it runs at launch is
+        # the switch's job alone.
+        return
     try:
         auto_start = enabled if PLUGIN_SYNC_AUTO_START_ON_TOGGLE else None
         if previous_plugin_ids:
@@ -1571,9 +1577,10 @@ class PluginLifecycleService:
     ) -> dict[str, object]:
         """Persist the user's auto-start preference without touching the process.
 
-        Only the ``auto_start`` field of the runtime override is written; the
-        ``enabled`` preference, the pending-approval gate and the running host
-        are left as they are.
+        The running host is left as it is. Turning auto-start on is the user
+        asking for the plugin to run at launch, so it also lifts what would
+        otherwise still block that: a persisted ``enabled=false`` left by an
+        earlier stop, and the pending approval of a freshly installed plugin.
         """
         if await asyncio.to_thread(_get_plugin_meta_sync, plugin_id) is None:
             raise _to_domain_error(
@@ -1583,10 +1590,18 @@ class PluginLifecycleService:
                 plugin_id=plugin_id,
                 error_type="PluginNotFound",
             )
+        restore_enabled = auto_start and (
+            await asyncio.to_thread(get_runtime_override, plugin_id) is False
+        )
         try:
-            await asyncio.to_thread(
-                set_runtime_auto_start_override, plugin_id, auto_start
-            )
+            if restore_enabled:
+                await asyncio.to_thread(
+                    set_runtime_override, plugin_id, True, auto_start=True
+                )
+            else:
+                await asyncio.to_thread(
+                    set_runtime_auto_start_override, plugin_id, auto_start
+                )
         except RuntimeOverridePersistenceError as exc:
             raise ServerDomainError(
                 code="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
@@ -1603,6 +1618,21 @@ class PluginLifecycleService:
         await asyncio.to_thread(
             _set_plugin_runtime_auto_start_sync, plugin_id, auto_start
         )
+        if restore_enabled:
+            await asyncio.to_thread(_set_plugin_runtime_enabled_sync, plugin_id, True)
+        if auto_start and not await asyncio.to_thread(clear_autostart_pending, plugin_id):
+            raise ServerDomainError(
+                code="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                message="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                status_code=500,
+                details={
+                    "plugin_id": plugin_id,
+                    "auto_start": auto_start,
+                    "error_type": "AutostartApprovalPersistenceError",
+                    "runtime_state_changed": False,
+                },
+                log_level="error",
+            )
         return {
             "success": True,
             "plugin_id": plugin_id,
