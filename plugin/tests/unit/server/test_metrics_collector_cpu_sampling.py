@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -131,3 +133,63 @@ def test_prune_drops_plugins_no_longer_in_hosts(fake_psutil: type[_FakePsProcess
     collector._prune_ps_processes({"keep": object()})
 
     assert set(collector._ps_processes) == {"keep"}
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize("late_action", ["write", "delete"])
+async def test_late_sampling_thread_from_stopped_round_does_not_touch_new_cache(
+    fake_psutil: type[_FakePsProcess], monkeypatch: pytest.MonkeyPatch, late_action: str
+) -> None:
+    """stop() 后立即 start()：旧轮次仍在运行的采样线程晚到时只能影响旧缓存。"""
+    old_entered = threading.Event()
+    release_old = threading.Event()
+    sampled: dict[int, threading.Event] = {1001: threading.Event(), 2002: threading.Event()}
+
+    original_init = _FakePsProcess.__init__
+    original_cpu = _FakePsProcess.cpu_percent
+
+    def _gated_init(self: _FakePsProcess, pid: int) -> None:
+        if pid == 1001 and late_action == "write":
+            old_entered.set()
+            assert release_old.wait(5)
+        original_init(self, pid)
+
+    def _gated_cpu(self: _FakePsProcess, interval: object = "unset") -> float:
+        if self.pid == 1001 and late_action == "delete":
+            old_entered.set()
+            assert release_old.wait(5)
+            raise module.psutil.NoSuchProcess()
+        return original_cpu(self, interval)
+
+    monkeypatch.setattr(_FakePsProcess, "__init__", _gated_init)
+    monkeypatch.setattr(_FakePsProcess, "cpu_percent", _gated_cpu)
+
+    collector = module.MetricsCollector(interval=3600)
+    original_collect = collector._collect_plugin_metrics_sync
+
+    def _tracked_collect(plugin_id, host, *args, **kwargs):
+        try:
+            return original_collect(plugin_id, host, *args, **kwargs)
+        finally:
+            sampled[host.process.pid].set()
+
+    monkeypatch.setattr(collector, "_collect_plugin_metrics_sync", _tracked_collect)
+
+    old_host = _host(1001)
+    await collector.start(lambda: {"demo": old_host})
+    assert await asyncio.to_thread(old_entered.wait, 5)
+
+    await collector.stop()
+    new_host = _host(2002)
+    await collector.start(lambda: {"demo": new_host})
+    assert await asyncio.to_thread(sampled[2002].wait, 5)
+    new_entry = collector._ps_processes["demo"]
+    assert new_entry[0] == 2002
+
+    release_old.set()
+    assert await asyncio.to_thread(sampled[1001].wait, 5)
+
+    try:
+        assert collector._ps_processes.get("demo") is new_entry
+    finally:
+        await collector.stop()
