@@ -524,7 +524,10 @@ class PluginCommunicationResourceManager:
             if task is None or task not in self._poll_wakeups:
                 raise
             self._poll_wakeups.discard(task)
-            task.uncancel()
+            # A cancel that overlaps the wake-up (shutdown(timeout=0)'s own
+            # wait_for, or an external cancel) must still stop the task.
+            if task.uncancel() > 0:
+                raise
         finally:
             self._polling_tasks.discard(task)
         return await recv(timeout_ms=0)

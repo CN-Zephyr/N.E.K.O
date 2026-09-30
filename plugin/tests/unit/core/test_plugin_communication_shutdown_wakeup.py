@@ -12,6 +12,17 @@ from plugin.core.zmq_transport import CH_RES
 # Far above anything shutdown may take: a consumer that waits out its poll
 # makes the elapsed-time assertions below fail by an order of magnitude.
 _HUGE_POLL_S = 30.0
+# Before the fix three consumers each used up the 0.5s graceful window
+# (>= 1.5s total); this bound leaves room for a loaded runner.
+_FAST_SHUTDOWN_S = 1.0
+
+
+async def _wait_until(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not reached before deadline")
+        await asyncio.sleep(0.001)
 
 
 class _Logger:
@@ -87,9 +98,7 @@ async def test_shutdown_wakes_parked_consumers_instead_of_waiting_out_the_poll(m
     await manager.shutdown(timeout=5.0)
     elapsed = time.perf_counter() - started
 
-    # Before the fix each of the three consumers used up the 0.5s graceful
-    # window before being cancelled, so this took at least 1.5s.
-    assert elapsed < 0.4
+    assert elapsed < _FAST_SHUTDOWN_S
     assert all(task is not None and task.done() for task in consumers)
     # Each consumer took the final non-blocking read before exiting.
     assert sorted(transport.drain_reads) == ["recv", "recv_image", "recv_message"]
@@ -115,8 +124,7 @@ async def test_a_request_with_no_result_is_cancelled_so_its_caller_does_not_hang
     caller = asyncio.create_task(
         manager._send_command_and_wait_local("req-lost", {"type": "TRIGGER"}, None, "demo")
     )
-    while "req-lost" not in manager._pending_futures:
-        await asyncio.sleep(0)
+    await _wait_until(lambda: "req-lost" in manager._pending_futures)
 
     await manager.shutdown(timeout=5.0)
 
@@ -142,6 +150,24 @@ async def test_a_cancel_that_is_not_the_shutdown_wakeup_still_stops_the_consumer
 
 
 @pytest.mark.plugin_unit
+async def test_zero_timeout_shutdown_skips_the_final_read(monkeypatch) -> None:
+    manager, transport = await _start_parked(monkeypatch)
+    transport.backlog["recv_image"].append(({"name": "late.png"}, b"x"))
+    consumers = [
+        manager._uplink_consumer_task,
+        manager._message_consumer_task,
+        manager._image_consumer_task,
+    ]
+
+    # wait_for(timeout=0) cancels again before the woken consumer resumes;
+    # that second cancel must win over the wake-up's final read.
+    await manager.shutdown(timeout=0)
+
+    assert all(task is not None and task.done() for task in consumers)
+    assert transport.drain_reads == []
+
+
+@pytest.mark.plugin_unit
 async def test_shutdown_over_real_sockets_does_not_wait_for_the_poll(monkeypatch) -> None:
     monkeypatch.setattr(communication, "QUEUE_GET_TIMEOUT", _HUGE_POLL_S)
     host = zmq_transport.HostTransport()
@@ -158,14 +184,13 @@ async def test_shutdown_over_real_sockets_does_not_wait_for_the_poll(monkeypatch
             manager._image_consumer_task,
         ]
         assert all(task is not None for task in consumers)
-        while not all(task in manager._polling_tasks for task in consumers):
-            await asyncio.sleep(0)
+        await _wait_until(lambda: all(task in manager._polling_tasks for task in consumers))
 
         started = time.perf_counter()
         await manager.shutdown(timeout=5.0)
         elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.4
+        assert elapsed < _FAST_SHUTDOWN_S
         assert all(task is not None and task.done() for task in consumers)
     finally:
         host.close()
