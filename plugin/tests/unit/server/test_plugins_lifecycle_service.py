@@ -4576,6 +4576,7 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
             return True
 
         monkeypatch.setattr(module, "clear_autostart_pending", _clear_pending)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
 
         async def _must_not_run(*_args, **_kwargs):
             raise AssertionError("auto-start toggle must not start or stop the plugin")
@@ -4683,6 +4684,9 @@ async def test_set_plugin_auto_start_reports_unpersisted_approval(
     backup = _backup_lifecycle_state()
     try:
         _seed_running_plugin("demo_plugin", config_path)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = False
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
         monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
 
         with pytest.raises(ServerDomainError) as exc_info:
@@ -4690,5 +4694,43 @@ async def test_set_plugin_auto_start_reports_unpersisted_approval(
 
         assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
         assert exc_info.value.status_code == 500
+        # Nothing was written, so the 500 matches what the user sees.
+        assert _isolate_runtime_overrides == {}
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is False
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_restores_approval_when_preference_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        calls: list[str] = []
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(
+            module, "clear_autostart_pending", lambda pid: calls.append(f"clear:{pid}") or True
+        )
+        monkeypatch.setattr(
+            module, "mark_autostart_pending", lambda pid: calls.append(f"mark:{pid}") or True
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+
+        monkeypatch.setattr(module, "set_runtime_auto_start_override", _fail)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        assert exc_info.value.code == "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED"
+        assert calls == ["clear:demo_plugin", "mark:demo_plugin"]
     finally:
         _restore_lifecycle_state(*backup)

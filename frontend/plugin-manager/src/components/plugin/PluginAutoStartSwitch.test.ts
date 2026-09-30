@@ -140,6 +140,35 @@ describe('PluginAutoStartSwitch', () => {
     app.unmount()
   })
 
+  it('ignores a detail request that was already in flight before the save', async () => {
+    let resolveStale: (value: unknown) => void = () => {}
+    apiMocks.getPlugin.mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
+    let resolveStatus: (value: unknown) => void = () => {}
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    // Hold the follow-up refresh so the stale detail lands before it starts.
+    apiMocks.getPluginStatus.mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve }))
+    apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
+    const { app, button } = mount(true)
+    const store = usePluginStore()
+    store.pluginDetails = {
+      demo: { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true },
+    }
+    const stale = store.fetchPluginDetail('demo')
+    apiMocks.getPlugin.mockRejectedValue(new Error('offline'))
+    await flushPromises()
+
+    button().click()
+    await vi.waitFor(() => expect(apiMocks.getPluginStatus).toHaveBeenCalled())
+    resolveStale({ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true })
+    await stale
+    resolveStatus({})
+    await vi.waitFor(() => expect(elementPlusMocks.ElMessage.success).toHaveBeenCalledWith('messages.autoStartDisabled'))
+    await flushPromises()
+
+    expect(button().dataset.checked).toBe('false')
+    app.unmount()
+  })
+
   it('shows a read-only switch for development plugins', async () => {
     const { app, button } = mount(false, { source: 'development' })
     await flushPromises()
