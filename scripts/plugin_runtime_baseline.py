@@ -254,7 +254,22 @@ def _isolated_env(sandbox: Path, *, launcher_main: bool) -> dict[str, str]:
     env = dict(os.environ)
     storage = sandbox / "storage"
     temp = sandbox / "temp"
-    for path in (storage, sandbox / "anchor", sandbox / "localappdata", sandbox / "appdata", temp, sandbox / "plugins"):
+    home = sandbox / "home"
+    xdg = {
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_DATA_HOME": home / ".local" / "share",
+        "XDG_STATE_HOME": home / ".local" / "state",
+        "XDG_CACHE_HOME": home / ".cache",
+    }
+    for path in (
+        storage,
+        sandbox / "anchor",
+        sandbox / "localappdata",
+        sandbox / "appdata",
+        temp,
+        sandbox / "plugins",
+        *xdg.values(),
+    ):
         path.mkdir(parents=True, exist_ok=True)
     env.update(
         {
@@ -264,6 +279,9 @@ def _isolated_env(sandbox: Path, *, launcher_main: bool) -> dict[str, str]:
             "APPDATA": str(sandbox / "appdata"),
             "TEMP": str(temp),
             "TMP": str(temp),
+            "TMPDIR": str(temp),
+            "HOME": str(home),
+            **{name: str(path) for name, path in xdg.items()},
             "NEKO_PLUGIN_BASELINE_PLUGINS_ROOT": str(sandbox / "plugins"),
             "PYTHONUTF8": "1",
         }
@@ -316,6 +334,7 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
         "call_p95_ms": _percentile(calls_ms, 95),
         "shutdown_s": run.get("shutdown_seconds"),
         "leftover_processes": run.get("leftover_processes"),
+        "shutdown_errors": len(run.get("shutdown_errors", [])),
     }
 
 
@@ -336,6 +355,7 @@ def _format_table(rows: list[dict[str, Any]]) -> str:
         ("call p50 ms", "call_p50_ms", "{:.1f}"),
         ("shutdown s", "shutdown_s", "{:.2f}"),
         ("leftover", "leftover_processes", "{:d}"),
+        ("shutdown errors", "shutdown_errors", "{:d}"),
     ]
 
     def cell(row: dict[str, Any], key: str, fmt: str) -> str:
@@ -351,6 +371,51 @@ def _format_table(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         lines.append("| " + " | ".join(cell(row, key, fmt) for _, key, fmt in columns) + " |")
     return "\n".join(lines)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the --run-one interpreter and every plugin process it spawned."""
+    try:
+        children = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+    for child in children:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+    proc.kill()
+    psutil.wait_procs(children, timeout=10)
+
+
+def _run_isolated(command: list[str], env: dict[str, str], timeout: float) -> tuple[int, str]:
+    """Run one count in its own process group; on timeout or Ctrl+C reap the whole tree."""
+    group = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
+    proc = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **group,
+    )
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        _, stderr = proc.communicate()
+        return -1, (stderr or "") + f"\nrun timed out after {timeout}s"
+    except BaseException:
+        _kill_tree(proc)
+        raise
+    return proc.returncode, stderr or ""
 
 
 def _git_revision() -> str | None:
@@ -400,20 +465,14 @@ def _orchestrate(args: argparse.Namespace) -> int:
                 if args.read_config_on_startup:
                     command.append("--read-config-on-startup")
                 began = time.perf_counter()
-                completed = subprocess.run(
+                returncode, stderr = _run_isolated(
                     command,
-                    cwd=REPO_ROOT,
-                    env=_isolated_env(sandbox, launcher_main=args.launcher_main),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=args.run_timeout,
+                    _isolated_env(sandbox, launcher_main=args.launcher_main),
+                    args.run_timeout,
                 )
-                if completed.returncode != 0 or not result_path.is_file():
-                    tail = (completed.stderr or "").strip().splitlines()[-5:]
-                    print(f"[baseline] N={count} failed (exit {completed.returncode})", file=sys.stderr)
+                if returncode != 0 or not result_path.is_file():
+                    tail = stderr.strip().splitlines()[-5:]
+                    print(f"[baseline] N={count} failed (exit {returncode})", file=sys.stderr)
                     for line in tail:
                         print(f"[baseline]   {line}", file=sys.stderr)
                     return 1
