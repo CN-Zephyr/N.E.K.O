@@ -243,3 +243,22 @@ async def test_overtaken_response_drops_plugins_no_longer_alive(monkeypatch):
     gate.release[0].set()
     assert await task_a == [{"id": "a"}]
     assert executor.plugin_list == []
+
+
+async def test_overtaken_response_keeps_plugin_missing_from_lagging_snapshot(monkeypatch):
+    # A's /plugins already saw "fresh" start, but the non-blocking liveness
+    # snapshot still lags and does not list it. Absence alone is not a stop:
+    # A's caller must still be offered the running plugin.
+    gate = _Gate([[{"id": "a"}, {"id": "fresh"}], []])
+    provider, _ = _external_source(gate)
+    executor = _make_executor(GOOD, provider)
+    executor._plugin_list_change_token = lambda: (1, ("a",))
+    monkeypatch.setattr(executor, "_schedule_short_desc_prewarm", lambda plugins: None, raising=False)
+    task_a = asyncio.create_task(executor.plugin_list_provider(force_refresh=True))
+    await gate.started[0].wait()
+    task_b = asyncio.create_task(executor.plugin_list_provider(force_refresh=True))
+    await gate.started[1].wait()
+    gate.release[1].set()
+    await task_b
+    gate.release[0].set()
+    assert await task_a == [{"id": "a"}, {"id": "fresh"}]
