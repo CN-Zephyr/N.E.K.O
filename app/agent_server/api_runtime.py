@@ -165,14 +165,26 @@ def _plugin_list_change_token() -> tuple:
     plugin-hosts read/write lock: the snapshot is taken without blocking and,
     when no snapshot is available at all, the token is reported unreadable
     (the executor then refetches ``/plugins`` asynchronously).
+
+    A live process whose plugin ``GET /plugins`` would no longer report as
+    ``running`` (``runtime_source_missing`` / ``runtime_load_state == "failed"``,
+    see ``_resolve_plugin_status``) is left out of the alive set, so marking
+    it moves the token and a failed refresh cannot keep offering it.
     """
     from plugin.core.state import state as plugin_state
 
     hosts = plugin_state.get_plugin_hosts_snapshot_nowait()
-    if hosts is None:
-        raise RuntimeError("plugin hosts snapshot unavailable without blocking")
+    plugins_meta = plugin_state.get_plugins_snapshot_nowait()
+    if hosts is None or plugins_meta is None:
+        raise RuntimeError("plugin snapshot unavailable without blocking")
     alive = []
     for plugin_id, host in hosts.items():
+        meta = plugins_meta.get(plugin_id)
+        if isinstance(meta, dict) and (
+            meta.get("runtime_source_missing") is True
+            or meta.get("runtime_load_state") == "failed"
+        ):
+            continue
         try:
             if host.is_alive():
                 alive.append(str(plugin_id))

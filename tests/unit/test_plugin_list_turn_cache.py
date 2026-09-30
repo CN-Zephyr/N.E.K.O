@@ -355,3 +355,86 @@ def test_change_token_unreadable_when_no_snapshot_without_blocking(monkeypatch):
             srv._plugin_list_change_token()
     finally:
         st._plugin_hosts_rwlock.release_write()
+
+
+class _AliveHost:
+    def is_alive(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [{"runtime_source_missing": True}, {"runtime_load_state": "failed"}],
+)
+def test_change_token_excludes_live_plugins_server_would_not_report_running(monkeypatch, marker):
+    # /plugins reports such plugins as source_missing / load_failed, which the
+    # analyzer excludes; the token's alive set must agree, even though the
+    # host process is still alive.
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    st.plugin_hosts["demo"] = _AliveHost()
+    st.plugins["demo"] = {"id": "demo"}
+    before = srv._plugin_list_change_token()
+    assert before[1] == ("demo",)
+
+    st.plugins["demo"] = {"id": "demo", **marker}
+    st.invalidate_snapshot_cache("plugins")
+    after = srv._plugin_list_change_token()
+    assert after[1] == ()
+    assert after != before
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_drops_source_missing_plugin_with_live_host(monkeypatch, clock):
+    state_mod = importlib.import_module("plugin.core.state")
+    from app.agent_server import api_runtime as srv
+
+    st = state_mod.GlobalState()
+    monkeypatch.setattr(state_mod, "state", st)
+    st.plugin_hosts["demo"] = _AliveHost()
+    st.plugins["demo"] = {"id": "demo"}
+    ex = _executor(monkeypatch, _Provider(), token_fn=srv._plugin_list_change_token)
+    await _turns(ex, 1)
+    ex._external_plugin_provider = _failing_provider()
+
+    st.plugins["demo"]["runtime_source_missing"] = True  # registry refresh
+    st.invalidate_snapshot_cache("plugins")
+    for _ in range(2):
+        assert await ex.plugin_list_provider(force_refresh=False) == []
+
+
+def _invalidate_after_snapshot(monkeypatch, st, rwlock, cache_type):
+    # Deterministically land an invalidation between the snapshot being taken
+    # (read lock held) and the snapshot being written back to the cache.
+    real_release = rwlock.release_read
+
+    def release_then_invalidate():
+        real_release()
+        st.plugin_hosts["late"] = _AliveHost()  # e.g. a plugin registering
+        st.invalidate_snapshot_cache(cache_type)
+
+    monkeypatch.setattr(rwlock, "release_read", release_then_invalidate, raising=False)
+    return real_release
+
+
+@pytest.mark.parametrize("reader", ["nowait", "cached"])
+def test_stale_hosts_snapshot_does_not_overwrite_invalidated_cache(monkeypatch, reader):
+    state_mod = importlib.import_module("plugin.core.state")
+    st = state_mod.GlobalState()
+    st.plugin_hosts["demo"] = _AliveHost()
+    lock = st._plugin_hosts_rwlock
+    real_release = _invalidate_after_snapshot(monkeypatch, st, lock, "hosts")
+
+    read = (
+        st.get_plugin_hosts_snapshot_nowait
+        if reader == "nowait"
+        else lambda: st.get_plugin_hosts_snapshot_cached(timeout=0.1)
+    )
+    assert set(read()) == {"demo"}  # this read raced with the registration
+
+    monkeypatch.setattr(lock, "release_read", real_release, raising=False)
+    # The stale snapshot must not have been cached as fresh.
+    assert set(read()) == {"demo", "late"}
