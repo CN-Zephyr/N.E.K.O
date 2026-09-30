@@ -547,13 +547,19 @@ class DirectTaskExecutor:
         an await. A response overtaken by a newer request is not published and
         skips prewarm, but its own caller still gets the list it fetched: start
         order says nothing about which response the server built later, so this
-        turn must not be handed the other request's (possibly older) list. The
-        change token read before the newer request still triggers a refetch on
-        the next turn if the catalog moved in between.
+        turn must not be handed the other request's (possibly older) list.
+        Because the list may predate the newer response, plugins whose process
+        is no longer alive (per the current change token) are removed from it,
+        so a plugin stopped in between is never offered. The change token read
+        before the newer request still triggers a refetch on the next turn if
+        the catalog moved in between.
         """
         if request_seq <= getattr(self, "_plugin_list_published_seq", 0):
             logger.debug("[Agent] not publishing overtaken plugin list response (seq=%d)", request_seq)
-            return plugins
+            alive = self._alive_plugin_ids_from_token(self._read_plugin_list_change_token())
+            if alive is None:
+                return plugins
+            return [p for p in plugins if isinstance(p, dict) and str(p.get("id")) in alive]
         self._plugin_list_published_seq = request_seq
         self.plugin_list = plugins
         self._plugin_list_fetched_at = _monotonic()

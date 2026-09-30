@@ -221,3 +221,25 @@ async def test_newer_empty_success_is_not_overwritten(monkeypatch, source):
     # (an analyze turn) must still see the running plugin it fetched.
     assert result_a == A_LIST
     assert prewarms == [[]]
+
+
+async def test_overtaken_response_drops_plugins_no_longer_alive(monkeypatch):
+    # A fetched a list that still has "gone"; the plugin stopped before A
+    # returned and B already published without it. A's caller must not be
+    # offered the stopped plugin, but keeps the alive one B may have missed.
+    alive = {"ids": ("a", "gone")}
+    gate = _Gate([[{"id": "a"}, {"id": "gone"}], []])
+    provider, _ = _external_source(gate)
+    executor = _make_executor(GOOD, provider)
+    executor._plugin_list_change_token = lambda: (1, alive["ids"])
+    monkeypatch.setattr(executor, "_schedule_short_desc_prewarm", lambda plugins: None, raising=False)
+    task_a = asyncio.create_task(executor.plugin_list_provider(force_refresh=True))
+    await gate.started[0].wait()
+    task_b = asyncio.create_task(executor.plugin_list_provider(force_refresh=True))
+    await gate.started[1].wait()
+    gate.release[1].set()
+    await task_b
+    alive["ids"] = ("a",)
+    gate.release[0].set()
+    assert await task_a == [{"id": "a"}]
+    assert executor.plugin_list == []
