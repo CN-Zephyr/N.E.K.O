@@ -195,7 +195,9 @@ SOURCES = pytest.mark.parametrize("source", [_external_source, _http_source], id
 async def test_older_success_after_newer_success_is_discarded(monkeypatch, source):
     executor, result_a, prewarms = await _race(monkeypatch, source, [A_LIST, B_LIST])
     assert executor.plugin_list == B_LIST
-    assert result_a == B_LIST
+    # A is not published, but its own caller gets what A fetched: start order
+    # does not tell which response the server built later.
+    assert result_a == A_LIST
     assert executor._plugin_list_fetched_at == 1005.0
     assert executor._plugin_list_fetched_token == 2  # B's pre-fetch token
     assert prewarms == [B_LIST]  # A did not prewarm
@@ -215,5 +217,7 @@ async def test_older_success_after_newer_failure_publishes(monkeypatch, source):
 async def test_newer_empty_success_is_not_overwritten(monkeypatch, source):
     executor, result_a, prewarms = await _race(monkeypatch, source, [A_LIST, []])
     assert executor.plugin_list == []
-    assert result_a == []
+    # e.g. a plugin started between B's and A's server-side reads: A's caller
+    # (an analyze turn) must still see the running plugin it fetched.
+    assert result_a == A_LIST
     assert prewarms == [[]]

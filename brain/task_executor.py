@@ -544,11 +544,16 @@ class DirectTaskExecutor:
         """Publish a successful fetch unless a newer request already published.
 
         Synchronous on purpose: the compare and the write must not be split by
-        an await. A stale response returns the current cache and skips prewarm.
+        an await. A response overtaken by a newer request is not published and
+        skips prewarm, but its own caller still gets the list it fetched: start
+        order says nothing about which response the server built later, so this
+        turn must not be handed the other request's (possibly older) list. The
+        change token read before the newer request still triggers a refetch on
+        the next turn if the catalog moved in between.
         """
         if request_seq <= getattr(self, "_plugin_list_published_seq", 0):
-            logger.debug("[Agent] discarding stale plugin list response (seq=%d)", request_seq)
-            return self.plugin_list
+            logger.debug("[Agent] not publishing overtaken plugin list response (seq=%d)", request_seq)
+            return plugins
         self._plugin_list_published_seq = request_seq
         self.plugin_list = plugins
         self._plugin_list_fetched_at = _monotonic()
@@ -572,9 +577,9 @@ class DirectTaskExecutor:
                 request_seq = self._next_plugin_list_request_seq()
                 plugins = await self._external_plugin_provider(force_refresh)
                 if isinstance(plugins, list):
-                    self._publish_plugin_list(plugins, token_before, request_seq)
-                    logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
-                    return self.plugin_list
+                    result = self._publish_plugin_list(plugins, token_before, request_seq)
+                    logger.info(f"[Agent] Loaded {len(result)} plugins via external provider")
+                    return result
                 if plugins is None:
                     # Fetch failed / timed out: keep the last good cache, minus
                     # plugins known to be no longer running.
@@ -588,6 +593,7 @@ class DirectTaskExecutor:
                 logger.warning(f"[Agent] external plugin_list_provider failed: {e}")
 
         # fallback to built-in HTTP fetcher
+        result = None
         if (self.plugin_list == []) or force_refresh or not self._plugin_list_cache_is_fresh():
             try:
                 token_before = self._read_plugin_list_change_token()
@@ -609,12 +615,14 @@ class DirectTaskExecutor:
                     if resp.status_code != 200 or not isinstance(plugin_list, list):
                         self._prune_plugin_list_on_fetch_failure()
                     else:
-                        self._publish_plugin_list(plugin_list, token_before, request_seq)
+                        result = self._publish_plugin_list(plugin_list, token_before, request_seq)
             except Exception as e:
                 logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
                 self._prune_plugin_list_on_fetch_failure()
-        logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins: {[p.get('id', 'unknown') for p in self.plugin_list if isinstance(p, dict)]}")
-        return self.plugin_list
+        if result is None:
+            result = self.plugin_list
+        logger.info(f"[Agent] Loaded {len(result)} plugins: {[p.get('id', 'unknown') for p in result if isinstance(p, dict)]}")
+        return result
 
 
     def _get_llm(
@@ -2144,8 +2152,7 @@ class DirectTaskExecutor:
         plugins = []
         if user_plugin_enabled:
             # 普通回合复用缓存；列表可能变化（生命周期信号 / TTL）时才重新拉取。
-            await self.plugin_list_provider(force_refresh=False)
-            plugins = self.plugin_list
+            plugins = await self.plugin_list_provider(force_refresh=False)
         if user_plugin_enabled and plugins:
             parallel_tasks.append(('up', self._assess_user_plugin(conversation, plugins, lang=lang)))
 
@@ -2327,8 +2334,7 @@ class DirectTaskExecutor:
         # If cache is empty, attempt to refresh once
         if not plugins_list:
             try:
-                await self.plugin_list_provider(force_refresh=True)
-                plugins_list = self.plugin_list or []
+                plugins_list = await self.plugin_list_provider(force_refresh=True) or []
             except Exception:
                 plugins_list = []
         
