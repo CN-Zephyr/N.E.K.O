@@ -80,6 +80,7 @@ from plugin.server.infrastructure.runtime_overrides import (
     get_runtime_auto_start_override,
     get_runtime_override,
     migrate_runtime_override,
+    set_runtime_auto_start_override,
     set_runtime_override,
 )
 from plugin.server.messaging.lifecycle_events import emit_lifecycle_event
@@ -550,6 +551,17 @@ def _set_plugin_runtime_enabled_sync(plugin_id: str, enabled: bool) -> None:
         raw_meta["runtime_enabled"] = enabled
         state.plugins[plugin_id] = raw_meta
     state.invalidate_snapshot_cache("plugins")
+
+
+def _set_plugin_runtime_auto_start_sync(plugin_id: str, auto_start: bool) -> bool:
+    with state.acquire_plugins_write_lock():
+        raw_meta = state.plugins.get(plugin_id)
+        if not isinstance(raw_meta, dict):
+            return False
+        raw_meta["runtime_auto_start"] = auto_start
+        state.plugins[plugin_id] = raw_meta
+    state.invalidate_snapshot_cache("plugins")
+    return True
 
 
 def _set_plugin_runtime_metadata_sync(
@@ -1552,6 +1564,51 @@ class PluginLifecycleService:
                 plugin_id=plugin_id,
                 error_type=type(exc).__name__,
             ) from exc
+
+    @serialized_plugin_operation
+    async def set_plugin_auto_start(
+        self, plugin_id: str, auto_start: bool
+    ) -> dict[str, object]:
+        """Persist the user's auto-start preference without touching the process.
+
+        Only the ``auto_start`` field of the runtime override is written; the
+        ``enabled`` preference, the pending-approval gate and the running host
+        are left as they are.
+        """
+        if await asyncio.to_thread(_get_plugin_meta_sync, plugin_id) is None:
+            raise _to_domain_error(
+                code="PLUGIN_NOT_FOUND",
+                message=f"Plugin '{plugin_id}' not found",
+                status_code=404,
+                plugin_id=plugin_id,
+                error_type="PluginNotFound",
+            )
+        try:
+            await asyncio.to_thread(
+                set_runtime_auto_start_override, plugin_id, auto_start
+            )
+        except RuntimeOverridePersistenceError as exc:
+            raise ServerDomainError(
+                code="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
+                message="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
+                status_code=500,
+                details={
+                    "plugin_id": plugin_id,
+                    "auto_start": auto_start,
+                    "error_type": type(exc).__name__,
+                    "runtime_state_changed": False,
+                },
+                log_level="error",
+            ) from exc
+        await asyncio.to_thread(
+            _set_plugin_runtime_auto_start_sync, plugin_id, auto_start
+        )
+        return {
+            "success": True,
+            "plugin_id": plugin_id,
+            "auto_start": auto_start,
+            "message": "Plugin auto-start preference updated",
+        }
 
     @serialized_plugin_operation
     async def reload_plugin(self, plugin_id: str) -> dict[str, object]:

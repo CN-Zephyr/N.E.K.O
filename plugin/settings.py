@@ -284,13 +284,15 @@ PLUGIN_TRIGGER_TIMEOUT = _get_float_env("NEKO_PLUGIN_TRIGGER_TIMEOUT", 10.0)
 # Env: NEKO_PLUGIN_STARTUP_TIMEOUT, default=10.0
 PLUGIN_STARTUP_TIMEOUT = _get_float_env("NEKO_PLUGIN_STARTUP_TIMEOUT", 10.0)
 
-# Keep the next-launch auto-start preference in sync with explicit user
-# start/stop actions from the plugin manager. Internal lifecycle operations do
-# not persist user intent and therefore do not change auto-start.
-# Env: NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE, default=True
+# Legacy opt-in: also rewrite the next-launch auto-start preference on explicit
+# user start/stop actions from the plugin manager. Off by default -- a one-off
+# manual start/stop no longer changes auto-start; users set it with the
+# dedicated auto-start switch (PUT /plugin/{id}/auto-start). Internal lifecycle
+# operations never persist user intent regardless of this flag.
+# Env: NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE, default=False
 PLUGIN_SYNC_AUTO_START_ON_TOGGLE = _get_bool_env(
     "NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE",
-    True,
+    False,
 )
 
 # 单个插件优雅关闭的超时时间
