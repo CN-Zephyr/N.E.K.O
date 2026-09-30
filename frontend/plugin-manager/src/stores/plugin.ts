@@ -13,6 +13,7 @@ import {
   reloadPlugin,
   reloadAllPlugins,
   refreshPluginsRegistry,
+  setPluginAutoStart,
 } from '@/api/plugins'
 import type { PluginListSummary } from '@/api/plugins'
 import { getLocale, i18n } from '@/i18n'
@@ -69,8 +70,10 @@ export const usePluginStore = defineStore('plugin', () => {
   // 不被 import，前端拿到 status=stopped 但又被 enabled=false 覆盖成
   // disabled，按钮被 isDisabled 拦截 → 用户"停过就再也开不起来"。
   // 现在直接信任 runtime status（stopped / running / load_failed），
-  // start API 仍会把 override 翻回 true，所以"停过下次还停"的持久化
-  // 行为不变，只是不再用一个独立的灰色 disabled 态遮蔽 start 按钮。
+  // stop / start API 仍会持久化 `enabled` override（start 翻回 true），
+  // 所以"停过下次还停"的行为不变，只是不再用一个独立的灰色 disabled
+  // 态遮蔽 start 按钮。`auto_start` 默认不随手动启停改写，只由独立的
+  // 自动启动开关（PUT /plugin/{id}/auto-start）设置。
   function withDisplayState<P extends PluginListSummary>(plugin: P) {
     return {
       ...plugin,
@@ -355,6 +358,11 @@ export const usePluginStore = defineStore('plugin', () => {
     if (options.refresh !== false) await refreshAfterMutation(pluginId)
   }
 
+  async function setAutoStart(pluginId: string, autoStart: boolean, options: PluginMutationOptions = {}) {
+    await setPluginAutoStart(pluginId, autoStart)
+    if (options.refresh !== false) await refreshAfterMutation(pluginId)
+  }
+
   async function reload(pluginId: string, options: PluginMutationOptions = {}) {
     const pendingRevision = pendingReloadRevision(pluginId)
     await reloadPlugin(pluginId)
@@ -430,5 +438,6 @@ export const usePluginStore = defineStore('plugin', () => {
     stop,
     reload,
     reloadAll,
+    setAutoStart,
   }
 })
