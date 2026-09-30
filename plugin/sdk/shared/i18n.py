@@ -116,21 +116,27 @@ def _load_json_file_checked(path: Path) -> tuple[dict[str, object], bool]:
         if not path.is_file() or path.stat().st_size > 512 * 1024:
             return {}, True
         text = path.read_text(encoding="utf-8")
+    except UnicodeError:
+        # Invalid UTF-8 is a property of the file, not a transient failure:
+        # skip this locale like malformed JSON and keep the others.
+        return {}, True
     except OSError:
         return {}, False
     try:
         payload = json.loads(text)
-    except (UnicodeError, json.JSONDecodeError):
+    except json.JSONDecodeError:
         return {}, True
     return (dict(payload) if isinstance(payload, Mapping) else {}), True
 
 
 # Parsed locale bundles keyed by resolved locales dir. Each entry is validated
 # against a stat signature of the ``*.json`` files (names, type, mtime_ns,
-# size), so edits, hot reload and installs are picked up without explicit
-# invalidation. Callers always receive fresh copies.
+# ctime_ns, size), so edits and hot reload are picked up without explicit
+# invalidation. Installs and rollbacks can copy files with preserved
+# timestamps, so they also call ``clear_plugin_i18n_cache``. Callers always
+# receive fresh copies.
 _BUNDLE_CACHE_MAX_ENTRIES = 256
-_Signature = tuple[tuple[str, int, int, int], ...]
+_Signature = tuple[tuple[str, int, int, int, int], ...]
 _CachedBundle = tuple[dict[str, object], bool]
 _bundle_cache: OrderedDict[str, tuple[_Signature, dict[str, _CachedBundle]]] = OrderedDict()
 _bundle_cache_lock = threading.Lock()
@@ -140,7 +146,7 @@ _IMMUTABLE_JSON_TYPES = (str, int, float, bool, type(None))
 def _scan_locale_files(locales_dir: Path) -> tuple[_Signature, list[Path]] | None:
     """Return the stat signature and paths of ``*.json`` files, sorted like
     ``sorted(locales_dir.glob("*.json"))``. ``None`` if the dir is unreadable."""
-    entries: list[tuple[str, Path, int, int, int]] = []
+    entries: list[tuple[str, Path, int, int, int, int]] = []
     try:
         with os.scandir(locales_dir) as it:
             for entry in it:
@@ -152,11 +158,14 @@ def _scan_locale_files(locales_dir: Path) -> tuple[_Signature, list[Path]] | Non
                     # Dangling symlink or file removed mid-scan: skip it like
                     # the old glob + is_file() path did, keep other locales.
                     continue
-                entries.append((os.path.normcase(entry.name), Path(entry.path), stat.S_IFMT(st.st_mode), st.st_mtime_ns, st.st_size))
+                entries.append((os.path.normcase(entry.name), Path(entry.path), stat.S_IFMT(st.st_mode), st.st_mtime_ns, st.st_ctime_ns, st.st_size))
     except OSError:
         return None
     entries.sort(key=lambda item: item[0])
-    signature = tuple((path.name, mode, mtime_ns, size) for _, path, mode, mtime_ns, size in entries)
+    signature = tuple(
+        (path.name, mode, mtime_ns, ctime_ns, size)
+        for _, path, mode, mtime_ns, ctime_ns, size in entries
+    )
     return signature, [item[1] for item in entries]
 
 

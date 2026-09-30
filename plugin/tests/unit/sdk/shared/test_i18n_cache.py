@@ -220,3 +220,36 @@ def test_transient_read_error_is_not_cached(tmp_path: Path, monkeypatch: pytest.
     failing["on"] = False
     second = load_plugin_i18n_from_dir(locales, default_locale="en")
     assert second.t("title", locale="zh-CN") == "你好"
+
+
+def test_invalid_utf8_locale_is_skipped(tmp_path: Path) -> None:
+    locales = tmp_path / "locales"
+    locales.mkdir()
+    _write(locales / "en.json", {"title": "Hello"})
+    (locales / "zh-CN.json").write_bytes(b'{"title": "\xff\xfe"}')
+
+    i18n = load_plugin_i18n_from_dir(locales, default_locale="en")
+    assert i18n.t("title", locale="en") == "Hello"
+    assert "zh-CN" not in i18n.messages
+    # A permanently undecodable file is not a transient error; the result is cached.
+    assert str(locales.resolve()) in i18n_module._bundle_cache
+
+
+def test_plugin_replacement_invalidates_timestamp_preserving_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.core import host as host_module
+    from plugin.server.application.plugins.installation_transactions import replace as replace_module
+
+    monkeypatch.setattr(host_module, "evict_cached_plugin_modules", lambda plugin_id: None)
+    meta, locales = _plugin(tmp_path)
+    load_plugin_i18n_from_meta(meta)
+
+    target = locales / "en.json"
+    before = target.stat()
+    _write(target, {"plugin.name": "Dumb"})  # same byte length as "Demo"
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    replace_module._evict_replaced_plugin_modules("demo")
+
+    assert load_plugin_i18n_from_meta(meta).t("plugin.name", locale="en") == "Dumb"
