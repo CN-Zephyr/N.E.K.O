@@ -176,20 +176,22 @@ async def test_late_sampling_thread_from_stopped_round_does_not_touch_new_cache(
     monkeypatch.setattr(collector, "_collect_plugin_metrics_sync", _tracked_collect)
 
     old_host = _host(1001)
-    await collector.start(lambda: {"demo": old_host})
-    assert await asyncio.to_thread(old_entered.wait, 5)
-
-    await collector.stop()
     new_host = _host(2002)
-    await collector.start(lambda: {"demo": new_host})
-    assert await asyncio.to_thread(sampled[2002].wait, 5)
-    new_entry = collector._ps_processes["demo"]
-    assert new_entry[0] == 2002
-
-    release_old.set()
-    assert await asyncio.to_thread(sampled[1001].wait, 5)
-
+    # 任一断言失败都要放行旧线程并停掉收集任务，避免遗留后台线程/任务拖慢清理。
     try:
+        await collector.start(lambda: {"demo": old_host})
+        assert await asyncio.to_thread(old_entered.wait, 5)
+
+        await collector.stop()
+        await collector.start(lambda: {"demo": new_host})
+        assert await asyncio.to_thread(sampled[2002].wait, 5)
+        new_entry = collector._ps_processes["demo"]
+        assert new_entry[0] == 2002
+
+        release_old.set()
+        assert await asyncio.to_thread(sampled[1001].wait, 5)
+
         assert collector._ps_processes.get("demo") is new_entry
     finally:
+        release_old.set()
         await collector.stop()
