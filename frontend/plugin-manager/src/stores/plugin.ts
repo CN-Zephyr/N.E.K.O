@@ -64,6 +64,11 @@ export const usePluginStore = defineStore('plugin', () => {
   let fetchStatusSeq = 0
   let fetchSummariesSeq = 0
   const fetchDetailSeq = new Map<string, number>()
+  // Auto-start values confirmed by a PUT, tagged with a save sequence. A summary
+  // request that started before the save still publishes, but with the confirmed
+  // value laid over its stale runtime_auto_start.
+  let autoStartSaveSeq = 0
+  const confirmedAutoStart = new Map<string, { value: boolean, seq: number }>()
 
   // 不再把 `runtime_enabled=false` 提升成 DISABLED 状态：
   // 历史上 stop 写 `runtime_overrides.json[pid]=false`，下次启动 plugin
@@ -98,6 +103,7 @@ export const usePluginStore = defineStore('plugin', () => {
       return pendingFetchSummaries
     }
     const seq = ++fetchSummariesSeq
+    const savesBefore = autoStartSaveSeq
     pendingFetchSummariesLocale = requestLocale
     pendingFetchSummaries = (async () => {
       try {
@@ -105,7 +111,10 @@ export const usePluginStore = defineStore('plugin', () => {
           ? { preserveMessagesOn404: true }
           : undefined)
         if (seq !== fetchSummariesSeq) return
-        const nextSummaries = response.plugins || []
+        const nextSummaries = (response.plugins || []).map((plugin) => {
+          const saved = confirmedAutoStart.get(plugin.id)
+          return saved && saved.seq > savesBefore ? { ...plugin, runtime_auto_start: saved.value } : plugin
+        })
         pruneDetails(new Set(nextSummaries.map(plugin => plugin.id)))
         pluginSummaries.value = reconcilePluginSnapshot(pluginSummaries.value, nextSummaries)
         pluginSummarySnapshotLoaded.value = true
@@ -364,13 +373,12 @@ export const usePluginStore = defineStore('plugin', () => {
     // failed refetch, and the switch reads the cached detail first, so it
     // would otherwise keep showing the old preference after a success toast.
     const saved = typeof result?.auto_start === 'boolean' ? result.auto_start : autoStart
-    // Detail and summary requests started before the PUT (e.g. a cached-entry
-    // revalidation) carry the old preference; fence them off so they cannot
-    // overwrite this value.
+    // A detail request started before the PUT (e.g. a cached-entry revalidation)
+    // carries the old preference; fence it off so it cannot overwrite this value.
+    // In-flight summaries still land (they may be the sidebar's first load) and
+    // pick up the confirmed value from confirmedAutoStart.
     invalidateDetail(pluginId)
-    fetchSummariesSeq += 1
-    pendingFetchSummaries = null
-    pendingFetchSummariesLocale = null
+    confirmedAutoStart.set(pluginId, { value: saved, seq: ++autoStartSaveSeq })
     const detail = pluginDetails.value[pluginId]
     if (detail) {
       pluginDetails.value = { ...pluginDetails.value, [pluginId]: { ...detail, runtime_auto_start: saved } }

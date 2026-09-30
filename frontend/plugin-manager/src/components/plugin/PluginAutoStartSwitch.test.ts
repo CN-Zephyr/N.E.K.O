@@ -178,10 +178,15 @@ describe('PluginAutoStartSwitch', () => {
     const stale = store.fetchPluginSummaries(true)
 
     await store.setAutoStart('demo', false, { refresh: false })
-    resolveStale({ plugins: [{ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true }] })
+    resolveStale({ plugins: [
+      { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true },
+      { id: 'other', name: 'Other', description: 'Other', version: '1.0.0', runtime_auto_start: true },
+    ] })
     await stale
 
+    // The response still publishes (other plugins appear) with the saved value kept.
     expect(store.getPluginById('demo')?.autoStart).toBe(false)
+    expect(store.getPluginById('other')?.autoStart).toBe(true)
     app.unmount()
   })
 
