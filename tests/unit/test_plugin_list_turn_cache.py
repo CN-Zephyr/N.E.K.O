@@ -166,12 +166,86 @@ async def test_provider_failure_keeps_cache_and_retries(monkeypatch, clock):
     provider.exc = RuntimeError("plugin server down")
     clock.now += te._PLUGIN_LIST_CACHE_TTL_SECONDS
     await _turns(ex, 2)
-    assert ex.plugin_list == PLUGINS  # last good list survives
-    assert provider.calls == 3  # stale cache keeps retrying
+    # TTL expired → cache is stale, so a failed refresh must not reuse it.
+    assert ex.plugin_list == []
+    assert provider.calls == 3  # keeps retrying
 
     provider.exc = None
     await _turns(ex, 3)
     assert provider.calls == 4
+    assert ex.plugin_list == PLUGINS
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_within_ttl_and_same_token_keeps_cache(monkeypatch, clock):
+    provider = _Provider()
+    ex = _executor(monkeypatch, provider, token_fn=lambda: 1)
+    await _turns(ex, 1)
+
+    async def failing(force_refresh):
+        return None  # transient /plugins timeout
+
+    ex._external_plugin_provider = failing
+    result = await ex.plugin_list_provider(force_refresh=True)
+    assert result == PLUGINS  # still fresh: transient failure keeps it
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_after_stop_does_not_reuse_stale_list(monkeypatch, clock):
+    rev = {"v": 1}
+    provider = _Provider()
+    ex = _executor(monkeypatch, provider, token_fn=lambda: rev["v"])
+    await _turns(ex, 1)
+    assert ex.plugin_list == PLUGINS
+
+    async def failing(force_refresh):
+        return None  # /plugins timed out
+
+    ex._external_plugin_provider = failing
+    rev["v"] = 2  # plugin stopped normally → lifecycle revision moved
+    for _ in range(3):
+        assert await ex.plugin_list_provider(force_refresh=False) == []
+    assert ex.plugin_list == []
+
+
+@pytest.mark.asyncio
+async def test_crashed_plugin_changes_token_and_triggers_refetch(monkeypatch, clock):
+    # A crash emits no lifecycle event; the alive-host part of the token moves.
+    alive = {"demo"}
+    provider = _Provider()
+    ex = _executor(
+        monkeypatch, provider, token_fn=lambda: (1, tuple(sorted(alive)))
+    )
+    await _turns(ex, 2)
+    assert provider.calls == 1
+    alive.clear()  # plugin process died on its own
+    provider.result = []
+    await _turns(ex, 1)
+    assert provider.calls == 2
+    assert ex.plugin_list == []
+
+
+def test_agent_change_token_tracks_host_liveness(monkeypatch):
+    from app.agent_server import api_runtime as srv
+    from plugin.core.state import state
+
+    class _Host:
+        def __init__(self, alive: bool) -> None:
+            self.alive = alive
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    host = _Host(True)
+    monkeypatch.setattr(
+        state, "get_plugin_hosts_snapshot_cached", lambda timeout=2.0, force=False: {"demo": host}
+    )
+    before = srv._plugin_list_change_token()
+    assert before[1] == ("demo",)
+    host.alive = False  # crash: no lifecycle event, revision unchanged
+    after = srv._plugin_list_change_token()
+    assert after[0] == before[0]
+    assert after != before
 
 
 def test_lifecycle_event_bumps_change_token():

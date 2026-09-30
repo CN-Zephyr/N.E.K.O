@@ -8,13 +8,20 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+import brain.task_executor as te
 from brain.task_executor import DirectTaskExecutor
 
 
 def _make_executor(cached, provider=None):
+    # The cached list was just fetched and no change signal is wired, so it is
+    # fresh: a failed refresh may keep it (a stale one is dropped, see
+    # test_plugin_list_turn_cache).
     executor = object.__new__(DirectTaskExecutor)
     executor.plugin_list = list(cached)
     executor._external_plugin_provider = provider
+    executor._plugin_list_change_token = None
+    executor._plugin_list_fetched_at = te._monotonic()
+    executor._plugin_list_fetched_token = None
     executor._short_desc_cache = {}
     executor._short_desc_prewarm_inflight = set()
     executor._short_desc_prewarm_tasks = set()

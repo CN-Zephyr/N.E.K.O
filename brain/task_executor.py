@@ -76,8 +76,8 @@ from .plugin_filter import (
 logger = get_module_logger(__name__, "Agent")
 _TIMEOUT_UNSET = object()
 # analyze 回合复用插件列表缓存的最长时间。变更信号（见
-# set_plugin_list_change_token）覆盖启停/重载/卸载；TTL 兜底覆盖没有事件的
-# 变化（插件进程崩溃、registry refresh 后 manifest 变更）。
+# set_plugin_list_change_token）覆盖启停/重载/卸载与插件进程意外退出；TTL 兜底
+# 覆盖没有信号的变化（如 registry refresh 后 manifest 变更）。
 _PLUGIN_LIST_CACHE_TTL_SECONDS = 30.0
 # 单独引用，便于测试注入确定性时钟。
 _monotonic = time.monotonic
@@ -323,8 +323,8 @@ class DirectTaskExecutor:
 
         ``token_fn`` returns a value that changes whenever the plugin list may
         have changed (agent_server wires the embedded plugin server's lifecycle
-        revision). A cached list is reused only while the token is unchanged
-        and younger than ``_PLUGIN_LIST_CACHE_TTL_SECONDS``."""
+        revision plus the set of plugin hosts whose process is alive). A cached
+        list is reused only while the token is unchanged and younger than ``_PLUGIN_LIST_CACHE_TTL_SECONDS``."""
         self._plugin_list_change_token = token_fn
 
     def _read_plugin_list_change_token(self) -> Any:
@@ -347,6 +347,23 @@ class DirectTaskExecutor:
         if token is _PLUGIN_LIST_TOKEN_UNAVAILABLE:
             return False
         return token == getattr(self, "_plugin_list_fetched_token", None)
+
+    def _drop_stale_plugin_list_on_fetch_failure(self) -> None:
+        """A failed refresh may keep the cache only while it is still fresh
+        (same change token, within TTL). A cache known to be stale (plugin
+        stopped / crashed, TTL expired) must not be handed to the analyzer as
+        available capabilities, so it is dropped for this turn — the same
+        "no plugins" outcome a failed fetch had before caching."""
+        if self._plugin_list_cache_is_fresh():
+            return
+        if self.plugin_list:
+            logger.debug(
+                "[Agent] plugin list refresh failed and cache is stale; dropping %d cached plugins",
+                len(self.plugin_list),
+            )
+        self.plugin_list = []
+        self._plugin_list_fetched_at = None
+        self._plugin_list_fetched_token = None
 
     def _apply_cached_short_descriptions(self, plugins: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Apply manifest-provided or previously-generated short_description
@@ -505,10 +522,11 @@ class DirectTaskExecutor:
                     logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
                     return self.plugin_list
                 if plugins is None:
-                    # Fetch failed / timed out: keep the last good cache rather
-                    # than wiping it for this (and later) turns.
+                    # Fetch failed / timed out: keep the last good cache only
+                    # while it is still fresh; a known-stale one is dropped.
+                    self._drop_stale_plugin_list_on_fetch_failure()
                     logger.debug(
-                        "[Agent] external plugin_list_provider fetch failed; keeping %d cached plugins",
+                        "[Agent] external plugin_list_provider fetch failed; using %d cached plugins",
                         len(self.plugin_list),
                     )
                     return self.plugin_list
@@ -531,8 +549,11 @@ class DirectTaskExecutor:
                         data = None
                     plugin_list = data.get("plugins") if isinstance(data, dict) else (data if isinstance(data, list) else None)
                     # Only a successful response replaces the cache (an empty
-                    # list legitimately clears it); failures keep the last good one.
-                    if resp.status_code == 200 and isinstance(plugin_list, list):
+                    # list legitimately clears it); failures keep the last good
+                    # one only while it is still fresh.
+                    if resp.status_code != 200 or not isinstance(plugin_list, list):
+                        self._drop_stale_plugin_list_on_fetch_failure()
+                    else:
                         self.plugin_list = plugin_list  # 更新实例变量
                         self._plugin_list_fetched_at = _monotonic()
                         self._plugin_list_fetched_token = token_before
@@ -541,6 +562,7 @@ class DirectTaskExecutor:
                         self._schedule_short_desc_prewarm(self.plugin_list)
             except Exception as e:
                 logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
+                self._drop_stale_plugin_list_on_fetch_failure()
         logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins: {[p.get('id', 'unknown') for p in self.plugin_list if isinstance(p, dict)]}")
         return self.plugin_list
 

@@ -152,6 +152,28 @@ class ToolCorrectionPayload(BaseModel):
     user_note: str = ""
 
 
+def _plugin_list_change_token() -> tuple:
+    """Cheap in-process change signal for the analyze-turn plugin list cache.
+
+    The plugin server is embedded in this process. Its lifecycle bus revision
+    is bumped on every start/stop/reload/delete/load event, but a plugin
+    process that dies on its own emits no event — so the set of hosts whose
+    process is still alive (the same check ``GET /plugins`` uses to report
+    ``running``) is part of the token too.
+    """
+    from plugin.core.state import state as plugin_state
+
+    hosts = plugin_state.get_plugin_hosts_snapshot_cached(timeout=0.5)
+    alive = []
+    for plugin_id, host in hosts.items():
+        try:
+            if host.is_alive():
+                alive.append(str(plugin_id))
+        except Exception:
+            continue
+    return plugin_state.get_bus_rev("lifecycle"), tuple(sorted(alive))
+
+
 def _check_agent_api_gate() -> Dict[str, Any]:
     """Unified agent API gate check."""
     try:
@@ -821,14 +843,7 @@ async def startup():
         try:
             Modules.task_executor.set_plugin_list_provider(_http_plugin_provider)
             logger.debug("[Agent] Registered http plugin_list_provider for task_executor")
-            # The plugin server is embedded in this process, so its lifecycle
-            # bus revision (bumped on every start/stop/reload/delete/load event)
-            # is a free in-process change signal for the analyze-turn cache.
-            from plugin.core.state import state as _plugin_state
-
-            Modules.task_executor.set_plugin_list_change_token(
-                lambda: _plugin_state.get_bus_rev("lifecycle")
-            )
+            Modules.task_executor.set_plugin_list_change_token(_plugin_list_change_token)
         except Exception as e:
             logger.warning(f"[Agent] Failed to inject plugin_list_provider into task_executor: {e}")
     except Exception as e:
