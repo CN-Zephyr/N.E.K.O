@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import multiprocessing
 from types import SimpleNamespace
 
 import pytest
@@ -84,3 +85,48 @@ def test_plugin_process_runner_marks_child_before_serving(monkeypatch):
             "demo", "plugins.demo:Plugin", "plugin.toml", "ipc://down", "ipc://up", uplink_token="token",
         )
     assert marks == [True]
+
+
+def _probe_spawned_child_response_lookup(result_queue) -> None:
+    # Runs in a fresh spawn interpreter: no inherited proxies, real module state.
+    import multiprocessing as mp
+
+    from plugin.core.state import state as child_state
+
+    started: list[bool] = []
+    original_manager = mp.Manager
+
+    def _tracking_manager(*args, **kwargs):
+        started.append(True)
+        return original_manager(*args, **kwargs)
+
+    mp.Manager = _tracking_manager
+    try:
+        child_state.mark_plugin_child_process()
+        lookup = (
+            child_state.get_plugin_response("rid-spawn"),
+            child_state.peek_plugin_response("rid-spawn"),
+            type(child_state.plugin_response_map).__name__,
+            type(child_state.plugin_response_event_map).__name__,
+        )
+        result_queue.put((started, child_state._plugin_response_map_manager is None, lookup))
+    finally:
+        mp.Manager = original_manager
+
+
+def test_spawned_plugin_child_response_lookup_never_starts_manager():
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(target=_probe_spawned_child_response_lookup, args=(result_queue,))
+    process.start()
+    try:
+        started, no_manager, lookup = result_queue.get(timeout=60)
+    finally:
+        process.join(15)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+    assert process.exitcode == 0
+    assert started == []
+    assert no_manager is True
+    assert lookup == (None, None, "dict", "dict")
