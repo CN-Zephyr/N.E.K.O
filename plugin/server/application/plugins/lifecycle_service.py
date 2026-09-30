@@ -79,7 +79,9 @@ from plugin.server.infrastructure.runtime_overrides import (
     RuntimeOverridePersistenceError,
     get_runtime_auto_start_override,
     get_runtime_override,
+    get_runtime_override_entry,
     migrate_runtime_override,
+    restore_runtime_override,
     set_runtime_auto_start_override,
     set_runtime_override,
 )
@@ -97,7 +99,6 @@ from plugin.settings import (
 from plugin.server.infrastructure.autostart_approvals import (
     clear_autostart_pending,
     is_autostart_approved,
-    mark_autostart_pending,
 )
 from plugin.utils import parse_bool_config
 
@@ -1597,24 +1598,13 @@ class PluginLifecycleService:
         restore_enabled = auto_start and (
             await asyncio.to_thread(get_runtime_override, plugin_id) is False
         )
-        # The approval goes first: if it cannot be made durable nothing else has
-        # been written yet, so the failure leaves disk and registry untouched.
         was_pending = auto_start and not await asyncio.to_thread(
             is_autostart_approved, plugin_id
         )
-        if was_pending and not await asyncio.to_thread(clear_autostart_pending, plugin_id):
-            raise ServerDomainError(
-                code="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
-                message="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
-                status_code=500,
-                details={
-                    "plugin_id": plugin_id,
-                    "auto_start": auto_start,
-                    "error_type": "AutostartApprovalPersistenceError",
-                    "runtime_state_changed": False,
-                },
-                log_level="error",
-            )
+        # The pending approval is the gate that keeps unapproved code from
+        # running at launch, so it is lifted only after the preference is
+        # durable. Every failure below therefore leaves the gate in place.
+        previous_override = await asyncio.to_thread(get_runtime_override_entry, plugin_id)
         try:
             if restore_enabled:
                 await asyncio.to_thread(
@@ -1625,12 +1615,6 @@ class PluginLifecycleService:
                     set_runtime_auto_start_override, plugin_id, auto_start
                 )
         except RuntimeOverridePersistenceError as exc:
-            # Put the approval back so the failed request changes nothing.
-            if was_pending and not await asyncio.to_thread(mark_autostart_pending, plugin_id):
-                logger.error(
-                    "Failed to restore pending auto-start approval for {} after a preference write failure",
-                    plugin_id,
-                )
             raise ServerDomainError(
                 code="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
                 message="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
@@ -1643,6 +1627,36 @@ class PluginLifecycleService:
                 },
                 log_level="error",
             ) from exc
+        if was_pending and not await asyncio.to_thread(clear_autostart_pending, plugin_id):
+            # Undo the preference so the failed request changes nothing. If the
+            # undo fails too, the plugin is still pending and cannot autostart.
+            written_override = await asyncio.to_thread(get_runtime_override_entry, plugin_id)
+            try:
+                rolled_back = await asyncio.to_thread(
+                    restore_runtime_override,
+                    plugin_id,
+                    previous_override,
+                    expected_current=written_override,
+                )
+            except (RuntimeOverridePersistenceError, OSError):
+                rolled_back = False
+            if not rolled_back:
+                logger.error(
+                    "Failed to roll back auto-start preference for {}; it stays pending approval",
+                    plugin_id,
+                )
+            raise ServerDomainError(
+                code="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                message="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                status_code=500,
+                details={
+                    "plugin_id": plugin_id,
+                    "auto_start": auto_start,
+                    "error_type": "AutostartApprovalPersistenceError",
+                    "runtime_state_changed": False,
+                },
+                log_level="error",
+            )
         await asyncio.to_thread(
             _set_plugin_runtime_auto_start_sync, plugin_id, auto_start
         )

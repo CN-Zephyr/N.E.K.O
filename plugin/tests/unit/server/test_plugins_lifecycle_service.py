@@ -4675,7 +4675,7 @@ async def test_set_plugin_auto_start_persist_failure_keeps_registry(
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
-async def test_set_plugin_auto_start_reports_unpersisted_approval(
+async def test_set_plugin_auto_start_rolls_back_preference_when_approval_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     _isolate_runtime_overrides: dict,
@@ -4694,8 +4694,8 @@ async def test_set_plugin_auto_start_reports_unpersisted_approval(
 
         assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
         assert exc_info.value.status_code == 500
-        # Nothing was written, so the 500 matches what the user sees.
-        assert _isolate_runtime_overrides == {}
+        # The written preference is rolled back, so the 500 matches what the user sees.
+        assert runtime_overrides_module.get_runtime_override_entry("demo_plugin") is None
         with module.state.acquire_plugins_read_lock():
             assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is False
     finally:
@@ -4704,7 +4704,35 @@ async def test_set_plugin_auto_start_reports_unpersisted_approval(
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
-async def test_set_plugin_auto_start_restores_approval_when_preference_write_fails(
+async def test_set_plugin_auto_start_keeps_pending_when_rollback_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
+
+        def _fail_restore(*_args, **_kwargs):
+            raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+
+        monkeypatch.setattr(module, "restore_runtime_override", _fail_restore)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        # The pending approval was never cleared, so launch still skips the plugin.
+        assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_leaves_approval_pending_when_preference_write_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     _isolate_runtime_overrides: dict,
@@ -4718,9 +4746,6 @@ async def test_set_plugin_auto_start_restores_approval_when_preference_write_fai
         monkeypatch.setattr(
             module, "clear_autostart_pending", lambda pid: calls.append(f"clear:{pid}") or True
         )
-        monkeypatch.setattr(
-            module, "mark_autostart_pending", lambda pid: calls.append(f"mark:{pid}") or True
-        )
 
         def _fail(*_args, **_kwargs):
             raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
@@ -4731,6 +4756,6 @@ async def test_set_plugin_auto_start_restores_approval_when_preference_write_fai
             await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
 
         assert exc_info.value.code == "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED"
-        assert calls == ["clear:demo_plugin", "mark:demo_plugin"]
+        assert calls == []
     finally:
         _restore_lifecycle_state(*backup)
