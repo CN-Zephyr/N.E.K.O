@@ -4536,6 +4536,9 @@ async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
         _seed_running_plugin("demo_plugin", config_path)
         runtime_overrides_module.set_runtime_override("demo_plugin", True, auto_start=True)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        # Pin the default mode so NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE in the
+        # environment cannot flip this test.
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", False)
 
         await module.PluginLifecycleService().stop_plugin(
             "demo_plugin", persist_user_intent=True
