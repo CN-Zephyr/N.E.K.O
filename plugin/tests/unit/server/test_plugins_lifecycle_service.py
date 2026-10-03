@@ -4557,11 +4557,13 @@ async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_start", [True, False])
+@pytest.mark.parametrize("has_enabled_override", [True, False])
 async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     _isolate_runtime_overrides: dict,
     auto_start: bool,
+    has_enabled_override: bool,
 ) -> None:
     config_path = _demo_config(tmp_path)
     backup = _backup_lifecycle_state()
@@ -4570,7 +4572,8 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
         with module.state.acquire_plugins_write_lock():
             module.state.plugins["demo_plugin"]["runtime_enabled"] = False
             module.state.plugins["demo_plugin"]["runtime_auto_start"] = not auto_start
-        runtime_overrides_module.set_runtime_override("demo_plugin", False)
+        if has_enabled_override:
+            runtime_overrides_module.set_runtime_override("demo_plugin", False)
         with module.state.acquire_plugin_hosts_read_lock():
             host = module.state.plugin_hosts["demo_plugin"]
 
@@ -4597,7 +4600,10 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
         # Turning auto-start on lifts the enabled=false a stop left behind and
         # the pending approval, or the next launch would still skip it.
         assert _isolate_runtime_overrides == {
-            "demo_plugin": {"enabled": auto_start, "auto_start": auto_start},
+            "demo_plugin": {
+                **({"enabled": auto_start} if has_enabled_override or auto_start else {}),
+                "auto_start": auto_start,
+            },
         }
         assert pending_calls == (["demo_plugin"] if auto_start else [])
         with module.state.acquire_plugin_hosts_read_lock():

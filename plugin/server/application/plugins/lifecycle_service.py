@@ -1672,7 +1672,8 @@ class PluginLifecycleService:
         otherwise still block that: a persisted ``enabled=false`` left by an
         earlier stop, and the pending approval of a freshly installed plugin.
         """
-        if await asyncio.to_thread(_get_plugin_meta_sync, plugin_id) is None:
+        meta = await asyncio.to_thread(_get_plugin_meta_sync, plugin_id)
+        if meta is None:
             raise _to_domain_error(
                 code="PLUGIN_NOT_FOUND",
                 message=f"Plugin '{plugin_id}' not found",
@@ -1681,7 +1682,8 @@ class PluginLifecycleService:
                 error_type="PluginNotFound",
             )
         restore_enabled = auto_start and (
-            await asyncio.to_thread(get_runtime_override, plugin_id) is False
+            meta.get("runtime_enabled") is False
+            or await asyncio.to_thread(get_runtime_override, plugin_id) is False
         )
         try:
             was_pending = auto_start and not await asyncio.to_thread(

@@ -98,6 +98,7 @@ def test_build_plugin_list_reports_source_missing_status(monkeypatch: pytest.Mon
         {
             "id": "missing_plugin",
             "name": "Missing Plugin",
+            "autostart_pending": False,
             "runtime_source_missing": True,
             "status": "source_missing",
             "i18n": {"messages": {}},
@@ -111,6 +112,25 @@ def test_build_plugin_list_reports_source_missing_status(monkeypatch: pytest.Mon
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_list_summary_and_detail_expose_autostart_approval_gate(
+    monkeypatch: pytest.MonkeyPatch, approved: bool,
+) -> None:
+    monkeypatch.setattr(query_module.state, "get_plugins_snapshot_cached", lambda timeout=2.0: {
+        "demo": {"id": "demo", "name": "Demo", "runtime_auto_start": True},
+    })
+    monkeypatch.setattr(query_module.state, "get_plugin_hosts_snapshot_cached", lambda timeout=2.0: {})
+    monkeypatch.setattr(query_module.state, "get_event_handlers_snapshot_cached", lambda timeout=2.0: {})
+    monkeypatch.setattr(query_module, "is_autostart_approved", lambda _plugin_id: approved)
+    service = query_module.PluginQueryService()
+    for summary in (False, True):
+        result = await service.list_plugins(summary=summary)
+        assert result["plugins"][0]["autostart_pending"] is (not approved)
+    detail = await service.get_plugin("demo")
+    assert detail["plugin"]["autostart_pending"] is (not approved)
 
 
 def test_build_plugin_list_omits_internal_entries_preview(monkeypatch: pytest.MonkeyPatch) -> None:

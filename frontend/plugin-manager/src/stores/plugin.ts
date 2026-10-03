@@ -90,7 +90,17 @@ export const usePluginStore = defineStore('plugin', () => {
       ...plugin,
       status: typeof plugin.status === 'string' ? plugin.status : StatusEnum.STOPPED,
       enabled: plugin.runtime_enabled !== false,
-      autoStart: plugin.runtime_auto_start !== false,
+      autoStart: plugin.runtime_auto_start !== false
+        && plugin.runtime_enabled !== false
+        && plugin.autostart_pending !== true,
+    }
+  }
+
+  function withConfirmedAutoStart<P extends PluginListSummary>(plugin: P, value: boolean): P {
+    return {
+      ...plugin,
+      runtime_auto_start: value,
+      ...(value ? { runtime_enabled: true, autostart_pending: false } : {}),
     }
   }
 
@@ -119,7 +129,7 @@ export const usePluginStore = defineStore('plugin', () => {
         if (seq !== fetchSummariesSeq) return
         const nextSummaries = (response.plugins || []).map((plugin) => {
           const saved = confirmedAutoStart.get(plugin.id)
-          return saved && saved.seq > savesBefore ? { ...plugin, runtime_auto_start: saved.value } : plugin
+          return saved && saved.seq > savesBefore ? withConfirmedAutoStart(plugin, saved.value) : plugin
         })
         pruneDetails(new Set(nextSummaries.map(plugin => plugin.id)))
         pluginSummaries.value = reconcilePluginSnapshot(pluginSummaries.value, nextSummaries)
@@ -449,12 +459,18 @@ export const usePluginStore = defineStore('plugin', () => {
     confirmedAutoStart.set(pluginId, { value: saved, seq: ++autoStartSaveSeq })
     const detail = pluginDetails.value[pluginId]
     if (detail) {
-      pluginDetails.value = { ...pluginDetails.value, [pluginId]: { ...detail, runtime_auto_start: saved } }
+      pluginDetails.value = { ...pluginDetails.value, [pluginId]: withConfirmedAutoStart(detail, saved) }
     }
     pluginSummaries.value = pluginSummaries.value.map(item => (
-      item.id === pluginId ? { ...item, runtime_auto_start: saved } : item
+      item.id === pluginId ? withConfirmedAutoStart(item, saved) : item
     ))
-    if (options.refresh !== false) await refreshAfterMutation(pluginId)
+    if (options.refresh !== false) {
+      const tasks: Promise<unknown>[] = [fetchPluginSummaries(true)]
+      if (detail) tasks.push(fetchPluginDetail(pluginId, true))
+      // This preference does not change process status or other plugins' details.
+      // Keep the confirmed state even if either revalidation fails.
+      await Promise.allSettled(tasks)
+    }
   }
 
   async function reload(pluginId: string, options: PluginMutationOptions = {}) {

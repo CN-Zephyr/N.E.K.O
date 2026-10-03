@@ -18,6 +18,7 @@ from plugin.server.application.install_source import (
 from plugin.server.application.plugins.ui_query_service import _build_plugin_list_actions_from_meta
 from plugin.server.domain import IO_RUNTIME_ERRORS
 from plugin.server.domain.errors import ServerDomainError
+from plugin.server.infrastructure.autostart_approvals import is_autostart_approved
 from plugin.utils.time_utils import now_iso
 
 logger = get_logger("server.application.plugins.query")
@@ -547,6 +548,7 @@ def _prepare_plugin_projection(
         else {field: plugin_meta[field] for field in fields if field in plugin_meta}
     )
     plugin_info["id"] = plugin_id
+    plugin_info["autostart_pending"] = not is_autostart_approved(plugin_id)
     plugin_info["status"] = _resolve_plugin_status(
         plugin_id=plugin_id,
         plugin_meta=plugin_meta,

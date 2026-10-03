@@ -99,6 +99,7 @@ describe('PluginAutoStartSwitch', () => {
     expect(button().dataset.checked).toBe('false')
     expect(elementPlusMocks.ElMessage.success).toHaveBeenCalledWith('messages.autoStartDisabled')
     expect(apiMocks.getPluginSummaries).toHaveBeenCalled()
+    expect(apiMocks.getPluginStatus).not.toHaveBeenCalled()
     expect(apiMocks.startPlugin).not.toHaveBeenCalled()
     expect(apiMocks.stopPlugin).not.toHaveBeenCalled()
     app.unmount()
@@ -143,10 +144,7 @@ describe('PluginAutoStartSwitch', () => {
   it('ignores a detail request that was already in flight before the save', async () => {
     let resolveStale: (value: unknown) => void = () => {}
     apiMocks.getPlugin.mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
-    let resolveStatus: (value: unknown) => void = () => {}
     apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
-    // Hold the follow-up refresh so the stale detail lands before it starts.
-    apiMocks.getPluginStatus.mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve }))
     apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
     const { app, button } = mount(true)
     const store = usePluginStore()
@@ -158,10 +156,9 @@ describe('PluginAutoStartSwitch', () => {
     await flushPromises()
 
     button().click()
-    await vi.waitFor(() => expect(apiMocks.getPluginStatus).toHaveBeenCalled())
+    await vi.waitFor(() => expect(apiMocks.getPluginSummaries).toHaveBeenCalled())
     resolveStale({ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true })
     await stale
-    resolveStatus({})
     await vi.waitFor(() => expect(elementPlusMocks.ElMessage.success).toHaveBeenCalledWith('messages.autoStartDisabled'))
     await flushPromises()
 
@@ -198,6 +195,34 @@ describe('PluginAutoStartSwitch', () => {
     button().click()
     await flushPromises()
     expect(apiMocks.setPluginAutoStart).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it.each([
+    { runtime_enabled: false },
+    { autostart_pending: true },
+    { runtime_enabled: false, autostart_pending: true },
+  ])('shows blocked autostart as off and publishes cleared gates after enabling: %j', async (gates) => {
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: true })
+    const { app, button } = mount(true, gates)
+    const store = usePluginStore()
+    store.pluginDetails = {
+      demo: { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true, ...gates },
+    }
+    let resolveStale: (value: unknown) => void = () => {}
+    apiMocks.getPluginSummaries.mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
+    const stale = store.fetchPluginSummaries(true)
+    expect(button().dataset.checked).toBe('false')
+
+    await store.setAutoStart('demo', true, { refresh: false })
+    resolveStale({ plugins: [{ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true, ...gates }] })
+    await stale
+    await flushPromises()
+    expect(button().dataset.checked).toBe('true')
+    expect(store.pluginSummaries[0]?.runtime_enabled).toBe(true)
+    expect(store.pluginSummaries[0]?.autostart_pending).toBe(false)
+    expect(apiMocks.startPlugin).not.toHaveBeenCalled()
+    expect(apiMocks.stopPlugin).not.toHaveBeenCalled()
     app.unmount()
   })
 })
