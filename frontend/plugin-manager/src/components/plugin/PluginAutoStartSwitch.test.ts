@@ -198,6 +198,22 @@ describe('PluginAutoStartSwitch', () => {
     app.unmount()
   })
 
+  it('explains that enabling autostart also enables a disabled plugin', async () => {
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: true })
+    apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
+    const { app, button, root } = mount(false, { runtime_enabled: false })
+    expect(button().dataset.checked).toBe('false')
+    expect(root.textContent).toContain('plugins.autoStartDisabledHint')
+    button().click()
+    await vi.waitFor(() => expect(elementPlusMocks.ElMessage.success).toHaveBeenCalled())
+    expect(apiMocks.setPluginAutoStart).toHaveBeenCalledWith('demo', true)
+    expect(button().dataset.checked).toBe('true')
+    expect(usePluginStore().getPluginById('demo')?.runtime_enabled).toBe(true)
+    expect(root.textContent).not.toContain('plugins.autoStartDisabledHint')
+    expect(apiMocks.startPlugin).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it.each([true, false])('preserves an initial detail load after saving (refresh=%s)', async (refresh) => {
     let resolveDetail: (value: unknown) => void = () => {}
     apiMocks.getPlugin.mockImplementationOnce(() => new Promise((resolve) => { resolveDetail = resolve }))

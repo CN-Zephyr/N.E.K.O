@@ -47,6 +47,9 @@ const supported = computed(() => {
 const hintKey = computed(() => {
   if (!supported.value) return 'plugins.autoStartUnsupportedDevelopment'
   const plugin = pluginStore.getPluginById(props.pluginId)
+  if (!autoStart.value && plugin?.runtime_enabled === false) {
+    return 'plugins.autoStartDisabledHint'
+  }
   if (autoStart.value && (plugin?.runtime_enabled === false || plugin?.autostart_pending === true)) {
     return 'plugins.autoStartBlockedHint'
   }

@@ -454,6 +454,7 @@ export default {
     autoStart: 'Início automático',
     manualStart: 'Início manual',
     autoStartHint: 'Iniciar automaticamente quando o N.E.K.O abrir. Iniciar ou parar manualmente não altera esta opção.',
+    autoStartDisabledHint: 'Este plugin está desativado. Ativar o início automático também o habilitará para a próxima abertura, sem iniciá-lo agora.',
     autoStartBlockedHint: 'A opção está ativada, mas o plugin está desativado ou aguardando aprovação e não iniciará ao abrir o N.E.K.O. Desative e ative novamente para habilitar e aprovar o início automático.',
     autoStartUnsupportedDevelopment: 'Plugins em desenvolvimento não iniciam automaticamente. Inicie-os manualmente.',
     fetchFailed: 'Falha ao obter os plugins',
