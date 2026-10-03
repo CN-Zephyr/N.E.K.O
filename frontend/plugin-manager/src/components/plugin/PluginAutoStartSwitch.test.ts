@@ -70,7 +70,7 @@ function mount(autoStart: boolean, extra: Record<string, unknown> = {}) {
   stubSwitch(app)
   app.mount(root)
   const button = () => root.querySelector<HTMLButtonElement>('[data-testid="plugin-auto-start-switch"]')!
-  return { app, button }
+  return { app, button, root }
 }
 
 describe('PluginAutoStartSwitch', () => {
@@ -202,9 +202,9 @@ describe('PluginAutoStartSwitch', () => {
     { runtime_enabled: false },
     { autostart_pending: true },
     { runtime_enabled: false, autostart_pending: true },
-  ])('shows blocked autostart as off and publishes cleared gates after enabling: %j', async (gates) => {
+  ])('keeps the saved preference on with a blocked hint and publishes cleared gates after enabling: %j', async (gates) => {
     apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: true })
-    const { app, button } = mount(true, gates)
+    const { app, button, root } = mount(true, gates)
     const store = usePluginStore()
     store.pluginDetails = {
       demo: { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true, ...gates },
@@ -212,17 +212,33 @@ describe('PluginAutoStartSwitch', () => {
     let resolveStale: (value: unknown) => void = () => {}
     apiMocks.getPluginSummaries.mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
     const stale = store.fetchPluginSummaries(true)
-    expect(button().dataset.checked).toBe('false')
+    expect(button().dataset.checked).toBe('true')
+    expect(root.textContent).toContain('plugins.autoStartBlockedHint')
 
     await store.setAutoStart('demo', true, { refresh: false })
     resolveStale({ plugins: [{ id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true, ...gates }] })
     await stale
     await flushPromises()
     expect(button().dataset.checked).toBe('true')
+    expect(root.textContent).not.toContain('plugins.autoStartBlockedHint')
     expect(store.pluginSummaries[0]?.runtime_enabled).toBe(true)
     expect(store.pluginSummaries[0]?.autostart_pending).toBe(false)
     expect(apiMocks.startPlugin).not.toHaveBeenCalled()
     expect(apiMocks.stopPlugin).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('clicking an on but blocked preference disables it without approving autostart', async () => {
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
+    const { app, button, root } = mount(true, { autostart_pending: true })
+    expect(button().dataset.checked).toBe('true')
+    expect(root.textContent).toContain('plugins.autoStartBlockedHint')
+    button().click()
+    await vi.waitFor(() => expect(elementPlusMocks.ElMessage.success).toHaveBeenCalled())
+    expect(apiMocks.setPluginAutoStart).toHaveBeenCalledWith('demo', false)
+    expect(button().dataset.checked).toBe('false')
+    expect(usePluginStore().getPluginById('demo')?.autostart_pending).toBe(true)
     app.unmount()
   })
 })

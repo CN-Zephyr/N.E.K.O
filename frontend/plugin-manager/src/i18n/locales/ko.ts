@@ -454,6 +454,7 @@ export default {
     autoStart: '자동 시작',
     manualStart: '수동 시작',
     autoStartHint: 'N.E.K.O 실행 시 이 플러그인을 자동으로 시작합니다. 수동으로 시작하거나 중지해도 이 설정은 바뀌지 않습니다.',
+    autoStartBlockedHint: '설정은 켜져 있지만 플러그인이 비활성화되었거나 승인 대기 중이므로 다음 실행 시 자동 시작되지 않습니다. 껐다가 다시 켜면 활성화 및 자동 시작이 승인됩니다.',
     autoStartUnsupportedDevelopment: '개발 중인 플러그인은 자동으로 시작되지 않습니다. 수동으로 시작하세요.',
     fetchFailed: '플러그인 목록을 불러오지 못했습니다',
     pluginType: '유형',

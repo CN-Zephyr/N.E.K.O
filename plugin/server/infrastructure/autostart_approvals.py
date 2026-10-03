@@ -180,6 +180,12 @@ def clear_autostart_pending(plugin_id: str) -> bool:
         return True
 
 
+def get_autostart_pending_snapshot() -> frozenset[str]:
+    """Read once for a projection, including the compatibility failure fallback."""
+    with _lock:
+        return frozenset(_load_locked())
+
+
 def is_autostart_approved(plugin_id: str, *, strict: bool = False) -> bool:
     """Whether the plugin may autostart; strict reads reject unknown approval."""
     with _lock:

@@ -454,6 +454,7 @@ export default {
     autoStart: '自动启动',
     manualStart: '手动启动',
     autoStartHint: 'N.E.K.O 启动时自动启动此插件。手动启动或停止不会改变此设置。',
+    autoStartBlockedHint: '偏好已开启，但插件被禁用或仍待批准，下次不会自启。关闭再开启可启用并批准自启。',
     autoStartUnsupportedDevelopment: '开发插件不会自动启动，请手动启动。',
     fetchFailed: '获取插件列表失败',
     pluginType: '类型',

@@ -454,6 +454,7 @@ export default {
     autoStart: 'Auto Start',
     manualStart: 'Manual Start',
     autoStartHint: 'Start automatically when N.E.K.O launches. Starting or stopping manually does not change this.',
+    autoStartBlockedHint: 'The preference is on, but this plugin is disabled or awaiting approval and will not start at launch. Turn off and on again to enable and approve auto-start.',
     autoStartUnsupportedDevelopment: 'Development plugins are not started automatically. Start them manually.',
     fetchFailed: 'Failed to fetch plugins',
     pluginType: 'Type',

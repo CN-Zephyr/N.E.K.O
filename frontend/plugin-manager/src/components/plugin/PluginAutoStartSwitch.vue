@@ -9,7 +9,7 @@
       @change="handleChange"
     />
     <span class="plugin-auto-start-switch__hint">
-      {{ supported ? t('plugins.autoStartHint') : t('plugins.autoStartUnsupportedDevelopment') }}
+      {{ t(hintKey) }}
     </span>
   </div>
 </template>
@@ -42,6 +42,15 @@ const autoStart = computed(() => {
 const supported = computed(() => {
   const plugin = pluginStore.getPluginById(props.pluginId)
   return plugin ? isOrdinaryPlugin(plugin) : true
+})
+
+const hintKey = computed(() => {
+  if (!supported.value) return 'plugins.autoStartUnsupportedDevelopment'
+  const plugin = pluginStore.getPluginById(props.pluginId)
+  if (autoStart.value && (plugin?.runtime_enabled === false || plugin?.autostart_pending === true)) {
+    return 'plugins.autoStartBlockedHint'
+  }
+  return 'plugins.autoStartHint'
 })
 
 // Same reporting rule as PluginActions: the request interceptor already
