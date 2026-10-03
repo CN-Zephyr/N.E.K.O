@@ -596,25 +596,18 @@ def _get_plugin_meta_sync(plugin_id: str) -> dict[str, object] | None:
     return normalized
 
 
-def _set_plugin_runtime_enabled_sync(plugin_id: str, enabled: bool) -> None:
+def _set_plugin_runtime_auto_start_sync(
+    plugin_id: str, auto_start: bool, *, restore_enabled: bool = False,
+) -> None:
     with state.acquire_plugins_write_lock():
         raw_meta = state.plugins.get(plugin_id)
         if not isinstance(raw_meta, dict):
             return
-        raw_meta["runtime_enabled"] = enabled
-        state.plugins[plugin_id] = raw_meta
-    state.invalidate_snapshot_cache("plugins")
-
-
-def _set_plugin_runtime_auto_start_sync(plugin_id: str, auto_start: bool) -> bool:
-    with state.acquire_plugins_write_lock():
-        raw_meta = state.plugins.get(plugin_id)
-        if not isinstance(raw_meta, dict):
-            return False
         raw_meta["runtime_auto_start"] = auto_start
+        if restore_enabled:
+            raw_meta["runtime_enabled"] = True
         state.plugins[plugin_id] = raw_meta
     state.invalidate_snapshot_cache("plugins")
-    return True
 
 
 def _set_plugin_runtime_metadata_sync(
@@ -1759,10 +1752,9 @@ class PluginLifecycleService:
                 log_level="error",
             )
         await asyncio.to_thread(
-            _set_plugin_runtime_auto_start_sync, plugin_id, auto_start
+            _set_plugin_runtime_auto_start_sync, plugin_id, auto_start,
+            restore_enabled=restore_enabled,
         )
-        if restore_enabled:
-            await asyncio.to_thread(_set_plugin_runtime_enabled_sync, plugin_id, True)
         return {
             "success": True,
             "plugin_id": plugin_id,

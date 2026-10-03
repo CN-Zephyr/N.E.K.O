@@ -4617,6 +4617,30 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
 
 
 @pytest.mark.plugin_unit
+def test_auto_start_registry_publication_updates_both_fields_before_invalidating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup = _backup_lifecycle_state()
+    published: list[dict] = []
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"] = {
+                "runtime_enabled": False, "runtime_auto_start": False,
+                "runtime_load_state": "failed",
+            }
+        monkeypatch.setattr(module.state, "invalidate_snapshot_cache", lambda _category: published.append(
+            copy.deepcopy(module.state.plugins["demo_plugin"])
+        ))
+        module._set_plugin_runtime_auto_start_sync("demo_plugin", True, restore_enabled=True)
+        assert published == [{
+            "runtime_enabled": True, "runtime_auto_start": True,
+            "runtime_load_state": "failed",
+        }]
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_start", [True, False])
 async def test_auto_start_toggle_with_unreadable_approval_store(

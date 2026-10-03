@@ -157,6 +157,7 @@ export const usePluginStore = defineStore('plugin', () => {
     const existing = pendingFetchDetails.get(pluginId)
     if (existing && !force) return existing
     const requestLocale = getLocale()
+    const savesBefore = autoStartSaveSeq
     const seq = (fetchDetailSeq.get(pluginId) || 0) + 1
     fetchDetailSeq.set(pluginId, seq)
     let request!: Promise<void>
@@ -167,7 +168,9 @@ export const usePluginStore = defineStore('plugin', () => {
       try {
         const detail = await getPlugin(pluginId, requestLocale)
         if (!stillCurrent()) return
-        pluginDetails.value = { ...pluginDetails.value, [pluginId]: detail }
+        const saved = confirmedAutoStart.get(pluginId)
+        pluginDetails.value = { ...pluginDetails.value, [pluginId]: saved && saved.seq > savesBefore
+          ? withConfirmedAutoStart(detail, saved.value) : detail }
       } catch (error: any) {
         const status = error?.response?.status
         if (status !== 404 && status !== 405) throw error
@@ -177,7 +180,9 @@ export const usePluginStore = defineStore('plugin', () => {
         const detail = response.plugins?.find((plugin) => plugin.id === pluginId)
         if (!stillCurrent()) return
         if (detail) {
-          pluginDetails.value = { ...pluginDetails.value, [pluginId]: detail }
+          const saved = confirmedAutoStart.get(pluginId)
+          pluginDetails.value = { ...pluginDetails.value, [pluginId]: saved && saved.seq > savesBefore
+            ? withConfirmedAutoStart(detail, saved.value) : detail }
         } else if (pluginId in pluginDetails.value) {
           const rest = { ...pluginDetails.value }
           delete rest[pluginId]
@@ -449,11 +454,8 @@ export const usePluginStore = defineStore('plugin', () => {
     // failed refetch, and the switch reads the cached detail first, so it
     // would otherwise keep showing the old preference after a success toast.
     const saved = typeof result?.auto_start === 'boolean' ? result.auto_start : autoStart
-    // A detail request started before the PUT (e.g. a cached-entry revalidation)
-    // carries the old preference; fence it off so it cannot overwrite this value.
-    // In-flight summaries still land (they may be the sidebar's first load) and
-    // pick up the confirmed value from confirmedAutoStart.
-    invalidateDetail(pluginId)
+    // Initial detail and summary loads still land with the confirmed preference
+    // overlaid; dropping them could leave the view empty if revalidation fails.
     confirmedAutoStart.set(pluginId, { value: saved, seq: ++autoStartSaveSeq })
     const detail = pluginDetails.value[pluginId]
     if (detail) {
@@ -464,7 +466,7 @@ export const usePluginStore = defineStore('plugin', () => {
     ))
     if (options.refresh !== false) {
       const tasks: Promise<unknown>[] = [fetchPluginSummaries()]
-      if (detail) tasks.push(fetchPluginDetail(pluginId, true))
+      if (detail || pendingFetchDetails.has(pluginId)) tasks.push(fetchPluginDetail(pluginId))
       // This preference does not change process status or other plugins' details.
       // Keep the confirmed state even if either revalidation fails.
       await Promise.allSettled(tasks)

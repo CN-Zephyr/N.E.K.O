@@ -198,6 +198,28 @@ describe('PluginAutoStartSwitch', () => {
     app.unmount()
   })
 
+  it.each([true, false])('preserves an initial detail load after saving (refresh=%s)', async (refresh) => {
+    let resolveDetail: (value: unknown) => void = () => {}
+    apiMocks.getPlugin.mockImplementationOnce(() => new Promise((resolve) => { resolveDetail = resolve }))
+    apiMocks.getPlugin.mockRejectedValue(new Error('offline'))
+    apiMocks.getPluginSummaries.mockResolvedValue({ plugins: [
+      { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: false },
+    ] })
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    const { app } = mount(true)
+    const store = usePluginStore()
+    const initial = store.ensurePlugin('demo')
+    const save = store.setAutoStart('demo', false, { refresh })
+    await flushPromises()
+    expect(apiMocks.getPlugin).toHaveBeenCalledTimes(1)
+    resolveDetail({ id: 'demo', name: 'Demo', description: 'Loaded detail', version: '1.0.0', runtime_auto_start: true })
+    const [detail] = await Promise.all([initial, save])
+    expect(detail?.description).toBe('Loaded detail')
+    expect(detail?.runtime_auto_start).toBe(false)
+    expect(store.getPluginById('demo')?.autoStart).toBe(false)
+    app.unmount()
+  })
+
   it('reuses the first in-flight summary during default save revalidation', async () => {
     let resolveSummary: (value: unknown) => void = () => {}
     apiMocks.getPluginSummaries.mockImplementationOnce(() => new Promise((resolve) => { resolveSummary = resolve }))
