@@ -362,13 +362,13 @@ def _persist_user_runtime_intent(
     *,
     previous_plugin_ids: tuple[str, ...] = (),
     runtime_state_changed: bool = False,
-) -> None:
+) -> bool:
     if not enabled and not PLUGIN_SYNC_AUTO_START_ON_TOGGLE:
         # A manual stop is temporary. Persisting enabled=false would make the
         # autostart selection skip the plugin at the next launch even though
         # its auto-start switch still says on; whether it runs at launch is
         # the switch's job alone.
-        return
+        return False
     try:
         auto_start = enabled if PLUGIN_SYNC_AUTO_START_ON_TOGGLE else None
         if previous_plugin_ids:
@@ -435,6 +435,9 @@ def _persist_user_runtime_intent(
             )
 
 
+    return True
+
+
 def _mark_preference_persistence_failure(
     response: dict[str, object],
     error: ServerDomainError,
@@ -457,14 +460,14 @@ async def _persist_changed_runtime_intent(
     previous_plugin_ids: tuple[str, ...] = (),
 ) -> None:
     try:
-        await asyncio.to_thread(
+        persisted = await asyncio.to_thread(
             _persist_user_runtime_intent,
             plugin_id,
             enabled,
             previous_plugin_ids=previous_plugin_ids,
             runtime_state_changed=True,
         )
-        response["preference_persisted"] = True
+        response["preference_persisted"] = persisted
     except ServerDomainError as exc:
         logger.error(
             "plugin runtime state changed but user preference could not be persisted: plugin_id={}, enabled={}, err_type={}",

@@ -4518,8 +4518,9 @@ def test_manual_toggle_auto_start_follows_sync_flag(
     monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", sync_enabled)
     monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: True)
 
-    module._persist_user_runtime_intent("demo_plugin", enabled)
+    persisted = module._persist_user_runtime_intent("demo_plugin", enabled)
 
+    assert persisted is (enabled or sync_enabled)
     assert _isolate_runtime_overrides == {"demo_plugin": expected}
 
 
@@ -4540,10 +4541,11 @@ async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
         # environment cannot flip this test.
         monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", False)
 
-        await module.PluginLifecycleService().stop_plugin(
+        response = await module.PluginLifecycleService().stop_plugin(
             "demo_plugin", persist_user_intent=True
         )
 
+        assert response["preference_persisted"] is False
         # Nothing is persisted, so the next launch still autostarts it.
         assert _isolate_runtime_overrides == {
             "demo_plugin": {"enabled": True, "auto_start": True},
