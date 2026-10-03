@@ -4579,7 +4579,7 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
             return True
 
         monkeypatch.setattr(module, "clear_autostart_pending", _clear_pending)
-        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
 
         async def _must_not_run(*_args, **_kwargs):
             raise AssertionError("auto-start toggle must not start or stop the plugin")
@@ -4605,6 +4605,47 @@ async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
             assert meta["runtime_auto_start"] is auto_start
             assert meta["runtime_enabled"] is auto_start
     finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_start", [True, False])
+async def test_auto_start_toggle_with_unreadable_approval_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+    auto_start: bool,
+) -> None:
+    from plugin.server.infrastructure import autostart_approvals
+    from utils import config_manager
+
+    def _unreadable_config():
+        raise OSError("approval store unavailable")
+
+    monkeypatch.setattr(config_manager, "get_config_manager", _unreadable_config)
+    autostart_approvals._reset_cache_for_testing()
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", _demo_config(tmp_path))
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = False
+        # The boot path intentionally falls back to approved on a failed read.
+        assert autostart_approvals.is_autostart_approved("demo_plugin") is True
+        if auto_start:
+            with pytest.raises(ServerDomainError) as exc_info:
+                await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+            assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+            assert exc_info.value.status_code == 500
+            assert _isolate_runtime_overrides == {}
+        else:
+            result = await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", False)
+            assert result["success"] is True
+            assert _isolate_runtime_overrides == {"demo_plugin": {"auto_start": False}}
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is False
+    finally:
+        autostart_approvals._reset_cache_for_testing()
         _restore_lifecycle_state(*backup)
 
 
@@ -4689,7 +4730,7 @@ async def test_set_plugin_auto_start_rolls_back_preference_when_approval_fails(
         _seed_running_plugin("demo_plugin", config_path)
         with module.state.acquire_plugins_write_lock():
             module.state.plugins["demo_plugin"]["runtime_auto_start"] = False
-        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
         monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
 
         with pytest.raises(ServerDomainError) as exc_info:
@@ -4716,7 +4757,7 @@ async def test_set_plugin_auto_start_keeps_pending_when_rollback_also_fails(
     backup = _backup_lifecycle_state()
     try:
         _seed_running_plugin("demo_plugin", config_path)
-        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
         monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
 
         def _fail_restore(*_args, **_kwargs):
@@ -4745,7 +4786,7 @@ async def test_set_plugin_auto_start_leaves_approval_pending_when_preference_wri
     try:
         _seed_running_plugin("demo_plugin", config_path)
         calls: list[str] = []
-        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id: False)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
         monkeypatch.setattr(
             module, "clear_autostart_pending", lambda pid: calls.append(f"clear:{pid}") or True
         )

@@ -180,10 +180,13 @@ def clear_autostart_pending(plugin_id: str) -> bool:
         return True
 
 
-def is_autostart_approved(plugin_id: str) -> bool:
-    """Whether ``plugin_id`` may start itself at server startup."""
+def is_autostart_approved(plugin_id: str, *, strict: bool = False) -> bool:
+    """Whether the plugin may autostart; strict reads reject unknown approval."""
     with _lock:
-        return str(plugin_id or "").strip() not in _load_locked()
+        pending = _load_locked()
+        if strict and _load_failed:
+            raise OSError(f"Failed to read {PENDING_FILENAME}")
+        return str(plugin_id or "").strip() not in pending
 
 
 def _reset_cache_for_testing() -> None:

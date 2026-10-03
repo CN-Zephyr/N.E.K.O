@@ -6,10 +6,18 @@ from httpx import ASGITransport, AsyncClient
 
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure.exceptions import register_exception_handlers
+from plugin.server.infrastructure.mutation_auth import AUTOSTART_CSRF_TOKEN, MAIN_SERVER_PORT
 from plugin.server.routes import plugins as route_module
 
 
 pytestmark = pytest.mark.plugin_unit
+
+
+def _mutation_headers() -> dict[str, str]:
+    return {
+        "Origin": f"http://127.0.0.1:{MAIN_SERVER_PORT}",
+        "X-CSRF-Token": AUTOSTART_CSRF_TOKEN,
+    }
 
 
 @pytest.fixture
@@ -39,7 +47,11 @@ async def test_plugins_refresh_routes_delegate_to_registry_service(
     monkeypatch.setattr(route_module.registry_service, "refresh_plugin", _refresh_plugin)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:48916",
+        headers=_mutation_headers(),
+    ) as client:
         all_response = await client.post("/plugins/refresh")
         assert all_response.status_code == 200
         assert all_response.json()["added"] == ["demo"]
@@ -105,7 +117,11 @@ async def test_delete_plugin_route_delegates_to_lifecycle_service(
     monkeypatch.setattr(route_module.lifecycle_service, "delete_plugin", _delete_plugin)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:48916",
+        headers=_mutation_headers(),
+    ) as client:
         response = await client.delete("/plugin/demo")
         assert response.status_code == 200
         assert response.json()["plugin_id"] == "demo"
@@ -126,7 +142,11 @@ async def test_delete_plugin_route_preserves_ownership_error_code(
     monkeypatch.setattr(route_module.lifecycle_service, "delete_plugin", _delete_plugin)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:48916",
+        headers=_mutation_headers(),
+    ) as client:
         response = await client.delete("/plugin/demo")
 
     assert response.status_code == 409
@@ -148,7 +168,11 @@ async def test_stop_plugin_route_persists_user_intent(
     monkeypatch.setattr(route_module.lifecycle_service, "stop_plugin", _stop_plugin)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:48916",
+        headers=_mutation_headers(),
+    ) as client:
         response = await client.post("/plugin/demo/stop")
 
     assert response.status_code == 200
@@ -176,7 +200,7 @@ async def test_auto_start_route_writes_preference_without_lifecycle_calls(
     monkeypatch.setattr(route_module.lifecycle_service, "stop_plugin", _must_not_run)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:48916", headers=_mutation_headers()) as client:
         response = await client.put("/plugin/demo/auto-start", json={"auto_start": False})
         invalid = await client.put("/plugin/demo/auto-start", json={})
 
@@ -184,6 +208,27 @@ async def test_auto_start_route_writes_preference_without_lifecycle_calls(
     assert response.json()["auto_start"] is False
     assert calls == [("demo", False)]
     assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://evil.example"},
+    {"Origin": f"http://127.0.0.1:{MAIN_SERVER_PORT}"},
+])
+async def test_auto_start_route_rejects_untrusted_or_tokenless_browser(
+    plugin_route_test_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+) -> None:
+    async def _must_not_run(*_args, **_kwargs):
+        raise AssertionError("unauthorized request must not mutate auto-start")
+
+    monkeypatch.setattr(route_module.lifecycle_service, "set_plugin_auto_start", _must_not_run)
+    transport = ASGITransport(app=plugin_route_test_app)
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:48916") as client:
+        response = await client.put("/plugin/demo/auto-start", json={"auto_start": True}, headers=headers)
+    assert response.status_code == 403
+    assert response.headers["X-Error-Code"] == "csrf_validation_failed"
 
 
 @pytest.mark.asyncio
@@ -198,7 +243,7 @@ async def test_auto_start_route_rejects_development_plugins(
     monkeypatch.setattr(route_module.lifecycle_service, "set_plugin_auto_start", _must_not_run)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:48916", headers=_mutation_headers()) as client:
         response = await client.put("/plugin/demo/auto-start", json={"auto_start": True})
 
     assert response.status_code == 409
@@ -217,7 +262,7 @@ async def test_auto_start_route_preserves_domain_error_shape(
     monkeypatch.setattr(route_module.lifecycle_service, "set_plugin_auto_start", _set_plugin_auto_start)
 
     transport = ASGITransport(app=plugin_route_test_app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:48916", headers=_mutation_headers()) as client:
         response = await client.put("/plugin/demo/auto-start", json={"auto_start": True})
 
     assert response.status_code == 404

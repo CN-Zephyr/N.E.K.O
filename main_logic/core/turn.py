@@ -266,7 +266,10 @@ class TurnMixin:
                     if len(self.tts_pending_chunks) == 1:
                         logger.info("TTS未就绪，开始缓存文本chunk...")
                     # 仅在回复首 chunk 尝试拉起，避免每个 chunk 都重试
-                    if is_first_chunk and self.tts_thread and not self.tts_thread.is_alive():
+                    if is_first_chunk and self.tts_thread and (
+                        not self.tts_thread.is_alive()
+                        or not self._tts_runtime_is_current(self._snapshot_tts_runtime())
+                    ):
                         self._respawn_tts_worker()
 
     def _set_conversation_turn_language(self, language: str | None) -> None:
@@ -378,7 +381,9 @@ class TurnMixin:
 
         A bound reply (``reply_turn``) carries the meta it was started with
         instead: it never takes a ``_pending_turn_meta`` another reply staged,
-        and clears the shared field only while that still holds its own."""
+        and clears the shared field only while that still holds its own. Its
+        ``turn_ended`` is set once the turn end is queued, so the completion
+        that follows a final discard does not end the turn again."""
         turn_end_msg: dict = {'type': 'system', 'data': 'turn end'}
         pending_meta = (
             self._pending_turn_meta if reply_turn is None else reply_turn.meta
@@ -390,6 +395,8 @@ class TurnMixin:
         if active_request_id:
             turn_end_msg['request_id'] = active_request_id
         self.sync_message_queue.put(turn_end_msg)
+        if reply_turn is not None:
+            reply_turn.turn_ended = True
         # Activity tracker flush：AI 刚结束一轮（普通完成 + truncate-recovery 都
         # 走这里）。text 用于 unfinished_thread 检测——tracker 跑问号启发式决定
         # 要不要开 5min 跟进窗口；为 None 时不开窗，但仍更新 seconds_since_ai_msg。
@@ -565,12 +572,21 @@ class TurnMixin:
         and meta rather than whatever the shared fields hold when it finally
         runs, and when a newer turn already owns the host
         (``_reply_turn_is_current``) it leaves every shared effect (TTS done,
-        turn end, AI text flush, wrap-up) to that turn. Unbound completions read
-        the shared fields as they stand: realtime clients, which guard their own
-        turn ends, and the Offline replies Core does not bind (independent-ASR
-        voice turns, whose completion runs inside ``close()`` rather than after
-        it, and proactive replies without ``on_proactive_done``).
+        turn end, AI text flush, wrap-up) to that turn. When a final discard
+        already ended its turn (``_ReplyTurn.turn_ended``) it does nothing: the
+        discard sent that turn end and has already settled the wrap-up.
+
+        Unbound completions read the shared fields as they stand: realtime
+        clients, which guard their own turn ends, and the Offline replies Core
+        does not bind (independent-ASR voice turns, whose completion runs inside
+        ``close()`` rather than after it, and proactive replies without
+        ``on_proactive_done``). An unbound reply keeps no record of a discard's
+        turn end, so after a final discard it still ends the turn a second
+        time. Skipping the completion on the client side instead would lose the
+        only close whenever the discard stood down without ending the turn.
         """
+        if reply_turn is not None and reply_turn.turn_ended:
+            return
         # 先于接管清理：已经不拥有这一轮的迟到回调也不该去清接管方自己的
         # TTS（镜像台词）和簿记。
         if reply_turn is not None and not self._reply_turn_is_current(reply_turn):
@@ -682,6 +698,7 @@ class TurnMixin:
                         self.summary_triggered_time = datetime.now()
                         self.message_cache_for_new_session = []
                         self.initial_cache_snapshot_len = 0
+                        self._primed_context_snapshot = None
                         self.initial_next_session_context_snapshot_len = 0
                         self.sync_message_queue.put({'type': 'system', 'data': 'renew session'})
 
@@ -802,8 +819,19 @@ class TurnMixin:
         # 门控（#2534 合并时留的路标就是指这里）：文本请求由 websocket_router
         # 作为各自独立的后台任务分发，旧请求 A 的迟到 discard 可以落在新请求 B
         # 已经开始 publish 之后，无门控地清会连 B 的前缀一起抹掉。
+        #
+        # cross_server 的 response_discarded_clear 也是同一份共享输出，同步地
+        # 和 buffer 一起清，必须赶在任何 await 之前：下面的 recovery 会先发正文
+        # 和 turn end，再 compare-and-clear 掉 request id，等它跑完再判产权就
+        # 恒为 False，clear 永远发不出去，cross_server 会把丢弃版和恢复正文
+        # 一起写进记忆。
         if may_clear_shared_output():
             self._current_ai_turn_text = ''
+            if self.sync_message_queue:
+                self.sync_message_queue.put({
+                    'type': 'system',
+                    'data': 'response_discarded_clear'
+                })
             await self._clear_tts_pipeline()
 
         # A request-bound discard is only relevant while that request still owns
@@ -948,12 +976,6 @@ class TurnMixin:
                 # Compare-and-clear：见函数顶部 active_request_id 快照说明。
                 if self._active_text_request_id == active_request_id:
                     self._active_text_request_id = None
-
-        if self.sync_message_queue and may_clear_shared_output():
-            self.sync_message_queue.put({
-                'type': 'system',
-                'data': 'response_discarded_clear'
-            })
 
         if not will_retry and not _is_too_long_final and _truncated_text is None:
             # Compare-and-clear：仅当共享字段仍是本轮快照时才清空。
@@ -1793,7 +1815,10 @@ class TurnMixin:
                     if len(self.tts_pending_chunks) == 1:
                         logger.info("TTS未就绪，开始缓存文本chunk...")
                     # 仅在回复首 chunk 尝试拉起，避免每个 chunk 都重试
-                    if is_first_chunk and self.tts_thread and not self.tts_thread.is_alive():
+                    if is_first_chunk and self.tts_thread and (
+                        not self.tts_thread.is_alive()
+                        or not self._tts_runtime_is_current(self._snapshot_tts_runtime())
+                    ):
                         self._respawn_tts_worker()
 
     async def send_lanlan_response(
@@ -1892,17 +1917,44 @@ class TurnMixin:
                 self._remember_recent_ai_voice_echo(text_clean)
         published_at = time.time()
         self.sync_message_queue.put({"type": "json", "data": message})
+        logger.debug(
+            "[voice-chain] stage=model_text_publish turn_id=%s request_id=%s first=%s text_len=%d",
+            effective_turn_id,
+            effective_request_id,
+            is_first_chunk,
+            len(text_clean),
+        )
         if on_published is not None:
             on_published(published_at)
         if cache_for_new_session and hasattr(self, 'is_preparing_new_session') and self.is_preparing_new_session:
             if not hasattr(self, 'message_cache_for_new_session'):
                 self.message_cache_for_new_session = []
             # 注意：缓存使用原始文本，不翻译（用于记忆等内部处理）
-            if len(self.message_cache_for_new_session) == 0 or self.message_cache_for_new_session[-1]['role']==self.master_name:
-                self.message_cache_for_new_session.append(
-                    {"role": self.lanlan_name, "text": text_clean})
-            elif self.message_cache_for_new_session[-1]['role'] == self.lanlan_name:
-                self.message_cache_for_new_session[-1]['text'] += text_clean
+            # Only guarded proactive deliveries pass expected_speech_id. Each
+            # one gets its own entry marked as such, so the screen-history
+            # guard (NotifyMixin._convert_cache_to_str) never reads two
+            # independent deliveries, or a delivery and a reply, as one chain.
+            # A first chunk under the same speech id is a retry of that
+            # delivery (prompt_ephemeral restarts each attempt with
+            # is_first_chunk=True); it replaces the discarded attempt's text.
+            source = "proactive" if expected_speech_id is not None else None
+            cache = self.message_cache_for_new_session
+            last = cache[-1] if cache else None
+            same_kind = (
+                last is not None
+                and last['role'] == self.lanlan_name
+                and last.get('source') == source
+            )
+            if same_kind and not (source and is_first_chunk):
+                last['text'] += text_clean
+            elif same_kind and last.get('speech_id') == expected_speech_id:
+                last['text'] = text_clean
+            elif last is None or last['role'] in (self.master_name, self.lanlan_name):
+                entry = {"role": self.lanlan_name, "text": text_clean}
+                if source:
+                    entry['source'] = source
+                    entry['speech_id'] = expected_speech_id
+                cache.append(entry)
 
         # WS 发送（可能失败，但 sync/cache 已保存）
         # [DIAG] 切换猫娘后对话框空白问题：仅首 chunk 记录，避免流式刷屏
@@ -2318,9 +2370,8 @@ class TurnMixin:
                 cache_for_new_session=False,
             )
 
-        self._remember_game_speech_correlation(turn_id, speech_correlation_id)
-
         if cached_chunks is not None:
+            self._remember_game_speech_correlation(turn_id, speech_correlation_id)
             # One call, one lock hold: sending frame by frame let an overlapping
             # ordinary/project TTS stream interleave between them, and the
             # frontend schedules decoded chunks in arrival order.
@@ -2369,6 +2420,7 @@ class TurnMixin:
             }
 
         await self.ensure_tts_pipeline_alive()
+        self._remember_game_speech_correlation(turn_id, speech_correlation_id)
         audio_queued = False
         capture_started = False
         completion_supported = bool(
