@@ -198,6 +198,35 @@ describe('PluginAutoStartSwitch', () => {
     app.unmount()
   })
 
+  it('reuses the first in-flight summary during default save revalidation', async () => {
+    let resolveSummary: (value: unknown) => void = () => {}
+    apiMocks.getPluginSummaries.mockImplementationOnce(() => new Promise((resolve) => { resolveSummary = resolve }))
+    // A superseding request would fail and discard the successful first load.
+    apiMocks.getPluginSummaries.mockRejectedValue(new Error('offline'))
+    apiMocks.getPlugin.mockRejectedValue(new Error('offline'))
+    apiMocks.setPluginAutoStart.mockResolvedValue({ success: true, plugin_id: 'demo', auto_start: false })
+    const { app } = mount(true)
+    const store = usePluginStore()
+    store.pluginDetails = {
+      demo: { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true },
+    }
+    store.pluginSummaries = []
+    const firstLoad = store.fetchPluginSummaries()
+    const save = store.setAutoStart('demo', false)
+    await vi.waitFor(() => expect(apiMocks.getPlugin).toHaveBeenCalled())
+    expect(apiMocks.getPluginSummaries).toHaveBeenCalledTimes(1)
+    resolveSummary({ plugins: [
+      { id: 'demo', name: 'Demo', description: 'Demo', version: '1.0.0', runtime_auto_start: true },
+      { id: 'other', name: 'Other', description: 'Other', version: '1.0.0', runtime_auto_start: true },
+    ] })
+    await Promise.all([firstLoad, save])
+    expect(store.pluginSummaries.map(plugin => plugin.id)).toEqual(['demo', 'other'])
+    expect(store.pluginSummaries[0]?.runtime_auto_start).toBe(false)
+    expect(store.getPluginById('demo')?.autoStart).toBe(false)
+    expect(apiMocks.getPluginStatus).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it.each([
     { runtime_enabled: false },
     { autostart_pending: true },

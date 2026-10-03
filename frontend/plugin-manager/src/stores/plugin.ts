@@ -463,7 +463,7 @@ export const usePluginStore = defineStore('plugin', () => {
       item.id === pluginId ? withConfirmedAutoStart(item, saved) : item
     ))
     if (options.refresh !== false) {
-      const tasks: Promise<unknown>[] = [fetchPluginSummaries(true)]
+      const tasks: Promise<unknown>[] = [fetchPluginSummaries()]
       if (detail) tasks.push(fetchPluginDetail(pluginId, true))
       // This preference does not change process status or other plugins' details.
       // Keep the confirmed state even if either revalidation fails.
