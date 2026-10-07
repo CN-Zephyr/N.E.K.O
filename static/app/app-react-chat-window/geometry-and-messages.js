@@ -1464,6 +1464,7 @@
                     payload: action.payload || undefined
                 };
             }).filter(Boolean) : undefined,
+            reaction: message.reaction ? Object.assign({}, message.reaction) : undefined,
             status: message.status,
             sortKey: message.sortKey
         };
@@ -1497,6 +1498,7 @@
             avatarUrl: resolveCurrentAssistantAvatarUrl(message.role, baseAvatarUrl),
             blocks: Array.isArray(message.blocks) ? message.blocks : [],
             actions: Array.isArray(message.actions) ? message.actions : undefined,
+            reaction: message.reaction ? Object.assign({}, message.reaction) : undefined,
             status: message.status,
             sortKey: typeof message.sortKey === 'number' ? message.sortKey : fallbackSortKey
         };

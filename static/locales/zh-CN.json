@@ -694,6 +694,7 @@
         "occupied": "摄像头被其它应用占用？关闭扫码/拍照应用后重试"
     },
     "chat": {
+        "messageReaction": "{{author}} 贴了 {{emoji}}",
         "cardActionFailed": "插件操作失败",
         "cardActionRunning": "正在执行…",
         "cardActionDone": "操作完成",

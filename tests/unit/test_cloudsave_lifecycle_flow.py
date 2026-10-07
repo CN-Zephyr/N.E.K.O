@@ -418,6 +418,7 @@ async def test_main_server_shutdown_does_not_reexport_runtime_into_cloudsave_sna
     with patch.object(main_server, "_IS_MAIN_PROCESS", True), \
          patch.object(main_server, "_preload_task", None), \
          patch.object(main_server, "agent_event_bridge", None), \
+         patch.object(main_server, "steamworks", None), \
          patch.object(main_server.character_runtime, "role_state", _role_state_from_session_managers({})), \
          patch.object(main_server, "_run_cloudsave_manager_action", AsyncMock()) as run_cloudsave_action, \
          patch("utils.music_crawlers.close_all_crawlers", AsyncMock(return_value=None)), \

@@ -694,6 +694,7 @@
         "occupied": "Камера занята другим приложением? Закройте приложения QR-кодов/фото и попробуйте снова"
     },
     "chat": {
+        "messageReaction": "{{author}} реагирует {{emoji}}",
         "cardActionFailed": "Ошибка действия плагина",
         "cardActionRunning": "Выполняется…",
         "cardActionDone": "Готово",

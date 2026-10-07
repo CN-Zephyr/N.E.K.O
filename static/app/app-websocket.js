@@ -1821,6 +1821,8 @@
     function finalizeAssistantTurn(assistantTurnId, options) {
         options = options || {};
         var enableMusic = options.enableMusic !== false;
+        var reactionTarget = options.enableReactions !== false ? S.messageReactionTarget : null;
+        S.messageReactionTarget = null;
 
         var bufferedFullText = typeof window._geminiTurnFullText === 'string'
             ? window._geminiTurnFullText
@@ -1857,6 +1859,9 @@
                 });
                 var emotionResult = await Promise.race([emotionPromise, timeoutPromise]);
                 if (emotionResult && emotionResult.emotion) {
+                    if (typeof window.applyMessageReactionFromEmotion === 'function') {
+                        try { window.applyMessageReactionFromEmotion(reactionTarget, emotionResult); } catch (_) { }
+                    }
                     console.log(window.t('console.emotionAnalysisComplete'), emotionResult);
                     if (typeof window.applyEmotion === 'function') window.applyEmotion(emotionResult.emotion);
                     if (assistantTurnId) {
@@ -1925,6 +1930,10 @@
         );
         window._nekoAssistantTurnId = S.assistantTurnId;
         S.assistantTurnStartedAt = Date.now();
+        S.messageReactionTarget = typeof window.captureMessageReactionTarget === 'function'
+            && !(responseMeta && (responseMeta.passthrough
+                || ['proactive', 'agent_callback', 'game_route', 'new_user_icebreaker'].indexOf(responseMeta.source) >= 0))
+            ? window.captureMessageReactionTarget(resolveAssistantRequestId(requestId, responseMeta)) : null;
         clearPendingAssistantTurnStart();
         emitAssistantLifecycleEvent('neko-assistant-turn-start', {
             turnId: S.assistantTurnId,
@@ -5238,7 +5247,7 @@
                     // 与正常 'turn end' 走同一套收尾（emotion + 字幕）。music 关闭——
                     // 主动消息不自动放歌；也不在此调 scheduleProactiveChat（见上方
                     // "skipping proactive chat schedule"），防 proactive 自触发。
-                    finalizeAssistantTurn(agentCallbackTurnId, { enableMusic: false });
+                    finalizeAssistantTurn(agentCallbackTurnId, { enableMusic: false, enableReactions: false });
 
                 // -------- system turn end --------
                 } else if (response.type === 'system' && response.data === 'turn end') {

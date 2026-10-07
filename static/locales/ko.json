@@ -694,6 +694,7 @@
         "occupied": "카메라가 다른 앱에 의해 사용 중입니다. QR코드/사진 앱을 닫고 다시 시도하세요"
     },
     "chat": {
+        "messageReaction": "{{author}}님이 {{emoji}}로 반응했습니다",
         "cardActionFailed": "플러그인 작업 실패",
         "cardActionRunning": "실행 중…",
         "cardActionDone": "완료",

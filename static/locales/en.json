@@ -694,6 +694,7 @@
         "occupied": "Camera is occupied by another app? Close QR code/photo apps and try again"
     },
     "chat": {
+        "messageReaction": "{{author}} reacted with {{emoji}}",
         "cardActionFailed": "Plugin action failed",
         "cardActionRunning": "Working…",
         "cardActionDone": "Done",

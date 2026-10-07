@@ -128,3 +128,13 @@ EMOTION_ANALYSIS_MAX_TOKENS = 40
 """情感分析 LLM 的 max_completion_tokens。
 - 用途：返回情感标签 + score 等短输出。
 - 上游：LLM 输出（注意：Gemini 可能返回 markdown 包裹，留 40 token 余量）。"""
+
+
+# Reuse the existing outward emotion decision; no additional inference.
+MESSAGE_REACTION_CONFIDENCE_THRESHOLD = 0.72
+MESSAGE_REACTION_EMOJIS_BY_EMOTION = {
+    "happy": ("😊", "😄", "🥰", "✨", "🎉"),
+    "sad": ("😢", "🥺", "🤗", "💧"),
+    "surprised": ("😮", "😲", "👀", "❗"),
+    "angry": ("😤", "😠", "💢", "😾"),
+}

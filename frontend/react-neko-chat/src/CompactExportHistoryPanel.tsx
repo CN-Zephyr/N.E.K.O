@@ -13,6 +13,7 @@ import {
 } from 'react';
 import { i18n } from './i18n';
 import MessageBlockView from './MessageBlockView';
+import MessageReactions from './MessageReactions';
 import ThinkingDots from './ThinkingDots';
 import { isTopicHintMessage } from './TopicHintBubble';
 import { type ChatMessage, type MessageAction } from './message-schema';
@@ -299,6 +300,7 @@ export default function CompactExportHistoryPanel({
     message.time,
     message.status || '',
     JSON.stringify(message.blocks),
+    JSON.stringify(message.reaction),
   ].join('')).join('');
   const exportBusy = pendingAction !== null;
   const exportActionsDisabled = !previewHasSelection || exportBusy;
@@ -774,6 +776,7 @@ export default function CompactExportHistoryPanel({
                   ))}
                 </div>
               </div>
+              <MessageReactions message={message} />
             </article>
           );
         })}
@@ -1097,6 +1100,7 @@ export default function CompactExportHistoryPanel({
                           ))}
                         </div>
                       </div>
+                      <MessageReactions message={message} />
                     </article>
                   );
                 })}

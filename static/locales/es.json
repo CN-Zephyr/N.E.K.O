@@ -694,6 +694,7 @@
         "occupied": "¿La cámara está ocupada por otra aplicación? Cierra las aplicaciones de códigos QR/fotos e inténtalo de nuevo."
     },
     "chat": {
+        "messageReaction": "{{author}} reaccionó con {{emoji}}",
         "cardActionFailed": "Error en la acción del plugin",
         "cardActionRunning": "Ejecutando…",
         "cardActionDone": "Completado",

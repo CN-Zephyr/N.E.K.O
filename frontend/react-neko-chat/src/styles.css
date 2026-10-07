@@ -1085,6 +1085,47 @@ body.neko-electron-runtime .app-shell:not(.chat-surface-mode-compact)[data-focus
   gap: 4px;
 }
 
+.message-reactions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid rgba(94, 142, 192, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.86);
+  font-size: 0.92rem;
+  line-height: 1.3;
+  pointer-events: none;
+  user-select: none;
+}
+
+.compact-export-history-message:has(> .message-reactions),
+.compact-export-preview-message:has(> .message-reactions) {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.compact-export-history-message > .message-reactions {
+  transform: translateX(var(--compact-history-stagger-x, 0px)) rotate(var(--compact-history-rotate, 0deg));
+}
+
+.compact-export-history-anchor[data-compact-export-history-visibility="open"] .compact-export-history-message > .message-reactions {
+  animation: compact-history-message-enter 0.26s cubic-bezier(0.2, 0.78, 0.34, 1) both;
+  animation-delay: var(--compact-history-enter-delay, 0ms);
+}
+
+.compact-export-history-anchor[data-compact-export-history-visibility="closing"] .compact-export-history-message > .message-reactions {
+  animation: compact-history-message-exit 0.2s ease-in both;
+  animation-delay: var(--compact-history-exit-delay, 0ms);
+}
+
+[data-theme="dark"] .message-reactions {
+  border-color: rgba(125, 185, 231, 0.32);
+  background: rgba(36, 49, 67, 0.9);
+}
+
 .message-meta {
   display: flex;
   align-items: center;
@@ -10066,6 +10107,7 @@ body.avatar-tool-editor-page .avatar-tool-workspace-settings {
   .message-row-assistant,
   .compact-export-history-message,
   .compact-export-history-bubble,
+  .message-reactions,
   .compact-music-player-mount,
   .compact-history-visibility-handle::before,
   .compact-history-visibility-handle::after,
