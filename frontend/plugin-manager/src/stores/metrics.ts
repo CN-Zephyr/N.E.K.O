@@ -13,7 +13,7 @@ export const useMetricsStore = defineStore('metrics', () => {
   // 按插件 id 索引的表一律无原型：id 可以叫 __proto__、constructor 之类，
   // 普通对象会把写入交给继承来的 setter，或读到继承来的属性。
   const currentMetrics = ref<Record<string, PluginMetrics>>(Object.create(null))
-  const metricsHistory = ref<Record<string, PluginMetrics[]>>({})
+  const metricsHistory = ref<Record<string, PluginMetrics[]>>(Object.create(null))
   const loading = ref(false)
   const error = ref<string | null>(null)
   
