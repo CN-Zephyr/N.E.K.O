@@ -68,6 +68,7 @@ def test_current_metrics_serializes_after_releasing_collector_lock(
     collector = MetricsCollector()
     record = PluginMetrics(plugin_id="demo", timestamp="2026-01-01T00:00:00+00:00")
     collector._metrics_history["demo"] = [record]
+    collector._live_plugin_ids = {"demo"}
     lock_states: list[bool] = []
 
     def _serialize(value: PluginMetrics) -> dict[str, object]:
@@ -88,6 +89,7 @@ def test_older_full_snapshot_does_not_overwrite_a_newer_metrics_cache(
     older = PluginMetrics(plugin_id="demo", timestamp="2026-01-01T00:00:00+00:00")
     newer = PluginMetrics(plugin_id="demo", timestamp="2026-01-01T00:00:01+00:00")
     collector._metrics_history["demo"] = [older]
+    collector._live_plugin_ids = {"demo"}
     collector._history_version = 1
     entered = threading.Event()
     release = threading.Event()
@@ -123,6 +125,7 @@ def test_metrics_history_filters_and_serializes_after_releasing_collector_lock(
     collector = MetricsCollector()
     record = PluginMetrics(plugin_id="demo", timestamp="2026-01-01T00:00:00+00:00")
     collector._metrics_history["demo"] = [record]
+    collector._live_plugin_ids = {"demo"}
     lock_states: list[bool] = []
 
     def _serialize(value: PluginMetrics) -> dict[str, object]:
@@ -137,3 +140,116 @@ def test_metrics_history_filters_and_serializes_after_releasing_collector_lock(
 
     assert result == [{"timestamp": "2026-01-01T00:00:00+00:00"}]
     assert lock_states == [False]
+
+
+class _FakeProcess:
+    def __init__(self, pid: int, *, alive: bool = True) -> None:
+        self.pid = pid
+        self.alive = alive
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+class _FakeHost:
+    def __init__(self, pid: int) -> None:
+        self.process = _FakeProcess(pid)
+
+
+def _run_collector_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+    collector: MetricsCollector,
+    hosts_per_tick: list[dict[str, object]],
+) -> None:
+    """Drive ``_collect_loop`` for exactly ``len(hosts_per_tick)`` ticks."""
+    import asyncio
+
+    from plugin.server.monitoring import metrics as metrics_module
+
+    monkeypatch.setattr(metrics_module, "PSUTIL_AVAILABLE", True)
+
+    def _fake_collect(plugin_id: str, host: object, _ps_processes: object = None) -> PluginMetrics | None:
+        process = getattr(host, "process", None)
+        if process is None or not process.is_alive():
+            return None
+        return PluginMetrics(
+            plugin_id=plugin_id,
+            timestamp="2026-01-01T00:00:00+00:00",
+            pid=process.pid,
+            memory_mb=100.0,
+            num_threads=10,
+        )
+
+    monkeypatch.setattr(collector, "_collect_plugin_metrics_sync", _fake_collect)
+    ticks = iter(hosts_per_tick)
+    collector._plugin_hosts_getter = lambda: next(ticks)
+    remaining = [len(hosts_per_tick)]
+
+    async def _sleep(_seconds: float) -> None:
+        remaining[0] -= 1
+        if remaining[0] <= 0:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(metrics_module.asyncio, "sleep", _sleep)
+    try:
+        asyncio.run(collector._collect_loop({}))
+    except asyncio.CancelledError:
+        # The end-of-tick sleep sits outside the loop's try, so the stop signal
+        # escapes; the empty-host path swallows it and returns normally.
+        pass
+    assert remaining[0] == 0
+
+
+def test_current_metrics_drop_plugins_after_they_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": _FakeHost(2)}, {"a": _FakeHost(1)}],
+    )
+
+    current = collector.get_current_metrics()
+    assert [row["plugin_id"] for row in current] == ["a"]
+    assert collector.get_current_metrics("b") == []
+    # History is kept for the stopped plugin.
+    assert len(collector.get_metrics_history("b")) == 1
+
+
+def test_current_metrics_are_empty_once_every_plugin_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": _FakeHost(2)}, {}],
+    )
+
+    # Regression guard: an empty host map used to skip the tick entirely, so the
+    # dashboard kept summing every stopped plugin's last sample.
+    assert collector.get_current_metrics() == []
+    assert collector.get_current_metrics("a") == []
+
+
+def test_current_metrics_skip_a_hosted_but_dead_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    crashed = _FakeHost(2)
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": crashed}, {"a": _FakeHost(1), "b": crashed}],
+    )
+    assert {row["plugin_id"] for row in collector.get_current_metrics()} == {"a", "b"}
+
+    crashed.process.alive = False
+    _run_collector_ticks(monkeypatch, collector, [{"a": _FakeHost(1), "b": crashed}])
+
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+
+
+def test_liveness_change_invalidates_a_fresh_full_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(monkeypatch, collector, [{"a": _FakeHost(1)}])
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+
+    # Within the 500ms cache TTL: the stop must still be visible immediately.
+    _run_collector_ticks(monkeypatch, collector, [{}])
+    assert collector.get_current_metrics() == []

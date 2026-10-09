@@ -91,6 +91,10 @@ class MetricsCollector:
         # 按 plugin_id 复用 psutil.Process（值为 (pid, Process)），
         # 以便 cpu_percent(interval=None) 基于上次采样计算差值而不阻塞。
         self._ps_processes: dict[str, tuple[int, object]] = {}
+        # Plugins that produced a sample in the latest collection tick. History
+        # is kept for stopped plugins, but "current" metrics must only report
+        # processes that are still alive.
+        self._live_plugin_ids: set[str] = set()
     
     async def start(self, plugin_hosts_getter: Callable[[], dict[str, object]]) -> None:
         """启动指标收集任务"""
@@ -130,11 +134,13 @@ class MetricsCollector:
                 if not plugin_hosts:
                     if PLUGIN_LOG_SERVER_DEBUG:
                         logger.debug("No plugin hosts available for metrics collection")
+                    self._publish_live_plugin_ids(set())
                     await asyncio.sleep(self.interval)
                     continue
                 
                 if PLUGIN_LOG_SERVER_DEBUG:
                     logger.debug(f"Collecting metrics for {len(plugin_hosts)} plugins: {list(plugin_hosts.keys())}")
+                live_plugin_ids: set[str] = set()
                 for plugin_id, host in plugin_hosts.items():
                     try:
                         metrics = await asyncio.to_thread(
@@ -154,6 +160,7 @@ class MetricsCollector:
                                     self._metrics_history[plugin_id].pop(0)
                                 if PLUGIN_LOG_SERVER_DEBUG:
                                     logger.debug(f"Successfully collected and stored metrics for plugin {plugin_id}")
+                            live_plugin_ids.add(plugin_id)
                         else:
                             # 记录为什么没有收集到指标
                             process = getattr(host, "process", None)
@@ -168,6 +175,7 @@ class MetricsCollector:
                                     logger.debug(f"Failed to collect metrics for plugin {plugin_id} (process alive but collection returned None)")
                     except _RUNTIME_ERRORS as e:
                         logger.warning(f"Exception while collecting metrics for plugin {plugin_id}: {e}", exc_info=True)
+                self._publish_live_plugin_ids(live_plugin_ids)
                 
             except asyncio.CancelledError:
                 break
@@ -176,6 +184,21 @@ class MetricsCollector:
             
             await asyncio.sleep(self.interval)
     
+    def _publish_live_plugin_ids(self, live_plugin_ids: set[str]) -> None:
+        """Record which plugins were alive in the latest tick.
+
+        Stopped or crashed plugins keep their history, but their last sample must
+        not keep counting towards current / global totals.
+        """
+        with self._lock:
+            if live_plugin_ids == self._live_plugin_ids:
+                return
+            self._live_plugin_ids = set(live_plugin_ids)
+            # Newer than any cached snapshot, so a stale publish cannot win.
+            self._history_version += 1
+            self._cache = []
+            self._cache_timestamp = 0.0
+
     def _prune_ps_processes(
         self,
         plugin_hosts: dict[str, object],
@@ -293,7 +316,7 @@ class MetricsCollector:
             # and dict allocation cannot delay a collector tick.
             with self._lock:
                 history = self._metrics_history.get(plugin_id, [])
-                latest = history[-1] if history else None
+                latest = history[-1] if history and plugin_id in self._live_plugin_ids else None
                 available_ids = list(self._metrics_history.keys())
             if latest is not None:
                 return [self._metrics_to_dict(latest)]
@@ -312,8 +335,8 @@ class MetricsCollector:
                 version = self._history_version
                 latest_records = [
                     history[-1]
-                    for history in self._metrics_history.values()
-                    if history
+                    for history_plugin_id, history in self._metrics_history.items()
+                    if history and history_plugin_id in self._live_plugin_ids
                 ]
             # Existing records are not mutated after append, so conversion can
             # safely happen after releasing the collector lock. Publish only if
