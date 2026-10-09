@@ -5,6 +5,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { getAllMetrics, getPluginMetrics, getPluginMetricsHistory } from '@/api/metrics'
 import type { PluginMetrics } from '@/types/api'
+import { createStaleResponseGuard } from '@/utils/staleResponseGuard'
 
 export const useMetricsStore = defineStore('metrics', () => {
   // 状态
@@ -16,23 +17,19 @@ export const useMetricsStore = defineStore('metrics', () => {
   
   // 防止请求堆积：正在进行的请求
   let pendingFetchAll: Promise<any> | null = null
-  // 每次发起全量请求加一。超时后旧请求可能还没结束，只有最新的请求能写指标、
-  // 清理 pendingFetchAll，晚到的旧响应直接丢掉。
+  // 每次发起全量请求加一。超时后旧请求可能还没结束，只有最新的请求能清理
+  // pendingFetchAll 和 loading；指标能不能写入由下面的 resultGuard 判断。
   let fetchAllGeneration = 0
-  // 全量请求和单插件请求共用的发起序号。单插件请求在全量请求之后发起，
-  // 它看到的服务端状态更新，全量结果整体替换时要保留它写入（或删掉）的那一项。
-  let requestSeq = 0
-  const pluginResultSeq: Record<string, number> = {}
-  // 最近一次写入的全量结果的序号。比它早发起的单插件请求看到的状态更旧，不能再覆盖。
-  let fullAppliedSeq = 0
+  // 全量请求和单插件请求在发起时各取一张票。按插件 id 记录已写入的最新票号，
+  // 晚到的旧响应不能覆盖（或删掉）同一插件更新的结果。
+  const resultGuard = createStaleResponseGuard<string>()
+  const ALL_KEY = ':all'  // 插件 id 不含冒号，不会撞名
+  // 最近一次写入的全量结果的票号。全量结果只给它涉及的插件记票号，所以单插件
+  // 结果还要另外和它比：比它早发起的单插件请求看到的状态更旧。
+  let fullAppliedTicket = 0
 
-  // 单插件结果只有比该插件已写入的结果（单插件或全量）都新时才能写入或删除。
-  function acceptPluginResult(pluginId: string, seq: number): boolean {
-    if (seq <= fullAppliedSeq || seq <= (pluginResultSeq[pluginId] ?? 0)) {
-      return false
-    }
-    pluginResultSeq[pluginId] = seq
-    return true
+  function acceptPluginResult(pluginId: string, ticket: number): boolean {
+    return ticket > fullAppliedTicket && resultGuard.accept(pluginId, ticket)
   }
   // 请求超时自动清理（防止请求堆积）
   const REQUEST_TIMEOUT = 15000 // 15秒
@@ -63,7 +60,7 @@ export const useMetricsStore = defineStore('metrics', () => {
     loading.value = true
     error.value = null
     const generation = ++fetchAllGeneration
-    const fullSeq = ++requestSeq
+    const ticket = resultGuard.begin()
     
     // 设置超时自动清理，防止请求堆积
     const timeoutId = setTimeout(() => {
@@ -78,7 +75,7 @@ export const useMetricsStore = defineStore('metrics', () => {
     pendingFetchAll = (async () => {
       try {
         const response = await getAllMetrics()
-        if (generation !== fetchAllGeneration) {
+        if (!resultGuard.accept(ALL_KEY, ticket)) {
           return undefined
         }
         const metricsList: PluginMetrics[] = Array.isArray((response as any)?.metrics)
@@ -88,21 +85,22 @@ export const useMetricsStore = defineStore('metrics', () => {
 
         // 用这一次的结果替换当前指标。只增不删的话，服务端已经剔除的插件
         // 会一直留着上一次的数字。
-        const next: Record<string, PluginMetrics> = {}
+        // 单插件请求晚于这次全量请求发起、已经写入（或删掉）的插件保持不动。
+        const byId: Record<string, PluginMetrics> = {}
         metricsList.forEach((metric: PluginMetrics) => {
-          next[metric.plugin_id] = metric
+          byId[metric.plugin_id] = metric
         })
-        for (const [id, seq] of Object.entries(pluginResultSeq)) {
-          if (seq <= fullSeq) continue
-          const local = currentMetrics.value[id]
-          if (local) {
-            next[id] = local
+        const next: Record<string, PluginMetrics> = { ...currentMetrics.value }
+        for (const id of new Set([...Object.keys(next), ...Object.keys(byId)])) {
+          if (!resultGuard.accept(id, ticket)) continue
+          if (byId[id]) {
+            next[id] = byId[id]
           } else {
             delete next[id]
           }
         }
         currentMetrics.value = next
-        fullAppliedSeq = fullSeq
+        fullAppliedTicket = ticket
         
         // 返回响应以便提取全局指标
         return response
@@ -135,7 +133,7 @@ export const useMetricsStore = defineStore('metrics', () => {
     }
     
     console.log(`[Metrics] Fetching metrics for plugin: ${pluginId}`)
-    const seq = ++requestSeq
+    const ticket = resultGuard.begin()
     
     try {
       const response = await getPluginMetrics(pluginId)
@@ -150,7 +148,7 @@ export const useMetricsStore = defineStore('metrics', () => {
       if (response.metrics && typeof response.metrics === 'object') {
         // 确保 metrics 包含必需的字段
         if (response.metrics.plugin_id && response.metrics.timestamp) {
-          if (!acceptPluginResult(pluginId, seq)) return
+          if (!acceptPluginResult(pluginId, ticket)) return
           currentMetrics.value[pluginId] = response.metrics
           console.log(`[Metrics] Successfully stored metrics for ${pluginId}`)
         } else {
@@ -159,7 +157,7 @@ export const useMetricsStore = defineStore('metrics', () => {
       } else {
         // 插件正在运行但没有指标数据（可能正在收集）
         // 清除之前的指标数据，让组件显示"暂无数据"
-        if (!acceptPluginResult(pluginId, seq)) return
+        if (!acceptPluginResult(pluginId, ticket)) return
         if (currentMetrics.value[pluginId]) {
           delete currentMetrics.value[pluginId]
         }
@@ -175,7 +173,7 @@ export const useMetricsStore = defineStore('metrics', () => {
       if (err.response?.status === 404) {
         console.log(`[Metrics] Plugin ${pluginId} not found (404)`)
         // 清除该插件的指标数据（如果存在）
-        if (!acceptPluginResult(pluginId, seq)) return
+        if (!acceptPluginResult(pluginId, ticket)) return
         if (currentMetrics.value[pluginId]) {
           delete currentMetrics.value[pluginId]
         }
