@@ -94,9 +94,10 @@ class MetricsCollector:
         # 按 plugin_id 复用 psutil.Process（值为 (pid, Process)），
         # 以便 cpu_percent(interval=None) 基于上次采样计算差值而不阻塞。
         self._ps_processes: dict[str, tuple[int, object]] = {}
-        # Plugins that produced a sample in the latest collection tick. History
-        # is kept for stopped plugins, but "current" metrics must only report
-        # processes that are still alive.
+        # Plugins that produced a sample in the latest collection tick, or whose
+        # process is still the one behind their last sample and only missed this
+        # tick's read. History is kept for stopped plugins, but "current" metrics
+        # must only report processes that are still alive.
         self._live_plugin_ids: set[str] = set()
     
     async def start(self, plugin_hosts_getter: Callable[[], dict[str, object]]) -> None:
