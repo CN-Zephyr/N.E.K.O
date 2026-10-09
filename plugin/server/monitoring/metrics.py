@@ -87,6 +87,9 @@ class MetricsCollector:
         # snapshot that was taken later.
         self._history_version = 0
         self._cache_version = -1
+        # Live-set changes bump this, and only this. A full query retries when
+        # it moves, so an ordinary append does not discard an in-flight snapshot.
+        self._liveness_version = 0
 
         # 按 plugin_id 复用 psutil.Process（值为 (pid, Process)），
         # 以便 cpu_percent(interval=None) 基于上次采样计算差值而不阻塞。
@@ -173,6 +176,10 @@ class MetricsCollector:
                             else:
                                 if PLUGIN_LOG_SERVER_DEBUG:
                                     logger.debug(f"Failed to collect metrics for plugin {plugin_id} (process alive but collection returned None)")
+                                # The process is still there. Keep its previous sample in
+                                # the current totals instead of treating one failed read
+                                # as a stop.
+                                live_plugin_ids.add(plugin_id)
                     except _RUNTIME_ERRORS as e:
                         logger.warning(f"Exception while collecting metrics for plugin {plugin_id}: {e}", exc_info=True)
                 self._publish_live_plugin_ids(live_plugin_ids)
@@ -195,7 +202,8 @@ class MetricsCollector:
                 return
             self._live_plugin_ids = set(live_plugin_ids)
             # Newer than any cached snapshot, so a stale publish cannot win.
-            self._history_version += 1
+            # Appends keep their own counter; only a live-set change retries a query.
+            self._liveness_version += 1
             self._cache = []
             self._cache_timestamp = 0.0
 
@@ -327,29 +335,31 @@ class MetricsCollector:
                 )
             return []
         else:
-            # 全量查询，使用缓存减少锁竞争
-            if self._cache and (now - self._cache_timestamp) < self._cache_ttl:
-                return self._cache
+            # 全量查询，使用缓存减少锁竞争。先拿走这份列表再判断，避免两次
+            # 读取之间缓存被清空、这次请求返回空列表。
+            cached = self._cache
+            if cached and (now - self._cache_timestamp) < self._cache_ttl:
+                return cached
 
-            def _live_snapshot() -> tuple[int, list[PluginMetrics]]:
+            def _live_snapshot() -> tuple[int, int, list[PluginMetrics]]:
                 with self._lock:
-                    return self._history_version, [
+                    return self._history_version, self._liveness_version, [
                         history[-1]
                         for history_plugin_id, history in self._metrics_history.items()
                         if history and history_plugin_id in self._live_plugin_ids
                     ]
 
             # Existing records are not mutated after append, so conversion can
-            # happen outside the lock. A liveness publish may bump
-            # _history_version and clear _cache while that conversion is still
-            # running; publishing the old snapshot would put stopped plugins
-            # back into the TTL cache. Retry until the captured version is
-            # still current, and keep the newer-cache guard.
+            # happen outside the lock. A liveness publish may clear _cache
+            # while that conversion is still running; publishing the old
+            # snapshot would put stopped plugins back into the TTL cache.
+            # Retry only when the live set moved. An append keeps the
+            # newer-cache guard so a later snapshot is not overwritten.
             for _ in range(3):
-                version, latest_records = _live_snapshot()
+                version, liveness_version, latest_records = _live_snapshot()
                 result = [self._metrics_to_dict(record) for record in latest_records]
                 with self._lock:
-                    if version != self._history_version:
+                    if liveness_version != self._liveness_version:
                         continue
                     if version < self._cache_version and self._cache:
                         return self._cache
@@ -359,7 +369,7 @@ class MetricsCollector:
                 logger.debug(f"get_current_metrics (all): found {len(result)} plugins with metrics")
                 return result
 
-            _, latest_records = _live_snapshot()
+            _, _, latest_records = _live_snapshot()
             return [self._metrics_to_dict(record) for record in latest_records]
     
     def get_metrics_history(

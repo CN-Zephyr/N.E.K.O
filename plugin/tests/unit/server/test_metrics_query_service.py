@@ -160,6 +160,7 @@ def _run_collector_ticks(
     monkeypatch: pytest.MonkeyPatch,
     collector: MetricsCollector,
     hosts_per_tick: list[dict[str, object]],
+    collect=None,
 ) -> None:
     """Drive ``_collect_loop`` for exactly ``len(hosts_per_tick)`` ticks."""
     import asyncio
@@ -180,7 +181,7 @@ def _run_collector_ticks(
             num_threads=10,
         )
 
-    monkeypatch.setattr(collector, "_collect_plugin_metrics_sync", _fake_collect)
+    monkeypatch.setattr(collector, "_collect_plugin_metrics_sync", collect or _fake_collect)
     ticks = iter(hosts_per_tick)
     collector._plugin_hosts_getter = lambda: next(ticks)
     remaining = [len(hosts_per_tick)]
@@ -190,7 +191,18 @@ def _run_collector_ticks(
         if remaining[0] <= 0:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(metrics_module.asyncio, "sleep", _sleep)
+    class _ScopedAsyncio:
+        """Override ``sleep`` only. Other threads keep the real asyncio module."""
+
+        def __init__(self, sleep):
+            self._sleep = sleep
+
+        def __getattr__(self, name: str):
+            if name == "sleep":
+                return self._sleep
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(metrics_module, "asyncio", _ScopedAsyncio(_sleep))
     try:
         asyncio.run(collector._collect_loop({}))
     except asyncio.CancelledError:
@@ -275,3 +287,33 @@ def test_stale_full_query_does_not_republish_stopped_plugins(monkeypatch: pytest
     assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
     # The in-flight snapshot must not refill the TTL cache.
     assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+
+
+def test_failed_sample_keeps_last_metrics_for_a_live_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": _FakeHost(2)}],
+    )
+
+    def _fail_b(plugin_id: str, host: object, _ps_processes: object = None) -> PluginMetrics | None:
+        if plugin_id == "b":
+            return None
+        process = getattr(host, "process", None)
+        return PluginMetrics(
+            plugin_id=plugin_id,
+            timestamp="2026-01-01T00:00:01+00:00",
+            pid=process.pid,
+            memory_mb=110.0,
+            num_threads=10,
+        )
+
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": _FakeHost(2)}],
+        collect=_fail_b,
+    )
+
+    assert {row["plugin_id"] for row in collector.get_current_metrics()} == {"a", "b"}

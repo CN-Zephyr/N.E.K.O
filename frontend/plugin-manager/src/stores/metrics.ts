@@ -62,11 +62,14 @@ export const useMetricsStore = defineStore('metrics', () => {
           ? ((response as any).metrics as PluginMetrics[])
           : []
         allMetrics.value = metricsList
-        
-        // 更新当前指标
+
+        // 用这一次的结果替换当前指标。只增不删的话，服务端已经剔除的插件
+        // 会一直留着上一次的数字。
+        const next: Record<string, PluginMetrics> = {}
         metricsList.forEach((metric: PluginMetrics) => {
-          currentMetrics.value[metric.plugin_id] = metric
+          next[metric.plugin_id] = metric
         })
+        currentMetrics.value = next
         
         // 返回响应以便提取全局指标
         return response
