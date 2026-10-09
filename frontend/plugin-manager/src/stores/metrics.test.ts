@@ -153,4 +153,25 @@ describe('metrics store fetchAllMetrics', () => {
 
     expect(Object.keys(store.currentMetrics)).toEqual(['other'])
   })
+
+  it('keeps a newer per-plugin sample for a plugin named __proto__', async () => {
+    const full = deferred<any>()
+    vi.mocked(getAllMetrics).mockReturnValueOnce(full.promise)
+    vi.mocked(getPluginMetrics).mockResolvedValueOnce({ metrics: metric('__proto__') } as any)
+    const store = useMetricsStore()
+
+    const pending = store.fetchAllMetrics()
+    await store.fetchPluginMetrics('__proto__')
+    full.resolve({ metrics: [metric('other')] })
+    await pending
+
+    expect(Object.keys(store.currentMetrics).sort()).toEqual(['__proto__', 'other'])
+    expect(store.getCurrentMetrics('__proto__')?.plugin_id).toBe('__proto__')
+  })
+
+  it('returns null for a missing plugin named like an Object.prototype property', () => {
+    const store = useMetricsStore()
+    expect(store.getCurrentMetrics('constructor')).toBeNull()
+    expect(store.getCurrentMetrics('toString')).toBeNull()
+  })
 })

@@ -10,7 +10,9 @@ import { createStaleResponseGuard } from '@/utils/staleResponseGuard'
 export const useMetricsStore = defineStore('metrics', () => {
   // 状态
   const allMetrics = ref<PluginMetrics[]>([])
-  const currentMetrics = ref<Record<string, PluginMetrics>>({})
+  // 按插件 id 索引的表一律无原型：id 可以叫 __proto__、constructor 之类，
+  // 普通对象会把写入交给继承来的 setter，或读到继承来的属性。
+  const currentMetrics = ref<Record<string, PluginMetrics>>(Object.create(null))
   const metricsHistory = ref<Record<string, PluginMetrics[]>>({})
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -86,12 +88,11 @@ export const useMetricsStore = defineStore('metrics', () => {
         // 用这一次的结果替换当前指标。只增不删的话，服务端已经剔除的插件
         // 会一直留着上一次的数字。
         // 单插件请求晚于这次全量请求发起、已经写入（或删掉）的插件保持不动。
-        // 无原型：插件 id 可以叫 constructor 之类，不能读到继承来的属性。
         const byId = Object.create(null) as Record<string, PluginMetrics>
         metricsList.forEach((metric: PluginMetrics) => {
           byId[metric.plugin_id] = metric
         })
-        const next: Record<string, PluginMetrics> = { ...currentMetrics.value }
+        const next: Record<string, PluginMetrics> = Object.assign(Object.create(null), currentMetrics.value)
         for (const id of new Set([...Object.keys(next), ...Object.keys(byId)])) {
           if (!resultGuard.accept(id, ticket)) continue
           if (Object.prototype.hasOwnProperty.call(byId, id)) {
