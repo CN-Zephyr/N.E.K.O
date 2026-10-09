@@ -111,4 +111,33 @@ describe('metrics store fetchAllMetrics', () => {
 
     expect(Object.keys(store.currentMetrics)).toEqual(['other'])
   })
+
+  it('ignores an older per-plugin response that settles after a newer one', async () => {
+    const older = deferred<any>()
+    vi.mocked(getPluginMetrics)
+      .mockReturnValueOnce(older.promise)
+      .mockRejectedValueOnce({ response: { status: 404 } })
+    const store = useMetricsStore()
+
+    const first = store.fetchPluginMetrics('stopped')
+    await store.fetchPluginMetrics('stopped')
+    older.resolve({ metrics: metric('stopped') })
+    await first
+
+    expect(store.currentMetrics).toEqual({})
+  })
+
+  it('ignores a per-plugin response issued before a full refresh that already applied', async () => {
+    const older = deferred<any>()
+    vi.mocked(getPluginMetrics).mockReturnValueOnce(older.promise)
+    vi.mocked(getAllMetrics).mockResolvedValueOnce({ metrics: [metric('other')] } as any)
+    const store = useMetricsStore()
+
+    const pending = store.fetchPluginMetrics('stopped')
+    await store.fetchAllMetrics()
+    older.resolve({ metrics: metric('stopped') })
+    await pending
+
+    expect(Object.keys(store.currentMetrics)).toEqual(['other'])
+  })
 })
