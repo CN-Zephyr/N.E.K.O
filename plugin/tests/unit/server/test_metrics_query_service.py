@@ -253,3 +253,25 @@ def test_liveness_change_invalidates_a_fresh_full_cache(monkeypatch: pytest.Monk
     # Within the 500ms cache TTL: the stop must still be visible immediately.
     _run_collector_ticks(monkeypatch, collector, [{}])
     assert collector.get_current_metrics() == []
+
+
+def test_stale_full_query_does_not_republish_stopped_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(
+        monkeypatch,
+        collector,
+        [{"a": _FakeHost(1), "b": _FakeHost(2)}],
+    )
+    collector._cache_timestamp = 0.0
+    original = collector._metrics_to_dict
+
+    def _publish_stop_while_serializing(metrics: PluginMetrics) -> dict[str, object]:
+        if metrics.plugin_id == "b":
+            collector._publish_live_plugin_ids({"a"})
+        return original(metrics)
+
+    monkeypatch.setattr(collector, "_metrics_to_dict", _publish_stop_while_serializing)
+
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+    # The in-flight snapshot must not refill the TTL cache.
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]

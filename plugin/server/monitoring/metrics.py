@@ -330,26 +330,37 @@ class MetricsCollector:
             # 全量查询，使用缓存减少锁竞争
             if self._cache and (now - self._cache_timestamp) < self._cache_ttl:
                 return self._cache
-            
-            with self._lock:
-                version = self._history_version
-                latest_records = [
-                    history[-1]
-                    for history_plugin_id, history in self._metrics_history.items()
-                    if history and history_plugin_id in self._live_plugin_ids
-                ]
+
+            def _live_snapshot() -> tuple[int, list[PluginMetrics]]:
+                with self._lock:
+                    return self._history_version, [
+                        history[-1]
+                        for history_plugin_id, history in self._metrics_history.items()
+                        if history and history_plugin_id in self._live_plugin_ids
+                    ]
+
             # Existing records are not mutated after append, so conversion can
-            # safely happen after releasing the collector lock. Publish only if
-            # no newer snapshot has already filled the cache.
-            result = [self._metrics_to_dict(record) for record in latest_records]
-            with self._lock:
-                if version < self._cache_version and self._cache:
-                    return self._cache
-                self._cache = result
-                self._cache_timestamp = time.time()
-                self._cache_version = version
-            logger.debug(f"get_current_metrics (all): found {len(result)} plugins with metrics")
-            return result
+            # happen outside the lock. A liveness publish may bump
+            # _history_version and clear _cache while that conversion is still
+            # running; publishing the old snapshot would put stopped plugins
+            # back into the TTL cache. Retry until the captured version is
+            # still current, and keep the newer-cache guard.
+            for _ in range(3):
+                version, latest_records = _live_snapshot()
+                result = [self._metrics_to_dict(record) for record in latest_records]
+                with self._lock:
+                    if version != self._history_version:
+                        continue
+                    if version < self._cache_version and self._cache:
+                        return self._cache
+                    self._cache = result
+                    self._cache_timestamp = time.time()
+                    self._cache_version = version
+                logger.debug(f"get_current_metrics (all): found {len(result)} plugins with metrics")
+                return result
+
+            _, latest_records = _live_snapshot()
+            return [self._metrics_to_dict(record) for record in latest_records]
     
     def get_metrics_history(
         self,
