@@ -178,8 +178,13 @@ class MetricsCollector:
                                     logger.debug(f"Failed to collect metrics for plugin {plugin_id} (process alive but collection returned None)")
                                 # The process is still there. Keep its previous sample in
                                 # the current totals instead of treating one failed read
-                                # as a stop.
-                                live_plugin_ids.add(plugin_id)
+                                # as a stop, but only if that sample came from this same
+                                # process: after a restart the old PID's numbers are stale.
+                                with self._lock:
+                                    history = self._metrics_history.get(plugin_id)
+                                    same_process = bool(history) and history[-1].pid == process.pid
+                                if same_process:
+                                    live_plugin_ids.add(plugin_id)
                     except _RUNTIME_ERRORS as e:
                         logger.warning(f"Exception while collecting metrics for plugin {plugin_id}: {e}", exc_info=True)
                 self._publish_live_plugin_ids(live_plugin_ids)
@@ -335,10 +340,13 @@ class MetricsCollector:
                 )
             return []
         else:
-            # 全量查询，使用缓存减少锁竞争。先拿走这份列表再判断，避免两次
-            # 读取之间缓存被清空、这次请求返回空列表。
-            cached = self._cache
-            if cached and (now - self._cache_timestamp) < self._cache_ttl:
+            # 全量查询，使用缓存减少锁竞争。缓存列表和它的时间戳要在锁内一起读：
+            # 分开读的话，可能拿到失效前的旧列表配上新发布的时间戳，把已停止的
+            # 插件当成新鲜数据返回。
+            with self._lock:
+                cached = self._cache
+                cached_at = self._cache_timestamp
+            if cached and (now - cached_at) < self._cache_ttl:
                 return cached
 
             def _live_snapshot() -> tuple[int, int, list[PluginMetrics]]:

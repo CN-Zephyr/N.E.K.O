@@ -317,3 +317,50 @@ def test_failed_sample_keeps_last_metrics_for_a_live_process(monkeypatch: pytest
     )
 
     assert {row["plugin_id"] for row in collector.get_current_metrics()} == {"a", "b"}
+
+
+def test_failed_sample_after_restart_drops_the_previous_process_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = MetricsCollector()
+    _run_collector_ticks(monkeypatch, collector, [{"a": _FakeHost(1), "b": _FakeHost(2)}])
+
+    def _fail_b(plugin_id: str, host: object, _ps_processes: object = None) -> PluginMetrics | None:
+        if plugin_id == "b":
+            return None
+        process = getattr(host, "process", None)
+        return PluginMetrics(plugin_id=plugin_id, timestamp="2026-01-01T00:00:01+00:00", pid=process.pid)
+
+    # "b" restarted under a new PID and its first read failed. The last sample
+    # belongs to the old process, so it must not stay in the current totals.
+    _run_collector_ticks(monkeypatch, collector, [{"a": _FakeHost(1), "b": _FakeHost(3)}], collect=_fail_b)
+
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+    assert collector.get_current_metrics("b") == []
+    assert len(collector.get_metrics_history("b")) == 1
+
+
+def test_full_cache_hit_reads_list_and_timestamp_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reading _cache and _cache_timestamp separately lets a query pair the
+    # pre-stop list with a timestamp published after the stop, and serve stopped
+    # plugins as fresh. Both must be read under the collector lock.
+    timestamp_reads_locked: list[bool] = []
+
+    class _Collector(MetricsCollector):
+        @property
+        def _cache_timestamp(self) -> float:
+            timestamp_reads_locked.append(self._lock.locked())
+            return self.__dict__.get("_ts", 0.0)
+
+        @_cache_timestamp.setter
+        def _cache_timestamp(self, value: float) -> None:
+            self.__dict__["_ts"] = value
+
+    collector = _Collector()
+    _run_collector_ticks(monkeypatch, collector, [{"a": _FakeHost(1)}])
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+    timestamp_reads_locked.clear()
+
+    # Served from the fresh TTL cache.
+    assert [row["plugin_id"] for row in collector.get_current_metrics()] == ["a"]
+    assert timestamp_reads_locked and all(timestamp_reads_locked)
