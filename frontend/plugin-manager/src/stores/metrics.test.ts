@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { getAllMetrics } from '@/api/metrics'
+import { getAllMetrics, getPluginMetrics } from '@/api/metrics'
 import { useMetricsStore } from './metrics'
 
 vi.mock('@/api/metrics', () => ({
@@ -22,6 +22,7 @@ describe('metrics store fetchAllMetrics', () => {
     setActivePinia(createPinia())
     vi.useFakeTimers()
     vi.mocked(getAllMetrics).mockReset()
+    vi.mocked(getPluginMetrics).mockReset()
   })
   afterEach(() => {
     vi.useRealTimers()
@@ -70,5 +71,44 @@ describe('metrics store fetchAllMetrics', () => {
     await expect(third).resolves.toMatchObject({ global: { total: 0 } })
     await second
     expect(store.loading).toBe(false)
+  })
+
+  it('keeps a per-plugin sample fetched after the full snapshot was requested', async () => {
+    const full = deferred<any>()
+    vi.mocked(getAllMetrics).mockReturnValueOnce(full.promise)
+    vi.mocked(getPluginMetrics).mockResolvedValueOnce({ metrics: metric('started') } as any)
+    const store = useMetricsStore()
+
+    const pending = store.fetchAllMetrics()
+    await store.fetchPluginMetrics('started')
+    full.resolve({ metrics: [metric('other')] })
+    await pending
+
+    expect(Object.keys(store.currentMetrics).sort()).toEqual(['other', 'started'])
+  })
+
+  it('keeps a plugin removed when its own later request found no metrics', async () => {
+    const full = deferred<any>()
+    vi.mocked(getAllMetrics).mockReturnValueOnce(full.promise)
+    vi.mocked(getPluginMetrics).mockRejectedValueOnce({ response: { status: 404 } })
+    const store = useMetricsStore()
+
+    const pending = store.fetchAllMetrics()
+    await store.fetchPluginMetrics('stopped')
+    full.resolve({ metrics: [metric('other'), metric('stopped')] })
+    await pending
+
+    expect(Object.keys(store.currentMetrics)).toEqual(['other'])
+  })
+
+  it('lets a full snapshot requested later replace an older per-plugin sample', async () => {
+    vi.mocked(getPluginMetrics).mockResolvedValueOnce({ metrics: metric('stopped') } as any)
+    vi.mocked(getAllMetrics).mockResolvedValueOnce({ metrics: [metric('other')] } as any)
+    const store = useMetricsStore()
+
+    await store.fetchPluginMetrics('stopped')
+    await store.fetchAllMetrics()
+
+    expect(Object.keys(store.currentMetrics)).toEqual(['other'])
   })
 })

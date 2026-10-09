@@ -19,6 +19,10 @@ export const useMetricsStore = defineStore('metrics', () => {
   // 每次发起全量请求加一。超时后旧请求可能还没结束，只有最新的请求能写指标、
   // 清理 pendingFetchAll，晚到的旧响应直接丢掉。
   let fetchAllGeneration = 0
+  // 全量请求和单插件请求共用的发起序号。单插件请求在全量请求之后发起，
+  // 它看到的服务端状态更新，全量结果整体替换时要保留它写入（或删掉）的那一项。
+  let requestSeq = 0
+  const pluginResultSeq: Record<string, number> = {}
   // 请求超时自动清理（防止请求堆积）
   const REQUEST_TIMEOUT = 15000 // 15秒
 
@@ -48,6 +52,7 @@ export const useMetricsStore = defineStore('metrics', () => {
     loading.value = true
     error.value = null
     const generation = ++fetchAllGeneration
+    const fullSeq = ++requestSeq
     
     // 设置超时自动清理，防止请求堆积
     const timeoutId = setTimeout(() => {
@@ -76,6 +81,15 @@ export const useMetricsStore = defineStore('metrics', () => {
         metricsList.forEach((metric: PluginMetrics) => {
           next[metric.plugin_id] = metric
         })
+        for (const [id, seq] of Object.entries(pluginResultSeq)) {
+          if (seq <= fullSeq) continue
+          const local = currentMetrics.value[id]
+          if (local) {
+            next[id] = local
+          } else {
+            delete next[id]
+          }
+        }
         currentMetrics.value = next
         
         // 返回响应以便提取全局指标
@@ -109,6 +123,7 @@ export const useMetricsStore = defineStore('metrics', () => {
     }
     
     console.log(`[Metrics] Fetching metrics for plugin: ${pluginId}`)
+    const seq = ++requestSeq
     
     try {
       const response = await getPluginMetrics(pluginId)
@@ -124,6 +139,7 @@ export const useMetricsStore = defineStore('metrics', () => {
         // 确保 metrics 包含必需的字段
         if (response.metrics.plugin_id && response.metrics.timestamp) {
           currentMetrics.value[pluginId] = response.metrics
+          pluginResultSeq[pluginId] = seq
           console.log(`[Metrics] Successfully stored metrics for ${pluginId}`)
         } else {
           console.warn(`[Metrics] Incomplete metrics data for ${pluginId}:`, response.metrics)
@@ -134,6 +150,7 @@ export const useMetricsStore = defineStore('metrics', () => {
         if (currentMetrics.value[pluginId]) {
           delete currentMetrics.value[pluginId]
         }
+        pluginResultSeq[pluginId] = seq
         // 记录消息（如果有）
         if (response.message) {
           console.log(`[Metrics] ${pluginId}: ${response.message}`)
@@ -149,6 +166,7 @@ export const useMetricsStore = defineStore('metrics', () => {
         if (currentMetrics.value[pluginId]) {
           delete currentMetrics.value[pluginId]
         }
+        pluginResultSeq[pluginId] = seq
         return
       }
       // 其他错误才记录
