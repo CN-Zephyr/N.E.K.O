@@ -16,6 +16,9 @@ export const useMetricsStore = defineStore('metrics', () => {
   
   // 防止请求堆积：正在进行的请求
   let pendingFetchAll: Promise<any> | null = null
+  // 每次发起全量请求加一。超时后旧请求可能还没结束，只有最新的请求能写指标、
+  // 清理 pendingFetchAll，晚到的旧响应直接丢掉。
+  let fetchAllGeneration = 0
   // 请求超时自动清理（防止请求堆积）
   const REQUEST_TIMEOUT = 15000 // 15秒
 
@@ -44,10 +47,11 @@ export const useMetricsStore = defineStore('metrics', () => {
     
     loading.value = true
     error.value = null
+    const generation = ++fetchAllGeneration
     
     // 设置超时自动清理，防止请求堆积
     const timeoutId = setTimeout(() => {
-      if (pendingFetchAll) {
+      if (pendingFetchAll && generation === fetchAllGeneration) {
         console.warn('[Metrics Store] fetchAllMetrics timeout, clearing pending request')
         pendingFetchAll = null
         loading.value = false
@@ -58,6 +62,9 @@ export const useMetricsStore = defineStore('metrics', () => {
     pendingFetchAll = (async () => {
       try {
         const response = await getAllMetrics()
+        if (generation !== fetchAllGeneration) {
+          return undefined
+        }
         const metricsList: PluginMetrics[] = Array.isArray((response as any)?.metrics)
           ? ((response as any).metrics as PluginMetrics[])
           : []
@@ -74,13 +81,18 @@ export const useMetricsStore = defineStore('metrics', () => {
         // 返回响应以便提取全局指标
         return response
       } catch (err: any) {
+        if (generation !== fetchAllGeneration) {
+          return undefined
+        }
         error.value = err?.message || 'FETCH_METRICS_FAILED'
         console.error('Failed to fetch metrics:', err)
         throw err
       } finally {
         clearTimeout(timeoutId)
-        loading.value = false
-        pendingFetchAll = null  // 请求完成后清除引用
+        if (generation === fetchAllGeneration) {
+          loading.value = false
+          pendingFetchAll = null  // 请求完成后清除引用
+        }
       }
     })()
     
