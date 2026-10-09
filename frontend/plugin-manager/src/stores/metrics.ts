@@ -86,14 +86,15 @@ export const useMetricsStore = defineStore('metrics', () => {
         // 用这一次的结果替换当前指标。只增不删的话，服务端已经剔除的插件
         // 会一直留着上一次的数字。
         // 单插件请求晚于这次全量请求发起、已经写入（或删掉）的插件保持不动。
-        const byId: Record<string, PluginMetrics> = {}
+        // 无原型：插件 id 可以叫 constructor 之类，不能读到继承来的属性。
+        const byId = Object.create(null) as Record<string, PluginMetrics>
         metricsList.forEach((metric: PluginMetrics) => {
           byId[metric.plugin_id] = metric
         })
         const next: Record<string, PluginMetrics> = { ...currentMetrics.value }
         for (const id of new Set([...Object.keys(next), ...Object.keys(byId)])) {
           if (!resultGuard.accept(id, ticket)) continue
-          if (byId[id]) {
+          if (Object.prototype.hasOwnProperty.call(byId, id)) {
             next[id] = byId[id]
           } else {
             delete next[id]

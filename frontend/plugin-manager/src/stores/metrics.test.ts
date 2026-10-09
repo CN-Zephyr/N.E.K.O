@@ -140,4 +140,17 @@ describe('metrics store fetchAllMetrics', () => {
 
     expect(Object.keys(store.currentMetrics)).toEqual(['other'])
   })
+
+  it('removes a plugin whose id matches an Object.prototype property', async () => {
+    vi.mocked(getAllMetrics)
+      .mockResolvedValueOnce({ metrics: [metric('constructor'), metric('other')] } as any)
+      .mockResolvedValueOnce({ metrics: [metric('other')] } as any)
+    const store = useMetricsStore()
+
+    await store.fetchAllMetrics()
+    expect(Object.keys(store.currentMetrics).sort()).toEqual(['constructor', 'other'])
+    await store.fetchAllMetrics()
+
+    expect(Object.keys(store.currentMetrics)).toEqual(['other'])
+  })
 })
