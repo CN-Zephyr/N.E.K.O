@@ -440,12 +440,11 @@ class ControlledScoringScheduler:
         return True
 
     def _expire_elapsed_queued_jobs(self) -> None:
-        """Expire queued work from the monotonic deadline, not a late timer.
+        """Preserve elapsed queue deadlines before fencing pending work.
 
-        ``call_later`` follows the event-loop clock. On a coarse Windows timer
-        that callback can lose the race to the worker, which would then run
-        the job and report an execution timeout. A job that never became
-        active is still a queue expiry.
+        The queue timer may not have run when cancellation retirement fails.
+        Check the deadline before the fence assigns scheduler_fenced, so an
+        already-expired queued job retains its timeout reason.
         """
 
         now = float(self._clock())
@@ -653,9 +652,6 @@ class ControlledScoringScheduler:
                         ScoreResultStatus.TIMED_OUT,
                         error_code="execution_deadline_expired",
                     )
-                # Drop queued jobs whose deadline already passed before this
-                # worker yields for physical cancellation.
-                self._expire_elapsed_queued_jobs()
                 if use_async:
                     settled = await self._cancel_async_score_bounded(score_task)
                     if not settled:
