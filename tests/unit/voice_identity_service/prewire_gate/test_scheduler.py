@@ -370,8 +370,11 @@ async def test_uncooperative_async_backend_fences_scheduler_without_overlap(
     backend = _AsyncUncooperativeBackend()
     scheduler = _scheduler(
         backend,
-        deadline_seconds=0.01 if trigger == "timeout" else 1.0,
-        close_timeout_seconds=0.01,
+        deadline_seconds=0.05 if trigger == "timeout" else 1.0,
+        # Cancellation must still be in progress when the queue deadline
+        # passes, and must finish before this test's 0.2s worker wait.
+        # Equal 10ms budgets collapse on Windows' timer resolution.
+        close_timeout_seconds=0.01 if trigger == "cancel" else 0.12,
     )
     active = scheduler.submit(_request("uncooperative-active"))
     queued = scheduler.submit(_request("must-not-run", start=10))

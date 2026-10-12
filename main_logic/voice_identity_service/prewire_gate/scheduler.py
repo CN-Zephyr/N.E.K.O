@@ -439,6 +439,29 @@ class ControlledScoringScheduler:
         )
         return True
 
+    def _expire_elapsed_queued_jobs(self) -> None:
+        """Expire queued work from the monotonic deadline, not a late timer.
+
+        ``call_later`` follows the event-loop clock. On a coarse Windows timer
+        that callback can lose the race to the worker, which would then run
+        the job and report an execution timeout. A job that never became
+        active is still a queue expiry.
+        """
+
+        now = float(self._clock())
+        for job_id in tuple(self._queue):
+            job = self._jobs.get(job_id)
+            if (
+                job is None
+                or job.future.done()
+                or job_id == self._active_job_id
+                or job.receipt.absolute_deadline > now
+            ):
+                continue
+            self._resolve(
+                job, ScoreResultStatus.TIMED_OUT, error_code="deadline_expired_in_queue"
+            )
+
     def _fence_after_unsettled_async_cancellation(self) -> None:
         """Stop this channel before an uncooperative call can overlap another."""
 
@@ -446,6 +469,7 @@ class ControlledScoringScheduler:
             return
         self._closed = True
         self._generation += 1
+        self._expire_elapsed_queued_jobs()
         active_job_id = self._active_job_id
         for job_id, job in tuple(self._jobs.items()):
             if job_id == active_job_id or job.future.done():
@@ -629,6 +653,9 @@ class ControlledScoringScheduler:
                         ScoreResultStatus.TIMED_OUT,
                         error_code="execution_deadline_expired",
                     )
+                # Drop queued jobs whose deadline already passed before this
+                # worker yields for physical cancellation.
+                self._expire_elapsed_queued_jobs()
                 if use_async:
                     settled = await self._cancel_async_score_bounded(score_task)
                     if not settled:
