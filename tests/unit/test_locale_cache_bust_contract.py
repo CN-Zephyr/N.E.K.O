@@ -66,9 +66,14 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
-        "2026-10-12-gravity-cat-settings",
+        "2026-10-12-visit-frame-badges-main-merge-4",
+        "2026-10-12-pr3140-gravity-main-merge",
+        "2026-10-12-visit-frame-badges-main-merge-3",
         "2026-10-12-pr14a-debrief-pr3398-merge",
+        "2026-10-12-visit-frame-badges-main-merge-2",
+        "2026-10-12-gravity-cat-settings",
         "2026-10-12-pr3398-main-merge",
+        "2026-10-12-visit-frame-badges-merge",
         "2026-10-12-pr14a-debrief-ambiguous-names-merge",
         "2026-10-12-pr14a-debrief-main-merge",
         "2026-10-12-visit-ambiguous-names-pr13-pr15-merge",
@@ -83,6 +88,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-10-11-pr14a-visit-debrief",
         "2026-10-11-visit-pr13-pr15-settings-memory-panel",
         "2026-10-11-visit-pr13-pr15-forget-record-discard",
+        "2026-10-12-visit-frame-badges",
         "2026-10-11-pngtuber-skipped-bound-memory-toggle-main-merge",
         "2026-10-10-pngtuber-delete-skipped-bound",
         "2026-10-09-memory-toggle-repair",
@@ -418,7 +424,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "69ba4612edd2df016b0986683128d7c2dd5b6f35f777e2578deb404806e510c9"
+LOCALE_KEY_SIGNATURE = 'ffc5aeb1eb78a44008e2e0064716748fbc85d843f87f5d9cdcf22586b7c4ca2b'
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
