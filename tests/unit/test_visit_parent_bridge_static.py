@@ -85,13 +85,16 @@ def test_only_index_loads_the_bridge_after_the_websocket_script():
 
 
 def test_websocket_dispatch_skips_the_chat_follower_window():
+    # 串门 PR-12 起 visit_* 帧集中在一个分派块里：父页取帧桥只在非 chat 跟随窗口调用（判定抽成共用 helper）
     src = _read("static/app/app-websocket.js")
-    i = src.index("response.type === 'visit_state_change'")
-    block = src[i:i + 700]
-    assert re.search(r"var visitChatFollower = window\.__NEKO_MULTI_WINDOW__ === true\s*\n", block)
-    assert "if (!visitChatFollower && window.nekoVisitParentBridge" in block
-    assert "/^\\/chat(?:_full)?(?:\\/|$)/" in block
+    i = src.index("if (response.type === 'visit_state_change') {")
+    block = src[i:i + 500]
+    assert "if (!_isVisitChatFollowerWindow() && window.nekoVisitParentBridge" in block
     assert "nekoVisitParentBridge.onStateChange(response)" in block
+    j = src.index("function _isVisitChatFollowerWindow()")
+    helper = src[j:j + 300]
+    assert re.search(r"return window\.__NEKO_MULTI_WINDOW__ === true\s*\n", helper)
+    assert "/^\\/chat(?:_full)?(?:\\/|$)/" in helper
 
 
 def test_avatar_portrait_is_not_modified_for_visits():

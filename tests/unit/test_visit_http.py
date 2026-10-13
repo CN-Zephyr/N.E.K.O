@@ -265,6 +265,31 @@ async def test_rooms_answers_202_with_only_the_visit_id(env):
     assert env.host.creds_calls == []   # 能力门之前不去 Servers
 
 
+async def test_user_switch_off_refuses_rooms_and_join_without_going_online(env):
+    # 用户的「串门」开关（visitEnabled）关着：建房、入房都拒，不占位、不领凭证、入房也不代转预览
+    env.host.settings["visitEnabled"] = False
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["code"] == "VISIT_DISABLED"
+    assert _no_slot() and env.host.creds_calls == []
+    env.guest.settings.pop("visitEnabled")   # 缺省即关
+    join = await _join(env)
+    assert join.status_code == 409 and join.json()["code"] == "VISIT_DISABLED"
+    assert env.preview_calls == [] and _no_slot("Guest") and env.guest.creds_calls == []
+    # 打开之后照常放行
+    env.host.settings["visitEnabled"] = True
+    env.use(env.host)
+    assert (await _rooms(env)).status_code == 202
+
+
+async def test_user_switch_is_checked_by_the_runtime_too(env):
+    # start_visit 自己也查（不只 HTTP 层）：别的调用方绕不过去
+    env.host.settings["visitEnabled"] = False
+    with pytest.raises(rtm.VisitRefused) as refused:
+        await rtm.start_visit("Host", "host")   # 夹具包了一层，注入的是 host 侧的 deps
+    assert refused.value.status == 409 and refused.value.body["code"] == "VISIT_DISABLED"
+    assert _no_slot() and env.host.creds_calls == []
+
+
 async def test_rooms_rejects_bad_fields_before_reserving(env):
     assert (await _rooms(env, catgirl="")).status_code == 400
     assert (await _rooms(env, crop="giant")).json()["code"] == "crop_format"
@@ -819,6 +844,31 @@ async def test_accept_forwards_to_the_matching_host_runtime(env):
     assert ok.status_code == 200 and calls == [False]
     assert other.status_code == 404 and other.json()["error"] == "no_pending_invite"
     assert bad.status_code == 400
+
+
+async def test_accept_true_is_refused_once_the_user_switch_is_off(env):
+    # 「允许串门」已关、关闭钩子还没结束这一场：不接待；婉拒照常放行
+    calls = []
+
+    class Stub:
+        visit_id, creds, admitted_account = VISIT_ID, None, "acct"
+
+        async def accept(self, accept):
+            calls.append(accept)
+            return 200, {"ok": True}
+
+    env.host.settings["visitEnabled"] = False
+    rtm._runtimes["Host"] = Stub()
+    try:
+        async with env.client() as c:
+            refused = await c.post(f"/api/visit/rooms/{VISIT_ID}/accept", headers=GOOD,
+                                   json={"catgirl": "Host", "accept": True})
+            declined = await c.post(f"/api/visit/rooms/{VISIT_ID}/accept", headers=GOOD,
+                                    json={"catgirl": "Host", "accept": False})
+    finally:
+        del rtm._runtimes["Host"]
+    assert refused.status_code == 409 and refused.json()["code"] == "VISIT_DISABLED"
+    assert declined.status_code == 200 and calls == [False]
 
 
 async def test_accept_before_the_guest_arrived_is_404(env):

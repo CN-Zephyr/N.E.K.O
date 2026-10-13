@@ -190,6 +190,9 @@ async def test_proxy_header_refuses_bind_even_from_loopback(monkeypatch, header)
     await run(socket, manager)
     assert not display_socket.is_bound(socket)
     assert socket.statuses() == ["VISIT_E_UNAUTHORIZED"] and socket.visit_frames() == []
+    # bind 自己被拒带 reason：页面只对它刷新 token 重发
+    details = [json.loads(f["message"])["details"] for f in socket.sent if f.get("type") == "status"]
+    assert details == [{"reason": "bind_refused"}]
     assert rt.replayed == []
 
 
@@ -288,6 +291,50 @@ async def test_unbound_text_without_a_visit_is_ordinary_chat(monkeypatch):
     assert calls["stream"] == []
     assert [m["data"] for kind, m in manager.calls if kind == "stream_data"] == ["hi"]
     assert socket.statuses() == [] and manager.statuses == []
+
+
+async def test_visit_line_after_the_route_released_is_refused_not_chatted(monkeypatch):
+    # 路由在 ending 放手、页面还没收到那一帧时发出的串门句：不漏进普通聊天，按「正在道别」拒掉
+    manager = _ProtocolManager()
+    calls = install(monkeypatch, manager, visit_active=False)
+    socket = VisitSocket([bind(), {"action": "stream_data", "input_type": "text", "data": "hi",
+                                   "source": "neko_visit:peer", "request_id": "r9"}])
+    await run(socket, manager)
+    await asyncio.sleep(0)
+    assert calls["stream"] == []
+    assert not any(kind == "stream_data" for kind, _ in manager.calls)
+    status = [json.loads(f["message"]) for f in socket.sent if f.get("type") == "status"]
+    assert status == [{"code": "VISIT_INPUT_REFUSED_WRAPUP", "details": {"request_id": "r9"}}]
+
+
+async def test_visit_line_is_refused_before_another_route_can_claim_it(monkeypatch):
+    # 页面漏了串门结束、别的路由（如游戏）已接管：写给串门的句子不能被它认领
+    manager = _ProtocolManager()
+    install(monkeypatch, manager, visit_active=False)
+    game_calls = []
+
+    async def game_stream(_name, message):
+        game_calls.append(message)
+        return True
+
+    async def game_start(_name, _message):
+        return False
+
+    async def game_finalize(_name):
+        return 0
+
+    monkeypatch.setitem(registry._kinds, "test_game", registry.ExternalRouteKind(
+        kind="test_game", is_active=lambda name: name == NAME, route_stream_message=game_stream,
+        on_start_session=game_start, finalize_for_character=game_finalize,
+        current_instance=lambda _n: "game:x",
+    ))
+    socket = VisitSocket([bind(), {"action": "stream_data", "input_type": "text", "data": "hi",
+                                   "source": "neko_visit:guest_cat", "request_id": "r10"}])
+    await run(socket, manager)
+    await asyncio.sleep(0)
+    assert game_calls == []
+    status = [json.loads(f["message"]) for f in socket.sent if f.get("type") == "status"]
+    assert status == [{"code": "VISIT_INPUT_REFUSED_WRAPUP", "details": {"request_id": "r10"}}]
 
 
 # ── 下行只发给已绑定的连接 ─────────────────────────────────────────────
