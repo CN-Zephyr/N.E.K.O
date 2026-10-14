@@ -822,6 +822,8 @@ class TurnMixin:
         owner = _taken_over_reply_turn(kind)
         if owner is not None:
             owner.taken_over = True
+            if owner.reply_tail is not None and not owner.reply_tail.completed:
+                owner.reply_tail.registry.cancel_reply(owner.reply_tail, "reply_interrupted")
         if owner is not None and owner.turn_ended:
             if owner.request_id and self._active_text_request_id == owner.request_id:
                 self._active_text_request_id = None
@@ -1563,6 +1565,16 @@ class TurnMixin:
                 )
                 print(f"[response_discarded parse_err] raw: {message!r}")
 
+        # The truncated recovery keeps this attempt's text as the reply, so its
+        # reply-tail images stay registered until the recovered body is
+        # published (``_mark_recovery_published``). Every other discard ends
+        # the attempt that registered them.
+        if (
+            reply_turn is not None and reply_turn.reply_tail is not None
+            and _truncated_text is None
+        ):
+            reply_turn.reply_tail.discard_attempt()
+
         # 被丢弃的这段回复前端已经 clear 掉了，用户没看到——不该作为"AI 说过的
         # 话"进 activity tracker 的 unfinished_thread 检测。_clear_tts_pipeline
         # 只管 TTS 队列和音频缓存，从不碰 _current_ai_turn_text，而这个 buffer
@@ -1665,6 +1677,13 @@ class TurnMixin:
                 # the steps below, but what the user saw and memory recorded
                 # still lands in history, before the taker's user message.
                 _append_recovery_history()
+                # Like the regular commit: the shown reply is complete, so
+                # its reply-tail images may follow it once the turn ends.
+                if (
+                    _truncated_text is not None and reply_turn is not None
+                    and reply_turn.reply_tail is not None
+                ):
+                    reply_turn.reply_tail.completed = True
 
             try:
                 if _truncated_text is not None:
@@ -3112,6 +3131,7 @@ class TurnMixin:
         request_id: str | None = None,
         source: str = "plugin",
         source_name: str | None = None,
+        reply_tail: dict | None = None,
     ) -> bool:
         """Render structured blocks as a SYSTEM message.
 
@@ -3136,7 +3156,7 @@ class TurnMixin:
         ):
             return False
         try:
-            await self.websocket.send_json({
+            payload = {
                 "type": "chat_blocks",
                 "blocks": structured_blocks,
                 "request_id": request_id,
@@ -3145,7 +3165,10 @@ class TurnMixin:
                     "source_name": source_name or "",
                     "passthrough": True,
                 },
-            })
+            }
+            if reply_tail is not None:
+                payload["reply_tail"] = reply_tail
+            await self.websocket.send_json(payload)
         except Exception as e:
             logger.warning(
                 "[%s] render_chat_blocks WS send failed: %s",

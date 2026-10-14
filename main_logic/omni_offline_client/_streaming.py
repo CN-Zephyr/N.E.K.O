@@ -373,6 +373,20 @@ class _StreamingMixin:
             self._conversation_history.append(AIMessage(content=text))
         return True
 
+    @staticmethod
+    def _mark_reply_tail_completed(reply_owner, live: bool, shown: str) -> None:
+        """Let the reply-tail images of ``reply_owner`` follow its reply.
+
+        Every exit that keeps this attempt's shown text as the reply (the
+        regular commit, the long-reply recovery, the summary gibberish
+        fallback) marks it. A retry or discard leaves it incomplete, and the
+        reroll exhausted ``RESPONSE_LENGTH_TRUNCATED`` recovery is marked by
+        the core once it has published the recovered body.
+        """
+        tail = getattr(reply_owner, "reply_tail", None)
+        if tail is not None and live and shown:
+            tail.completed = True
+
     def _trim_cancelled_round_text(self, shown: str, rounds) -> None:
         """Make a kept, cancelled tool round hold only the text that was shown.
 
@@ -1213,6 +1227,9 @@ class _StreamingMixin:
                         if not self._resume_response_generation(response_generation):
                             status_reported = True
                             break
+                        tail = getattr(reply_owner, "reply_tail", None)
+                        if tail is not None:
+                            tail.discard_attempt()
                         assistant_message = ""           # 仅最后一段未持久化的 text，用于 final AIMessage append
                         assistant_message_total = ""     # 全轮累积，用于 _check_repetition / 长度 guard
                         is_first_chunk = True
@@ -1864,10 +1881,14 @@ class _StreamingMixin:
                                 )
                                 # The recovery may first be emitted by the
                                 # end-of-stream flush above, a cancellation point.
-                                if self._commit_reply(
+                                _live_at_commit = self._commit_reply(
                                     user_message, history_recovery_text, response_generation,
                                     turn_history=turn_history,
-                                ):
+                                )
+                                self._mark_reply_tail_completed(
+                                    reply_owner, _live_at_commit, recovery_text,
+                                )
+                                if _live_at_commit:
                                     await self._check_repetition(recovery_text)
                                 assistant_message = history_recovery_text
                                 guard_exhausted = True
@@ -2010,13 +2031,14 @@ class _StreamingMixin:
                             # 用 assistant_message_total 会把判定为乱码、已丢弃的 tail
                             # 也塞进 _recent_responses，污染后续重复判定。
                             cut_keeps_shown = False
-                            if (
-                                self._commit_reply(
-                                    user_message, summary_prefix_for_history, response_generation,
-                                    turn_history=turn_history,
-                                )
-                                and summary_prefix_for_history
-                            ):
+                            _live_at_commit = self._commit_reply(
+                                user_message, summary_prefix_for_history, response_generation,
+                                turn_history=turn_history,
+                            )
+                            self._mark_reply_tail_completed(
+                                reply_owner, _live_at_commit, assistant_message_total,
+                            )
+                            if _live_at_commit and summary_prefix_for_history:
                                 await self._check_repetition(summary_prefix_for_history)
                             assistant_message = ""
                             guard_exhausted = True
@@ -2092,6 +2114,9 @@ class _StreamingMixin:
                         _live_at_commit = self._commit_reply(
                             user_message, assistant_message, response_generation,
                             turn_history=turn_history,
+                        )
+                        self._mark_reply_tail_completed(
+                            reply_owner, _live_at_commit, assistant_message_total,
                         )
                         # 重复检测看完整一轮文本（含 pre-tool），与人类用户感知
                         # 的"这一轮 AI 说了什么"一致。
