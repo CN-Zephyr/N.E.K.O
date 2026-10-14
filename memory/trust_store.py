@@ -110,6 +110,7 @@ from utils.config_manager import get_config_manager
 # Module-level import on purpose (mirrors gates.py): this runs inside the
 # critical section, and a function-local import would lock the import
 # machinery along with the pool.
+from utils.asyncio_executor import to_thread_through_cancellation
 from utils.file_utils import atomic_write_json, read_json_tolerating_replace
 
 from memory.identity import (
@@ -223,8 +224,12 @@ _load_failed: bool = False
 # Cancellation safety: the whole critical section runs inside ONE
 # ``asyncio.to_thread``. Once handed off it cannot be cancelled — the awaiting
 # coroutine may be cancelled but the thread still finishes and still releases
-# the lock. Hence no shield / no second cancellation loop / no before-after
-# rollback: there is no "hold a lock across await" anywhere in this module.
+# the lock. Hence no before-after rollback: there is no "hold a lock across
+# await" anywhere in this module. The one exception to "a cancelled await
+# returns at once" is ``aapply_trust_mutations``: its CALLER may hold another
+# lock around the write (keyed scoped_history holds the fact persistence lock
+# so a forget cannot bump the generation in between), so on cancellation it
+# waits for its own worker to finish before re-raising.
 _pool_lock = threading.Lock()
 
 # Mutators are SYNCHRONOUS on purpose: "await inside the lock" and "take another
@@ -1160,9 +1165,10 @@ async def aapply_trust_mutations(
     """The single write entry point for trust evolution.
 
     LOCK ORDER: the pool lock is a LEAF. While holding it, never take another
-    lock, never await, and never call into ``FactStore``. This runs as the last
-    durable write of its handler, after every FactStore call, so the two lock
-    orders cannot overlap.
+    lock, never await, and never call into ``FactStore``. Callers may hold
+    other locks around this call (keyed scoped_history holds the fact
+    persistence lock: key_lock -> persist_alock -> pool lock); that is safe
+    exactly because nothing is acquired while the pool lock is held.
     """
     materialized = tuple(muts)
     if not materialized:
@@ -1175,7 +1181,8 @@ async def aapply_trust_mutations(
         captured["result"] = result
         return dirty, result
 
-    persisted, _ = await asyncio.to_thread(_with_pool_write, _mutator)
+    # 被取消时等线程写完再抛：调用方可能持着别的锁等这次写（见模块头取消安全说明）
+    persisted, _ = await to_thread_through_cancellation(_with_pool_write, _mutator)
     base = captured.get("result") or TrustApplyResult(
         persisted=False,
         per_mutation=tuple(MutationOutcome() for _ in materialized),
