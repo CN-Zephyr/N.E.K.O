@@ -505,6 +505,19 @@ function createSettingsPopupContent(manager, prefix, popup) {
         void window.nekoVisitSettings.revealEntries();
     }
 
+    // 2.6 猫咪设置（自动变猫 / 重力猫猫 / 猫猫音效）：浏览器部署的独立入口，
+    // 与桌面壳聚合设置页「通用 → 猫咪」分组共用状态层
+    const catSettingsBtn = manager._createSettingsMenuButton({
+        label: window.t ? window.t('settings.toggles.catSettings') : '猫咪设置',
+        labelKey: 'settings.toggles.catSettings'
+    });
+    popup.appendChild(catSettingsBtn);
+
+    const catSidePanel = manager._createCatSettingsSidePanel(popup);
+    catSidePanel._anchorElement = catSettingsBtn;
+    catSidePanel._popupElement = popup;
+    manager._attachSidePanelHover(catSettingsBtn, catSidePanel);
+
     // 3. 角色设置按钮已移至分隔线下方（在 _createSettingsMenuItems 中创建）
 
     // 4. 主动搭话和自主视觉（角色设置已移至分隔线下方的导航菜单区域）
@@ -761,9 +774,6 @@ function createChatSettingsSidePanel(manager, prefix, popup) {
         { id: 'focus-cognition', label: window.t ? window.t('settings.toggles.focusCognition') : '凝神模式', labelKey: 'settings.toggles.focusCognition', tooltipKey: 'settings.toggles.focusCognitionTooltip', storageKey: 'focusCognitionEnabled', alwaysTinted: true },
         { id: 'auto-memory-recall', label: window.t ? window.t('settings.toggles.autoMemoryRecall') : '自动想起记忆', labelKey: 'settings.toggles.autoMemoryRecall', tooltipKey: 'settings.toggles.autoMemoryRecallTooltip', storageKey: 'autoMemoryRecallEnabled', alwaysTinted: true },
         { id: 'slop-filter', label: window.t ? window.t('settings.toggles.slopFilter') : '自然表达', labelKey: 'settings.toggles.slopFilter', tooltipKey: 'settings.toggles.slopFilterTooltip', storageKey: 'slopFilterEnabled', alwaysTinted: true },
-        { id: 'auto-cat', label: window.t ? window.t('settings.toggles.autoCat') : '自动变猫', labelKey: 'settings.toggles.autoCat', tooltipKey: 'settings.toggles.autoCatTooltip', alwaysTinted: true },
-        { id: 'gravity-cat', label: window.t ? window.t('settings.toggles.gravityCat') : '重力猫猫', labelKey: 'settings.toggles.gravityCat', tooltipKey: 'settings.toggles.gravityCatTooltip', alwaysTinted: true },
-        { id: 'cat-audio', label: window.t ? window.t('settings.toggles.catAudio') : '猫猫音效', labelKey: 'settings.toggles.catAudio', tooltipKey: 'settings.toggles.catAudioTooltip', alwaysTinted: true },
     ];
 
     chatToggles.forEach(toggle => {
@@ -813,6 +823,67 @@ function createVisitSettingsSidePanel(manager, prefix, popup) {
     if (window.nekoVisitSettings && typeof window.nekoVisitSettings.appendPanelExtras === 'function') {
         window.nekoVisitSettings.appendPanelExtras(container);
     }
+
+    document.body.appendChild(container);
+    return container;
+}
+
+/**
+ * 创建猫咪设置侧边面板：自动变猫 / 重力猫猫 / 猫猫音效三个猫形态开关。
+ * 状态层与桌面壳聚合设置页「通用 → 猫咪」分组共用同一组 localStorage 键，
+ * 双入口互相同步；浏览器部署（无 N.E.K.O.-PC 桌面壳）以本面板为唯一入口。
+ */
+function createCatSettingsSidePanel(manager, prefix, popup) {
+    const container = manager._createSidePanelContainer();
+    container.setAttribute('data-neko-sidepanel-type', 'cat-settings');
+    container.style.flexDirection = 'column';
+    container.style.alignItems = 'stretch';
+    container.style.gap = '0';
+    container.style.width = '200px';
+    container.style.minWidth = '0';
+    container.style.padding = '4px 4px';
+
+    const catToggles = [
+        { id: 'auto-cat', label: window.t ? window.t('settings.toggles.autoCat') : '自动变猫', labelKey: 'settings.toggles.autoCat', tooltipKey: 'settings.toggles.autoCatTooltip', alwaysTinted: true },
+        { id: 'gravity-cat', label: window.t ? window.t('settings.toggles.gravityCat') : '重力猫猫', labelKey: 'settings.toggles.gravityCat', tooltipKey: 'settings.toggles.gravityCatTooltip', alwaysTinted: true },
+        { id: 'cat-audio', label: window.t ? window.t('settings.toggles.catAudio') : '猫猫音效', labelKey: 'settings.toggles.catAudio', tooltipKey: 'settings.toggles.catAudioTooltip', alwaysTinted: true },
+    ];
+
+    catToggles.forEach(toggle => {
+        const toggleItem = manager._createSettingsToggleItem(toggle);
+        container.appendChild(toggleItem);
+        if (typeof toggleItem._nekoUpdateSettingsToggleStyle === 'function') {
+            toggleItem._nekoUpdateSettingsToggleStyle();
+        }
+    });
+
+    // 双入口同步：弹层 DOM 在页面加载时只创建一次，桌面壳聚合设置页回写状态层后
+    // （N.E.K.O.-PC petPreference 管线），复选框会停留在创建时的旧值。展开面板时
+    // 重读三个 getter 再刷样式，保证两个入口看到同一份状态。
+    const syncCheckedStates = () => {
+        [
+            ['auto-cat', window.nekoAutoGoodbye, 'isAutoCatEnabled'],
+            ['gravity-cat', window.nekoIdleCat1Playground, 'isGravityCatEnabled'],
+            ['cat-audio', window.nekoIdleCatAudio, 'isEnabled'],
+        ].forEach(([toggleId, host, getterName]) => {
+            if (!host || typeof host[getterName] !== 'function') return;
+            const checkbox = container.querySelector(`#${prefix}-${toggleId}`);
+            if (!checkbox) return;
+            const nextChecked = host[getterName]() === true;
+            if (checkbox.checked !== nextChecked) {
+                checkbox.checked = nextChecked;
+            }
+            const toggleItem = checkbox.closest(`.${prefix}-toggle-item`);
+            if (toggleItem && typeof toggleItem._nekoUpdateSettingsToggleStyle === 'function') {
+                toggleItem._nekoUpdateSettingsToggleStyle();
+            }
+        });
+    };
+    const originalExpand = container._expand;
+    container._expand = () => {
+        syncCheckedStates();
+        originalExpand();
+    };
 
     document.body.appendChild(container);
     return container;
@@ -1935,6 +2006,7 @@ function attachSidePanelHover(manager, prefix, anchorEl, sidePanel) {
             'agent-openclaw-actions',
             'chat-settings',
             'animation-settings',
+            'cat-settings',
             'visit-settings',
             'interval-proactive-chat',
             'interval-proactive-vision',
@@ -2973,6 +3045,10 @@ const AvatarPopupMixin = {
 
         ManagerProto._createVisitSettingsSidePanel = function (popup) {
             return createVisitSettingsSidePanel(this, prefix, popup);
+        };
+
+        ManagerProto._createCatSettingsSidePanel = function (popup) {
+            return createCatSettingsSidePanel(this, prefix, popup);
         };
 
         ManagerProto._createAnimationSettingsSidePanel = function () {
