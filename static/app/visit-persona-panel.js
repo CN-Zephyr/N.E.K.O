@@ -24,6 +24,33 @@
     var POLL_MS = 2000;
     var POLL_MAX = 90;
 
+    function acquireForceInteractiveLease() {
+        if (typeof window.__nekoAcquireForceInteractiveLease !== 'function') {
+            window.__nekoAcquireForceInteractiveLease = function () {
+                var state = window.__nekoForceInteractiveLeaseState;
+                if (!state || typeof state.count !== 'number') {
+                    state = { count: 0, restore: false };
+                    window.__nekoForceInteractiveLeaseState = state;
+                }
+                if (state.count === 0) {
+                    state.restore = window.__nekoForceInteractive === true;
+                    try { window.__nekoForceInteractive = true; } catch (_) { /* 普通浏览器无需处理 */ }
+                }
+                state.count += 1;
+                var released = false;
+                return function () {
+                    if (released) return;
+                    released = true;
+                    state.count = Math.max(0, state.count - 1);
+                    if (state.count === 0) {
+                        try { window.__nekoForceInteractive = state.restore; } catch (_) { /* noop */ }
+                    }
+                };
+            };
+        }
+        return window.__nekoAcquireForceInteractiveLease();
+    }
+
     function t(key, fallback, params) {
         var text = '';
         if (typeof window.t === 'function') {
@@ -133,7 +160,7 @@
             openPanel.close(false);
         }
 
-        var overlay = el('div', 'visit-dialog-overlay');
+        var overlay = el('div', 'visit-dialog-overlay visit-persona-overlay');
         var dialog = el('div', 'visit-dialog visit-persona');
         dialog.setAttribute('role', 'dialog');
         dialog.setAttribute('aria-modal', 'true');
@@ -149,17 +176,22 @@
         textarea.placeholder = t('visit.persona.editHint', '用几句话介绍她自己：性格、爱好、说话的样子');
         var privateBox = el('div', 'visit-persona-private');
         var actions = el('div', 'visit-dialog-actions');
+        var body = el('div', 'visit-persona-body');
         dialog.appendChild(title);
-        dialog.appendChild(intro);
+        body.appendChild(intro);
         if (options.requireConfirm) {
-            dialog.appendChild(el('p', 'visit-dialog-line is-warning', t('visit.persona.unreviewed', '出门前先看一眼她的串门自我介绍，确认后才能串门')));
+            body.appendChild(el('p', 'visit-dialog-line is-warning', t('visit.persona.unreviewed', '出门前先看一眼她的串门自我介绍，确认后才能串门')));
         }
-        dialog.appendChild(notice);
-        dialog.appendChild(textarea);
-        dialog.appendChild(privateBox);
+        body.appendChild(notice);
+        body.appendChild(textarea);
+        body.appendChild(privateBox);
+        dialog.appendChild(body);
         dialog.appendChild(actions);
         overlay.appendChild(dialog);
         (document.body || document.documentElement).appendChild(overlay);
+        // Electron 的透明桌面窗默认把未登记区域的鼠标透传给后面的应用。
+        // 串门弹窗打开期间临时接管输入，避免按钮看得见却点到后面的窗口。
+        var releaseInteractive = acquireForceInteractiveLease();
         refreshCompactGeometry();
 
         var settle;
@@ -178,6 +210,7 @@
             panel.closed = true;
             if (typeof document.removeEventListener === 'function') document.removeEventListener('keydown', onKeydown, true);
             if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            releaseInteractive();
             refreshCompactGeometry();
             if (openPanel === panel) openPanel = null;
             settle(confirmed === true);
@@ -191,6 +224,7 @@
                 var spec = typeof line === 'string' ? { text: line } : line;
                 notice.appendChild(el('p', 'visit-dialog-line' + (spec.tone ? ' is-' + spec.tone : ''), spec.text));
             });
+            refreshCompactGeometry();
         }
 
         function setButtons(buttons) {
@@ -206,6 +240,7 @@
                 });
                 actions.appendChild(btn);
             });
+            refreshCompactGeometry();
         }
 
         function renderPrivate(data) {
@@ -223,6 +258,7 @@
             if (data && data.scan_complete === false) {
                 privateBox.appendChild(el('p', 'visit-dialog-line is-warning', t('visit.persona.scanIncomplete', '自动检查不完整，请自己再看一遍有没有私人信息')));
             }
+            refreshCompactGeometry();
         }
 
         function closeButton() {
@@ -359,6 +395,7 @@
                 if (await load()) {
                     notice.appendChild(el('p', 'visit-dialog-line is-warning',
                         t('visit.persona.changed', '这段内容刚刚被更新过，已重新读取，请再确认一次')));
+                    refreshCompactGeometry();
                 }
                 return;
             } else if (code === 'persona_generating') {

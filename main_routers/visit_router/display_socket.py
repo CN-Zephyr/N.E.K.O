@@ -64,6 +64,106 @@ _UNAUTHORIZED = "VISIT_E_UNAUTHORIZED"
 _replays: set[asyncio.Task] = set()
 """Bind replays in flight (kept referenced until done)."""
 
+_desktop_run_id: Optional[str] = None
+_desktop_run_lock: Optional[asyncio.Lock] = None
+_desktop_run_reset_task: Optional[asyncio.Task[bool]] = None
+
+
+def _desktop_lock() -> asyncio.Lock:
+    global _desktop_run_lock
+    if _desktop_run_lock is None:
+        _desktop_run_lock = asyncio.Lock()
+    return _desktop_run_lock
+
+
+async def _perform_desktop_run_reset(previous: Optional[asyncio.Task[bool]]) -> bool:
+    """Run one restart cleanup after the preceding run's cleanup has retired."""
+    if previous is not None:
+        await asyncio.shield(previous)
+    from main_routers.visit_router import credentials, runtime
+
+    try:
+        reset = await runtime.reset_pending_host_invites_for_desktop_restart()
+        # Connect scopes this bulk reset by both the authenticated account and
+        # X-Client-Id, the stable local installation id (not the public OAuth client id).
+        cancelled = await credentials.cancel_pending_host_invites()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - A later bind for this run retries the cleanup.
+        logger.warning("visit display: desktop restart invitation reset failed: %s", type(exc).__name__)
+        return False
+    if reset or cancelled:
+        logger.info(
+            "visit display: desktop restart reset %d local and %d remote pending invitation(s)",
+            reset,
+            cancelled,
+        )
+    return True
+
+
+async def _reset_for_new_desktop_run(message: Any) -> None:
+    """Invalidate unused invites once per Electron process, without holding the ordering lock during I/O."""
+    global _desktop_run_id, _desktop_run_reset_task
+    run_id = message.get("desktop_run_id") if isinstance(message, dict) else None
+    if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+        return
+    async with _desktop_lock():
+        previous = _desktop_run_id
+        cleanup = _desktop_run_reset_task
+        if previous is None:
+            _desktop_run_id = run_id
+            _desktop_run_reset_task = None
+            return
+        if previous == run_id and cleanup is None:
+            return
+        if previous != run_id:
+            cleanup = asyncio.create_task(
+                _perform_desktop_run_reset(cleanup),
+                name="visit-desktop-restart-reset",
+            )
+            _desktop_run_id = run_id
+            _desktop_run_reset_task = cleanup
+        elif cleanup.done() and cleanup.result() is False:
+            cleanup = asyncio.create_task(
+                _perform_desktop_run_reset(None),
+                name="visit-desktop-restart-reset-retry",
+            )
+            _desktop_run_reset_task = cleanup
+    await asyncio.shield(cleanup)
+
+
+async def wait_desktop_restart_reset() -> bool:
+    """Before minting a room, finish (and once retry) the current desktop-run cleanup.
+
+    This is the admission fence that prevents a delayed bulk cancel from
+    invalidating an invitation created after the new renderer already bound.
+    """
+    global _desktop_run_reset_task
+    retried = False
+    while True:
+        async with _desktop_lock():
+            cleanup = _desktop_run_reset_task
+            if cleanup is None:
+                return True
+            if cleanup.done():
+                try:
+                    if cleanup.result() is True:
+                        return True
+                except asyncio.CancelledError:
+                    pass
+                if retried:
+                    return False
+                cleanup = asyncio.create_task(
+                    _perform_desktop_run_reset(None),
+                    name="visit-desktop-restart-reset-admission-retry",
+                )
+                _desktop_run_reset_task = cleanup
+                retried = True
+        if await asyncio.shield(cleanup):
+            return True
+        if retried:
+            return False
+
 
 def is_bound(websocket: Any) -> bool:
     """Whether ``websocket`` passed ``visit_bind`` (False for None or a fake without the mark)."""
@@ -161,6 +261,7 @@ async def handle_bind(websocket: Any, lanlan_name: str, message: Any) -> bool:
         # reason lets the page distinguish a rejected bind from rejected frames on an unbound connection (screen frames, playback progress): only the former warrants refreshing the token and retrying
         await refuse(websocket, reason="bind_refused")
         return False
+    await _reset_for_new_desktop_run(message)
     setattr(websocket, VISIT_SOCKET_BOUND_ATTR, True)
     _delivered(websocket)
     from main_routers.visit_router import runtime
@@ -374,6 +475,12 @@ async def end_visits_with_peer(peer_uid: str) -> int:
 
 
 def _reset_for_tests() -> None:
+    global _desktop_run_id, _desktop_run_lock, _desktop_run_reset_task
     for task in list(_replays):
         task.cancel()
     _replays.clear()
+    _desktop_run_id = None
+    _desktop_run_lock = None
+    if _desktop_run_reset_task is not None and not _desktop_run_reset_task.done():
+        _desktop_run_reset_task.cancel()
+    _desktop_run_reset_task = None

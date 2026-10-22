@@ -1334,6 +1334,8 @@ def test_compact_choice_hit_contract_uses_real_options_only():
 
 def test_desktop_compact_choice_placement_uses_surface_anchor_without_frame_polling():
     app_source = REACT_CHAT_APP_PATH.read_text(encoding="utf-8")
+    styles = REACT_CHAT_STYLES_PATH.read_text(encoding="utf-8")
+    host_styles = STATIC_INDEX_CSS_PATH.read_text(encoding="utf-8")
 
     placement_effect = app_source.split("if (!compactChoiceLayerOpen) return;", 1)[1].split(
         "const requestCompactChatState = useCallback",
@@ -1347,6 +1349,61 @@ def test_desktop_compact_choice_placement_uses_surface_anchor_without_frame_poll
     assert "schedulePlacementUpdateWithDesktopLayout(layout);" in placement_effect
     assert "requestAnimationFrame(trackPlacement)" not in placement_effect
     assert "const trackPlacement = () =>" not in placement_effect
+
+    above_choice = styles.split(
+        'body > .compact-chat-choice-anchor[data-chat-surface-mode="compact"][data-compact-choice-placement="above"]',
+        1,
+    )[1].split(
+        'body > .compact-chat-choice-anchor[data-chat-surface-mode="compact"][data-compact-choice-placement="below"]',
+        1,
+    )[0]
+    assert "--compact-visit-layer-reserved-block-size" in above_choice
+    choice_base = styles.split(
+        'body > .compact-chat-choice-anchor[data-chat-surface-mode="compact"]',
+        1,
+    )[1].split(
+        'body > .compact-chat-choice-anchor[data-chat-surface-mode="compact"]::-webkit-scrollbar',
+        1,
+    )[0]
+    assert "--compact-choice-available-block-size" in choice_base
+    desktop_selector = 'body.electron-chat-window.subtitle-web-host > .compact-chat-choice-anchor[data-chat-surface-mode="compact"] {'
+    assert "var(--compact-choice-available-block-size, 240px)" in css_block(
+        styles,
+        desktop_selector,
+        "/* 串门工具条使用独立 Portal",
+    )
+    assert "var(--compact-choice-available-block-size, 240px)" in css_block(
+        host_styles,
+        desktop_selector,
+        'body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]',
+    )
+    assert "const requiredAbove = layerHeight + gap + visitReserve;" in placement_effect
+    assert "availableAbove - gap - visitReserve" in placement_effect
+
+
+def test_compact_visit_geometry_separates_visual_container_from_button_hits():
+    script = APP_REACT_CHAT_WINDOW_PATH.read_text(encoding="utf-8")
+    collector = script.split("function collectCompactVisitGeometryItems(element)", 1)[1].split(
+        "function collectCompactCompositeGeometryItems(element, kind)",
+        1,
+    )[0]
+    surface = script.split("function collectCompactSurfaceGeometryItems()", 1)[1].split(
+        "function getCompactInteractionGeometrySnapshot()",
+        1,
+    )[0]
+
+    assert "var visualRect = normalizeCompactDomRect(element.getBoundingClientRect());" in collector
+    visual = collector.split("id: 'visit:visual'", 1)[1].split("interactive: false", 1)[0]
+    assert "visualRect: visualRect" in visual
+    assert "hitRect: null" in visual and "nativeRect: null" in visual
+    assert "querySelectorAll('.composer-visit-bar-action')" in collector
+    action = collector.split("id: child.getAttribute('data-visit-bar-action')", 1)[1].split(
+        "interactive: true",
+        1,
+    )[0]
+    assert "hitRect: rect" in action and "nativeRect: rect" in action
+    assert "if (compactGeometryItem === 'visit')" in surface
+    assert "collectCompactVisitGeometryItems(element)" in surface
 
 
 def test_desktop_compact_history_hit_regions_are_clipped_to_visible_parent():

@@ -327,6 +327,8 @@ const report = {};
   // ── 输入：后端拒绝 → 按 request_id 标那一个气泡「未送达」并恢复文字 ──
   {
     const h = createHarness();
+    let geometryRefreshes = 0;
+    h.win.addEventListener('neko:compact-interaction-geometry-refresh', () => { geometryRefreshes += 1; });
     h.state('started');
     h.I.submitVisitChatText({ text: '第一句', requestId: 'r1' });
     h.I.submitVisitChatText({ text: '第二句', requestId: 'r2' });
@@ -345,7 +347,9 @@ const report = {};
     report.echo_claimed = h.messages.find((m) => m.id === 'visit-local-r1').blocks[0].text;
     report.echo_no_dup = h.lineMessage('H1') ? 1 : 0;
     // 收件人切到自家猫娘
+    const refreshesBeforeRecipientSwitch = geometryRefreshes;
     h.I.handleVisitBarAction('to_own');
+    report.recipient_switch_refreshed_hit_geometry = geometryRefreshes > refreshesBeforeRecipientSwitch;
     h.I.submitVisitChatText({ text: '给她的', requestId: 'r3' });
     report.recipient_own = h.sendCalls[h.sendCalls.length - 1].options.source;
   }
@@ -367,11 +371,12 @@ const report = {};
   {
     const routes = {};
     let previewStatus = 200;
+    let previewCode = '';
     let blocked = false;
     let joinReplies = [];
     routes['/api/visit/invites/*'] = async () => previewStatus === 200
       ? { status: 200, body: { visit_id: VID2, host_display_name: '邻居', host_short_code: 'ABCDEF', cross_region: true, expires_at: 9e9, locally_blocked: blocked } }
-      : { status: previewStatus, body: { code: previewStatus === 410 ? 'invite_expired' : 'invite_invalid' } };
+      : { status: previewStatus, body: { code: previewCode || (previewStatus === 410 ? 'invite_expired' : 'invite_invalid') } };
     routes['/api/visit/rooms/' + VID2 + '/join'] = async () => joinReplies.shift() || { status: 202, body: { ok: true } };
     const h = createHarness({ routes });
     let personaCalls = 0;
@@ -386,8 +391,18 @@ const report = {};
     await h.chat._test.joinWithCode('ABCDEFGH23');
     report.preview_fail_joins = h.fetches.filter((f) => f.url.indexOf('/join') !== -1).length;
     report.preview_fail_dialogs = h.dialogs().length;
+    // 额度预检失败：下一步后直接用全局横幅提示，不弹确认、不发 join。
+    previewStatus = 429;
+    previewCode = 'VISIT_QUOTA_EXCEEDED';
+    const quotaPreviewJoins = h.fetches.filter((f) => f.url.indexOf('/join') !== -1).length;
+    const quotaPreviewToasts = h.toasts.length;
+    await h.chat._test.joinWithCode('ABCDEFGH23');
+    report.quota_preview_joins = h.fetches.filter((f) => f.url.indexOf('/join') !== -1).length - quotaPreviewJoins;
+    report.quota_preview_dialogs = h.dialogs().length;
+    report.quota_preview_toasts = h.toasts.slice(quotaPreviewToasts);
     // 屏蔽：确认框没有「出门」按钮
     previewStatus = 200;
+    previewCode = '';
     blocked = true;
     const pending = h.chat._test.joinWithCode('ABCDEFGH23');
     await h.settle();
@@ -412,6 +427,16 @@ const report = {};
     report.persona_joins_before = personaJoinsBefore;
     const order = h.fetches.map((f) => f.url.indexOf('/preview') !== -1 ? 'preview' : (f.url.indexOf('/join') !== -1 ? 'join' : 'other'));
     report.order_after_confirm = order.slice(-3);
+    // 额度用完：复用全局状态横幅，不另造串门弹窗
+    joinReplies = [{ status: 429, body: { code: 'VISIT_QUOTA_EXCEEDED' } }];
+    const toastsBeforeQuota = h.toasts.length;
+    const p3 = h.chat._test.joinWithCode('ABCDEFGH23');
+    await h.settle();
+    const d3 = h.dialogs()[0];
+    h.buttonsOf(d3).find((b) => b.attrs['data-visit-dialog-button'] === 'go').click();
+    await p3;
+    report.quota_failure_dialogs = h.dialogs().length;
+    report.quota_failure_toasts = h.toasts.length - toastsBeforeQuota;
   }
   // ── 叫她回来：route/end 请求体逐字段 ──
   {
@@ -1027,18 +1052,27 @@ const report = {};
     report.snapshot_then_live_lines = h.messages.filter((m) => m.id.indexOf('visit-line-') === 0).length;
     report.snapshot_then_live_pending = h.chat._test.state().pending.length;
   }
-  // ── 等客时取消（pending → ending → ended）：不留查看详情 / 导出 / 举报 ──
+  // ── 等客时取消（后端不推 ending：pending → ended）：不留查看详情 / 导出 / 举报 ──
   {
     const h = createHarness();
     h.state('pending');
-    h.state('ending');
     h.state('ended');
+    report.cancel_before_start_phase_after_ended = h.chat._test.state().visit.phase;
     report.cancel_before_start_ended_message = h.messages.some((m) => m.id === 'visit-ended-' + VID);
+    // 漏收 started：ending 只推给已激活的场次，本身就算开始过
+    const h4 = createHarness();
+    h4.state('pending');
+    h4.state('ending');
+    h4.state('ended');
+    report.missed_started_ending_ended_message = h4.messages.some((m) => m.id === 'visit-ended-' + VID);
     const h2 = createHarness();
     h2.state('started');
     h2.state('ending');
     h2.state('ended');
     report.started_then_ended_message = h2.messages.some((m) => m.id === 'visit-ended-' + VID);
+    const h3 = createHarness();
+    h3.chat.applyState({ active: true, visit_id: VID, phase: 'ending', side: 'guest', room: null, transcript: [], enabled: true }, false);
+    report.unstarted_ending_snapshot_phase = h3.chat._test.state().visit.phase;
   }
   // ── ending 起输入框交还普通聊天：串门 ack 的会话标记在 ending 撤掉，之后起的真会话 ended 时不动 ──
   {
@@ -1290,6 +1324,106 @@ const report = {};
     const end = h.fetches.find((f) => f.url === '/api/visit/route/end');
     report.switched_join_end = end && end.body;
   }
+  // ── 页面漏了邀请帧：再次点击直接恢复原邀请码，不再 POST 新房间 ──
+  {
+    const currentUrl = '/api/visit/rooms/current?catgirl=%E5%92%AA%E5%92%AA';
+    const routes = {
+      [currentUrl]: async () => ({ status: 200, body: { visit_id: VID2, phase: 'invite_ready', invite_code: 'ABCDEFGH23', invite_expires_at: 9e9 } }),
+    };
+    const h = createHarness({ routes });
+    await h.chat._test.startInvite();
+    const state = h.chat._test.state().visit;
+    report.existing_invite_phase = state.phase;
+    report.existing_invite_code = state.inviteCode;
+    report.existing_invite_creates = h.fetches.filter((f) => f.url === '/api/visit/rooms' && f.method === 'POST').length;
+  }
+  // ── 恢复 GET 在途时收到更晚的 started 帧：旧响应不能让页面倒退 ──
+  {
+    const currentUrl = '/api/visit/rooms/current?catgirl=%E5%92%AA%E5%92%AA';
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const routes = {
+      [currentUrl]: async () => {
+        await gate;
+        return { status: 200, body: { visit_id: VID, phase: 'invite_ready', invite_code: 'ABCDEFGH23', invite_expires_at: 9e9 } };
+      },
+    };
+    const h = createHarness({ routes });
+    const pending = h.chat._test.startInvite();
+    await h.settle();
+    h.frame({ type: 'visit_state_change', action: 'started', visit_id: VID, side: 'host', ts: 1 });
+    release();
+    await pending;
+    const state = h.chat._test.state().visit;
+    report.stale_host_recovery_phase = state.phase;
+    report.stale_host_recovery_code = state.inviteCode;
+    report.stale_host_recovery_creates = h.fetches.filter((f) => f.url === '/api/visit/rooms' && f.method === 'POST').length;
+  }
+  // ── 新房间的 invite_ready 帧丢失：本机恢复接口轮询出原邀请码，不重复建房 ──
+  {
+    const currentUrl = '/api/visit/rooms/current?catgirl=%E5%92%AA%E5%92%AA';
+    let probes = 0;
+    const routes = {
+      [currentUrl]: async () => {
+        probes += 1;
+        if (probes === 1) return { status: 404, body: { error: 'no_pending_invite' } };
+        return { status: 200, body: { visit_id: VID2, phase: 'invite_ready', invite_code: 'QWERTYUI23', invite_expires_at: 9e9 } };
+      },
+      '/api/visit/rooms': async () => ({ status: 202, body: { visit_id: VID2, phase: 'pending' } }),
+    };
+    const h = createHarness({ routes });
+    await h.chat._test.startInvite();
+    report.created_invite_initial_phase = h.chat._test.state().visit.phase;
+    h.advance(300);
+    await h.settle();
+    const state = h.chat._test.state().visit;
+    report.created_invite_recovered_phase = state.phase;
+    report.created_invite_recovered_code = state.inviteCode;
+    report.created_invite_creates = h.fetches.filter((f) => f.url === '/api/visit/rooms' && f.method === 'POST').length;
+  }
+  // ── POST 在途先到 pending 帧：仍要安排邀请码恢复，不能因响应已旧而永久等候 ──
+  {
+    const currentUrl = '/api/visit/rooms/current?catgirl=%E5%92%AA%E5%92%AA';
+    let probes = 0;
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const routes = {
+      [currentUrl]: async () => {
+        probes += 1;
+        if (probes === 1) return { status: 404, body: { error: 'no_pending_invite' } };
+        return { status: 200, body: { visit_id: VID2, phase: 'invite_ready', invite_code: 'ZXCVBNMA23', invite_expires_at: 9e9 } };
+      },
+      '/api/visit/rooms': async () => { await gate; return { status: 202, body: { visit_id: VID2, phase: 'pending' } }; },
+    };
+    const h = createHarness({ routes });
+    const pending = h.chat._test.startInvite();
+    await h.settle();
+    h.frame({ type: 'visit_state_change', action: 'pending', visit_id: VID2, side: 'host', ts: 1 });
+    release();
+    await pending;
+    h.advance(300);
+    await h.settle();
+    const state = h.chat._test.state().visit;
+    report.pending_before_create_recovered_phase = state.phase;
+    report.pending_before_create_recovered_code = state.inviteCode;
+    report.pending_before_create_count = h.fetches.filter((f) => f.url === '/api/visit/rooms' && f.method === 'POST').length;
+  }
+  // ── 恢复接口 404：用权威 state 收掉已结束场次，不能永远停在等待邀请码 ──
+  {
+    const currentUrl = '/api/visit/rooms/current?catgirl=%E5%92%AA%E5%92%AA';
+    const stateUrl = '/api/visit/state?catgirl=%E5%92%AA%E5%92%AA';
+    const routes = {
+      [currentUrl]: async () => ({ status: 404, body: { error: 'no_pending_invite' } }),
+      [stateUrl]: async () => ({ status: 200, body: { enabled: true, active: false } }),
+      '/api/visit/rooms': async () => ({ status: 202, body: { visit_id: VID2, phase: 'pending' } }),
+    };
+    const h = createHarness({ routes });
+    await h.chat._test.startInvite();
+    h.advance(300);
+    await h.settle();
+    report.missing_current_reconciled_visit = h.chat._test.state().visit.visitId;
+    report.missing_current_state_probes = h.fetches.filter((f) => f.url === stateUrl).length;
+  }
   // ── 建房在途时换了角色：后端收下的那一场同样立刻硬结束 ──
   {
     let release;
@@ -1479,6 +1613,7 @@ def test_backend_refusal_marks_that_bubble_and_restores_the_text(report):
     assert report["echo_claimed"] == "第一句（清洗后）"
     assert report["echo_no_dup"] == 0
     assert report["recipient_own"] == "neko_visit:own_cat"
+    assert report["recipient_switch_refreshed_hit_geometry"] is True
 
 
 def test_guest_side_and_wrap_up_refuse_but_ending_does_not_take_input(report):
@@ -1489,6 +1624,8 @@ def test_guest_side_and_wrap_up_refuse_but_ending_does_not_take_input(report):
 
 def test_preview_comes_first_and_failures_never_join(report):
     assert report["preview_fail_joins"] == 0 and report["preview_fail_dialogs"] == 0
+    assert report["quota_preview_joins"] == 0 and report["quota_preview_dialogs"] == 0
+    assert report["quota_preview_toasts"] == ["今天的串门时间用完了"]
     assert report["blocked_buttons"] == ["cancel"]
     assert "你已屏蔽此人" in report["blocked_text"]
     # The confirmation contains only a display name, short code, and cross-region notice, without technical numbers.
@@ -1501,7 +1638,13 @@ def test_persona_409_is_confirmed_before_the_single_retry(report):
     assert report["persona_calls"] == 1
     assert report["persona_joins_before"] == 1       # After the first join returns 409, before retry.
     assert report["join_count"] == 2
-    assert report["join_body"] == {"catgirl": "咪咪", "invite_code": "ABCDEFGH23", "confirm": True}
+    assert report["join_body"] == {"catgirl": "咪咪", "invite_code": "ABCDEFGH23", "confirm": True,
+                                   "crop": "full"}
+
+
+def test_guest_quota_exhaustion_reuses_the_global_status_banner(report):
+    assert report["quota_failure_dialogs"] == 0
+    assert report["quota_failure_toasts"] == 1
 
 
 def test_recall_posts_the_route_end_body_and_toasts_recall_already(report):
@@ -1545,7 +1688,7 @@ def test_reload_mid_visit_binds_active_and_idle_binds_inactive(report):
     assert report["reload_pacer_armed"] is True
     assert report["reload_chat_phase"] == "active"
     assert report["idle_active"] is False
-    assert report["idle_bar_entry"] == ["entry"]
+    assert report["idle_bar_entry"] == ["invite", "go"]
 
 
 def test_a_later_submission_keeps_an_old_refused_text_out_of_the_composer(report):
@@ -1734,6 +1877,9 @@ def test_live_final_after_snapshot_claims_and_removes_the_local_bubble(report):
 
 
 def test_cancel_before_start_leaves_no_ended_message(report):
+    assert report["cancel_before_start_phase_after_ended"] is None
+    assert report["missed_started_ending_ended_message"] is True
+    assert report["unstarted_ending_snapshot_phase"] is None
     assert report["cancel_before_start_ended_message"] is False
     assert report["started_then_ended_message"] is True
 
@@ -1848,6 +1994,36 @@ def test_room_created_after_a_character_switch_is_ended(report):
     end = report["switched_create_end"]
     assert end is not None
     assert end["lanlan_name"] == "咪咪" and end["reason"] == "route_end" and end["visit_id"]
+
+
+def test_clicking_invite_restores_the_existing_code_without_creating_another_room(report):
+    assert report["existing_invite_phase"] == "invite_ready"
+    assert report["existing_invite_code"] == "ABCDEFGH23"
+    assert report["existing_invite_creates"] == 0
+
+
+def test_late_host_recovery_reply_does_not_overwrite_a_newer_socket_phase(report):
+    assert report["stale_host_recovery_phase"] == "active"
+    assert report["stale_host_recovery_code"] in (None, "")
+    assert report["stale_host_recovery_creates"] == 0
+
+
+def test_a_new_room_recovers_its_code_when_the_ready_frame_is_missed(report):
+    assert report["created_invite_initial_phase"] == "pending"
+    assert report["created_invite_recovered_phase"] == "invite_ready"
+    assert report["created_invite_recovered_code"] == "QWERTYUI23"
+    assert report["created_invite_creates"] == 1
+
+
+def test_pending_frame_before_create_reply_still_recovers_the_invite_code(report):
+    assert report["pending_before_create_recovered_phase"] == "invite_ready"
+    assert report["pending_before_create_recovered_code"] == "ZXCVBNMA23"
+    assert report["pending_before_create_count"] == 1
+
+
+def test_missing_current_invite_reconciles_authoritative_visit_state(report):
+    assert report["missing_current_reconciled_visit"] in (None, "")
+    assert report["missing_current_state_probes"] == 1
 
 
 def test_self_line_recipient_uses_the_lines_own_side(report):
