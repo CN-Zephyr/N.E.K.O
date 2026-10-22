@@ -5201,6 +5201,38 @@ function CompactChatApp({
     syncCompactInputToolWheelPointerHover();
   }, [syncCompactInputToolWheelPointerHover]);
 
+  useEffect(() => {
+    if (!isCompactSurface || composerHidden) return undefined;
+    const handleHoverMove = (event: PointerEvent | MouseEvent) => {
+      if (compactToolOriginDragRef.current || !compactInputToolFanOpenRef.current) return;
+      if ('pointerType' in event && event.pointerType && event.pointerType !== 'mouse') return;
+      // 触屏抬手后 Chromium 会补发没有 pointerType 的 mousemove，坐标仍在刚点过的按钮上。
+      const touchCompatMouse = !('pointerType' in event)
+        && Boolean((event as MouseEvent & {
+          sourceCapabilities?: { firesTouchEvents?: boolean };
+        }).sourceCapabilities?.firesTouchEvents);
+      if (touchCompatMouse) return;
+      recordCompactInputToolWheelPointerPosition(event.clientX, event.clientY);
+      syncCompactInputToolWheelPointerHover({
+        clientX: event.clientX,
+        clientY: event.clientY,
+      });
+    };
+    // 触摸输入层盖住轮盘时，未按下的移动常常只以 mousemove 进页面，而且打不中
+    // pointer-events:none 的轮盘节点。气泡只认几何悬停，所以在 window 上补记。
+    window.addEventListener('pointermove', handleHoverMove, true);
+    window.addEventListener('mousemove', handleHoverMove, true);
+    return () => {
+      window.removeEventListener('pointermove', handleHoverMove, true);
+      window.removeEventListener('mousemove', handleHoverMove, true);
+    };
+  }, [
+    composerHidden,
+    isCompactSurface,
+    recordCompactInputToolWheelPointerPosition,
+    syncCompactInputToolWheelPointerHover,
+  ]);
+
   const forwardCompactToolWheelBackgroundClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (event.defaultPrevented || event.button !== 0) return;
     const eventTarget = event.target instanceof Element ? event.target : null;
@@ -5372,7 +5404,14 @@ function CompactChatApp({
         handleCompactInputToolHoverEnter(event);
       }}
       onPointerLeave={(event) => {
-        clearCompactInputToolWheelPointerHover();
+        if (event.pointerType === 'mouse') {
+          // 鼠标命中测试离开轮盘时，指针可能仍停在视觉按钮上。按坐标重算，避免气泡被清掉。
+          recordCompactInputToolWheelPointerPosition(event.clientX, event.clientY);
+          syncCompactInputToolWheelPointerHover({ clientX: event.clientX, clientY: event.clientY });
+        } else {
+          // 触屏抬手的 pointerleave 坐标仍落在刚点过的按钮上，按坐标重算会把气泡挂住。
+          clearCompactInputToolWheelPointerHover();
+        }
         handleCompactInputToolHoverLeave(event);
       }}
       onFocus={() => {

@@ -5183,7 +5183,7 @@ body.electron-chat-window.subtitle-web-host .compact-export-history-anchor.is-th
   overflow: hidden;
   text-overflow: ellipsis;
   opacity: 0;
-  pointer-events: none;
+  pointer-events: none !important;
   user-select: none;
   transform: translate(-2px, 1px) scale(0.98);
   transition: opacity 0.12s ease, transform 0.12s ease;
