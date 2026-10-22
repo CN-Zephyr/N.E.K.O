@@ -166,14 +166,26 @@
     function createMusicPlaybackReportContext(playbackId, options, track, token) {
         options = options || {};
         track = track || {};
+        const previousContext = localPlayer && localPlayer._musicPlaybackReportContext;
+        if (previousContext && previousContext.recommendationId && (
+            previousContext.playbackId !== playbackId
+            || previousContext.recommendationId !== (options.recommendationId || '')
+        )) {
+            reportRecommendationPlaybackState('stopped', previousContext, 'replaced');
+        }
         return {
             playbackId: playbackId || '',
             token: token,
             lifecycleStartedAt: getMusicLifecycleTimestamp(),
             mediaReady: false,
+            playbackStarted: false,
+            getCancellationReason: options.getCancellationReason,
             source: typeof options.source === 'string' ? options.source.slice(0, 16) : '',
             hasNextCandidate: options.hasNextCandidate === true,
             failureUiHandled: false,
+            recommendationId: typeof options.recommendationId === 'string' ? options.recommendationId : '',
+            recommendationPlaybackId: options.recommendationId ? MUSIC_COORD_SENDER_ID + ':' + String(token) : '',
+            listenedSeconds: 0,
             url: String(track.url || ''),
             track: {
                 name: String(track.name || '').slice(0, 120),
@@ -182,7 +194,36 @@
         };
     }
 
+    function reportRecommendationPlaybackState(state, evidenceContext, failureReason) {
+        try {
+            // Recommendation evidence is independent of the conversational socket.
+            // Only the owning player carries this immutable recommendation id.
+            if (evidenceContext && evidenceContext.recommendationId && window.nekoMusicRecommendations) {
+                if (['ended', 'stopped', 'failed'].includes(evidenceContext.recommendationLastState)) return;
+                const audio = localPlayer && localPlayer.audio;
+                const kind = state === 'error' ? 'failed'
+                    : state === 'ended' && audio && !audio.ended ? 'stopped' : state;
+                let listened = 0;
+                const played = audio && audio.played;
+                if (played) {
+                    for (let i = 0; i < played.length; i++) listened += Math.max(0, played.end(i) - played.start(i));
+                }
+                evidenceContext.listenedSeconds = Math.min(86400, Math.max(evidenceContext.listenedSeconds, listened));
+                evidenceContext.recommendationLastState = kind;
+                window.nekoMusicRecommendations.recordPlayback(evidenceContext.recommendationId, kind, {
+                    playback_id: evidenceContext.recommendationPlaybackId,
+                    listened_seconds: evidenceContext.listenedSeconds,
+                    position_seconds: audio && Number.isFinite(audio.currentTime) ? Math.min(86400, Math.max(0, audio.currentTime)) : 0,
+                    reason: String(failureReason || '').slice(0, 64)
+                });
+            }
+        } catch (_) {
+            console.warn('[Music recommendation] Playback evidence could not be recorded');
+        }
+    }
+
     function reportMusicPlaybackState(state, track, playbackContext, failureReason) {
+        reportRecommendationPlaybackState(state, playbackContext, failureReason);
         try {
             const appState = window.appState;
             const socket = appState && appState.socket;
@@ -389,6 +430,26 @@
     // 不走 'neko_music_coord' 是为了职责分离：那个 channel 仅用于
     // "谁在播音乐/是否占用"的互斥协调，这里是 UI 层消息镜像，语义不同。
     const CHAT_MIRROR_CHANNEL_NAME = 'neko_chat_ui_mirror';
+    function applyChatMirror(data) {
+        if (!data || typeof data !== 'object') return;
+        if (data.target && data.target !== MUSIC_COORD_SENDER_ID) return;
+        if (data.type === 'recommendation_request' || data.type === 'recommendation_snapshot' || data.type === 'recommendation_reset') {
+            window.dispatchEvent(new CustomEvent('neko:chat-mirror', { detail: data }));
+            return;
+        }
+        const host = window.reactChatWindowHost;
+        if (!host) return;
+        try {
+            if (data.type === 'append' && typeof host.appendMessage === 'function' && data.message) {
+                host.appendMessage(data.message);
+            } else if (data.type === 'update' && typeof host.updateMessage === 'function' && data.messageId) {
+                host.updateMessage(data.messageId, data.patch || {});
+            } else return;
+            window.dispatchEvent(new CustomEvent('neko:chat-mirror', { detail: data }));
+        } catch (e) {
+            console.warn('[Music UI] 镜像 React chat 消息失败:', e);
+        }
+    }
     let chatMirrorChannel = null;
     try {
         if (typeof BroadcastChannel !== 'undefined') {
@@ -397,17 +458,7 @@
                 const data = event && event.data;
                 if (!data || typeof data !== 'object') return;
                 if (!data.sender || data.sender === MUSIC_COORD_SENDER_ID) return;
-                const host = window.reactChatWindowHost;
-                if (!host) return;
-                try {
-                    if (data.type === 'append' && typeof host.appendMessage === 'function' && data.message) {
-                        host.appendMessage(data.message);
-                    } else if (data.type === 'update' && typeof host.updateMessage === 'function' && data.messageId) {
-                        host.updateMessage(data.messageId, data.patch || {});
-                    }
-                } catch (e) {
-                    console.warn('[Music UI] 镜像 React chat 消息失败:', e);
-                }
+                applyChatMirror(data);
             };
             window.addEventListener('pagehide', (event) => {
                 if (event.persisted) return;
@@ -421,11 +472,16 @@
     }
 
     const broadcastChatMirror = (payload) => {
+        if (getMusicIpcBridge()) {
+            postMusicPlayerBridgeEvent('chat_mirror', payload);
+            return;
+        }
         if (!chatMirrorChannel) return;
         try {
             chatMirrorChannel.postMessage(Object.assign({ sender: MUSIC_COORD_SENDER_ID, ts: Date.now() }, payload));
         } catch (_) { /* ignore */ }
     };
+    window.__nekoBroadcastChatMirror = broadcastChatMirror;
 
     // 对外暴露的"本地 append + 广播镜像"两合一 helper —— 供 app-proactive.js
     // 等下游在想让一条消息同时落到所有窗口的 React chat 时使用。
@@ -544,6 +600,12 @@
         if (remoteTs && currentMusicOwnerStartedAt && remoteTs < currentMusicOwnerStartedAt) return false;
 
         // A newer remote owner wins; remove the local owner bar immediately so a mirror can replace it.
+        // Persist the old owner's final listening interval before cleanup revokes its context.
+        // This handoff does not use fullTeardown and must not depend on the chat socket.
+        const previousContext = localPlayer && localPlayer._musicPlaybackReportContext;
+        if (previousContext && ['playing', 'paused'].includes(previousContext.recommendationLastState)) {
+            reportRecommendationPlaybackState('stopped', previousContext, 'replaced');
+        }
         destroyMusicPlayer(true, false, true);
         return true;
     }
@@ -1569,7 +1631,10 @@
         if (!sender || sender === MUSIC_COORD_SENDER_ID) return false;
         const payload = event.payload || {};
         try {
-            if (event.type === 'coord') {
+            if (event.type === 'chat_mirror') {
+                applyChatMirror(Object.assign({}, payload, { sender }));
+                return true;
+            } else if (event.type === 'coord') {
                 if (payload.coordType === 'request_state') {
                     // 晚加入的窗口请求当前 owner 状态：我是 owner 就立即补发一帧 bar_state，
                     // 让它无需等下一次 timeupdate / 心跳就能镜像出播放器条。
@@ -2284,7 +2349,8 @@
         if (
             fullTeardown
             && terminalReportContext
-            && ['playing', 'paused'].includes(terminalReportContext.lastReportedState)
+            && (['playing', 'paused'].includes(terminalReportContext.lastReportedState)
+                || ['playing', 'paused'].includes(terminalReportContext.recommendationLastState))
         ) {
             reportMusicPlaybackState('ended', null, terminalReportContext);
         }
@@ -2431,6 +2497,8 @@
 
     const executePlayCore = async (trackInfo, currentToken, shouldAutoPlay = true, playbackOptions = {}) => {
         if (currentToken !== latestMusicRequestToken) return musicPlayResult(false, 'superseded');
+        const cancellationReason = getMusicPlaybackCancellationReason(playbackOptions);
+        if (cancellationReason) return musicPlayResult(false, cancellationReason);
 
         // 清除可能的自动销毁与 DOM 移除定时器
         if (autoDestroyTimer) {
@@ -2548,6 +2616,17 @@
             trackInfo,
             currentToken
         );
+        const cancelBeforePlayback = (reportFailure = false) => {
+            const reason = playbackReportContext.playbackStarted ? '' : getMusicPlaybackCancellationReason(playbackOptions);
+            if (!reason) return null;
+            // Never release a successor's player, bar, or readiness waiter.
+            if (currentToken === latestMusicRequestToken && currentMusicPlaybackId === playbackIdForRequest) {
+                if (reportFailure) reportMusicPlaybackFailureIfNeeded(playbackReportContext, reason, false);
+                if (pendingMusicMediaReadyCancel) pendingMusicMediaReadyCancel();
+                destroyMusicPlayer(true, false, false);
+            }
+            return musicPlayResult(false, reason);
+        };
         currentMusicOwnerStartedAt = Date.now();
         currentPlayingTrack = trackInfo;
         // 广播一次占位 state —— APlayer 还在初始化/切曲，但 follower 现在
@@ -2653,7 +2732,7 @@
                     preload: shouldAutoPlay ? 'auto' : 'metadata',
                     // Playback starts below, only after validating this request.
                     autoplay: false,
-                    isCurrentRequest: () => currentToken === latestMusicRequestToken,
+                    isCurrentRequest: () => currentToken === latestMusicRequestToken && !getMusicPlaybackCancellationReason(playbackOptions),
                     mutex: true, volume: MUSIC_CONFIG.defaultVolume,
                     listFolded: true, order: 'normal',
                     audio: [{ name: trackInfo.name, artist: trackInfo.artist, url: trackInfo.url, cover: displayCoverUrl }]
@@ -2665,14 +2744,14 @@
                 else
                     aplayerInstance = new window.APlayer(playerConfig);
 
-                if (currentToken !== latestMusicRequestToken) {
+                if (currentToken !== latestMusicRequestToken || getMusicPlaybackCancellationReason(playbackOptions)) {
                     releaseMusicPlayerInstance(aplayerInstance);
                     // 回滚：前面 emitBarInitialState 已经让 follower 建起占位
                     // bar，但现在请求被更新的 token 取代，我们不会再发权威
                     // state，得主动广播 destroyed 把占位 bar 摘掉，不然 follower
                     // 会卡在一条假 bar 直到被下一次 state 盖掉。
                     broadcastBarDestroyed(false, playbackIdForRequest);
-                    return musicPlayResult(false, 'superseded');
+                    return cancelBeforePlayback() || musicPlayResult(false, 'superseded');
                 }
                 if (!aplayerInstance) throw new Error("APlayer init failed");
 
@@ -2690,6 +2769,7 @@
                 boundPlayer.on('play', () => {
                     const reportContext = getOwnedMusicPlaybackReportContext(boundPlayer, 'playing');
                     if (!reportContext) return;
+                    reportContext.playbackStarted = true;
                     reportContext.mediaReady = true;
                     if (autoDestroyTimer) { clearTimeout(autoDestroyTimer); autoDestroyTimer = null; }
                     updatePlayBtnState(true);
@@ -3014,6 +3094,16 @@
                     // 使用闭包捕获当前的播放器引用
                     const boundPlayerForProxy = localPlayer;
                     localPlayer.audio.play = function () {
+                        const context = boundPlayerForProxy._musicPlaybackReportContext;
+                        const canceled = context && !context.playbackStarted && getMusicPlaybackCancellationReason(context);
+                        if (canceled) {
+                            if (localPlayer === boundPlayerForProxy && context.token === latestMusicRequestToken) {
+                                reportMusicPlaybackFailureIfNeeded(context, canceled, false);
+                                if (pendingMusicMediaReadyCancel) pendingMusicMediaReadyCancel();
+                                destroyMusicPlayer(true, false, false);
+                            }
+                            return Promise.resolve();
+                        }
                         // 捕获触发播放时的 token
                         const tokenAtPlay = latestMusicRequestToken;
                         const pp = originalPlay.call(this);
@@ -3053,6 +3143,7 @@
                         // 【核心修复】增加 token 校验，且交互后移除监听
                         // 如果在点击之前，用户已经切换到了新的请求，或者播放器已销毁，则不执行旧的播放操作
                         if (tokenAtProxy === latestMusicRequestToken && bPlayer && bPlayer.audio && bPlayer.audio.paused) {
+                            if (cancelBeforePlayback(true)) return;
                             console.log('[Music UI] 检测到用户交互，正在尝试通过代理触发延迟播放');
                             bPlayer.play();
                         }
@@ -3097,6 +3188,7 @@
                 setTimeout(() => {
                     // 【核心修复】延迟播放校验 Token，防止旧请求误触发新曲播放 (CodeRabbit 建议)
                     if (currentToken === latestMusicRequestToken && localPlayer && typeof localPlayer.play === 'function') {
+                        if (cancelBeforePlayback(true)) return;
                         localPlayer.play();
                     }
                 }, 100);
@@ -3108,6 +3200,10 @@
 
             const mediaResult = await mediaReadyPromise;
             if (currentToken !== latestMusicRequestToken) return musicPlayResult(false, 'superseded');
+            if (!['playing', 'paused'].includes(playbackReportContext.recommendationLastState)) {
+                const canceled = cancelBeforePlayback();
+                if (canceled) return canceled;
+            }
             if (!mediaResult.ok) {
                 localPlayer._loadError = true;
                 const deferFailureUi = shouldDeferCandidateFailureUi(playbackOptions, mediaResult.reason);
@@ -3141,6 +3237,8 @@
             return musicPlayResult(true, mediaResult.reason);
         } catch (err) {
             if (currentToken !== latestMusicRequestToken) return musicPlayResult(false, 'superseded');
+            const canceled = cancelBeforePlayback();
+            if (canceled) return canceled;
             console.error('[Music UI] 播放器处理异常:', err);
             reportMusicPlaybackFailureIfNeeded(playbackReportContext, 'player_error', false);
             updateMusicCard('error', currentPlayingTrack);
@@ -3171,8 +3269,13 @@
      * 向播放器发送播放请求 [Async Ready]
      * 如果 URL 暂时不在白名单中，会等待最多 500ms 以响应并行的插件注册
      */
+    const getMusicPlaybackCancellationReason = options => typeof options.getCancellationReason === 'function'
+        ? options.getCancellationReason() : '';
+
     window.sendMusicMessageDetailed = async function (trackInfo, shouldAutoPlay = true, playbackOptions = {}) {
         if (!trackInfo) return musicPlayResult(false, 'invalid_track', true);
+        const cancellationReason = getMusicPlaybackCancellationReason(playbackOptions);
+        if (cancellationReason) return musicPlayResult(false, cancellationReason);
 
         // 进入 dispatch 流水线就立即 +1 —— 让并发的 dispatchMusicPlay
         // 能在 isMusicPlaying() 还未变成 true 的"加载中"窗口里也识别到占用。
@@ -3222,6 +3325,12 @@
         if (currentToken !== latestMusicRequestToken) {
             releasePending();
             return musicPlayResult(false, 'superseded');
+        }
+
+        const canceledAfterAllowlist = getMusicPlaybackCancellationReason(playbackOptions);
+        if (canceledAfterAllowlist) {
+            releasePending();
+            return musicPlayResult(false, canceledAfterAllowlist);
         }
 
         if (trackInfo.url && isUnsupportedMusicStream(trackInfo.url)) {
@@ -3342,6 +3451,8 @@
 
         try {
             await loadAPlayerLibrary();
+            const canceled = getMusicPlaybackCancellationReason(playbackOptions);
+            if (canceled) return musicPlayResult(false, canceled);
             const result = await executePlay(trackInfo, currentToken, shouldAutoPlay, playbackOptions);
             if (!result.ok && currentToken === latestMusicRequestToken) {
                 destroyMusicPlayer(
@@ -3354,6 +3465,8 @@
             if (result.ok && shouldAutoPlay) showNowPlayingToast(trackInfo.name);
             return result;
         } catch (err) {
+            const canceled = getMusicPlaybackCancellationReason(playbackOptions);
+            if (canceled) return musicPlayResult(false, canceled);
             // 库加载失败同样需要校验 token，防止关闭后弹出报错
             if (currentToken === latestMusicRequestToken) {
                 console.error('[Music UI] 库加载失败:', err);
