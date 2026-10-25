@@ -800,6 +800,9 @@
 
     function renderLine(entry) {
         if (!isUiWindow()) return;
+        // 协议偶尔会在上游模型失败时收到空的 delta / final。空内容不是一条可见消息，
+        // 不应占出一个只有作者和时间的气泡；带“被打断”提示的空行仍保留提示。
+        if (relayCleanIsEmpty(entry.text) && !entry.truncated) return;
         var adapter = window.appChat;
         if (!adapter || typeof adapter.renderVisitLine !== 'function') return;
         var notice = entry.truncated ? t('visit.stream.truncated', '（被打断）') : '';
@@ -823,6 +826,13 @@
             replace: !!claimed
         });
         entry.rendered = true;
+    }
+
+    function removeRenderedLine(entry) {
+        if (!entry || !entry.rendered) return;
+        var host = getHost();
+        if (host && typeof host.removeMessage === 'function') host.removeMessage(entry.messageId);
+        entry.rendered = false;
     }
 
     function armStall(entry) {
@@ -870,6 +880,11 @@
         entry.text = String(frame.text || '');
         entry.truncated = frame.truncated === true;
         if (typing && frame.speaker && frame.speaker.name === typing.name) typing = null;
+        // authoritative final 为空时，撤掉此前 delta 形成的半截气泡；否则会留下“空回复”。
+        if (relayCleanIsEmpty(entry.text) && !entry.truncated) {
+            removeRenderedLine(entry);
+            return;
+        }
         renderLine(entry);
     }
 
@@ -989,7 +1004,14 @@
         if (visit.visitId && visit.visitId !== visitId && inVisit() && action !== 'pending' && action !== 'invite_ready') return;
         if (visit.visitId !== visitId) {
             // 漏收了上一场的 ended、新一场的 pending 先到：上一场照样留下结束消息、标掉还在等回显的本地气泡
-            if (visit.visitId && inVisit()) onEnded({ visit_id: visit.visitId, side: visit.side, reason: '' });
+            if (visit.visitId && inVisit()) {
+                var previousVisit = visit.visitId;
+                var previousSide = visit.side;
+                onEnded({ visit_id: previousVisit, side: previousSide, reason: '' });
+                // invite_ready 也可作为新场次的权威起点；先让显示端回收旧 iframe，
+                // 否则它会按旧 visit_id 丢掉稍后转发的新 invite_ready。
+                relayEndedToDisplay(previousVisit, previousSide);
+            }
             startNewVisit(visitId);
         }
         if (frame.side === 'host' || frame.side === 'guest') {
@@ -1031,6 +1053,9 @@
         case 'ended':
             onEnded(frame);
             render();
+            if (typeof window.nekoRelayVisitStateToDisplay === 'function') {
+                window.nekoRelayVisitStateToDisplay(frame);
+            }
             return;
         case 'pending':
         case 'joining':
@@ -1057,6 +1082,11 @@
             clearReconnectPoll();
         }
         render();
+        // Electron 多窗口里 /chat 往往是最新的主 WebSocket，而媒体 iframe
+        // 必须由 Pet 窗创建；把已经校验并应用的生命周期状态同步过去。
+        if (typeof window.nekoRelayVisitStateToDisplay === 'function') {
+            window.nekoRelayVisitStateToDisplay(frame);
+        }
     }
 
     function onEnded(frame) {
@@ -2325,6 +2355,45 @@
             ? phase : null;
     }
 
+    function relayEndedToDisplay(visitId, side) {
+        if (!visitId || typeof window.nekoRelayVisitStateToDisplay !== 'function') return;
+        window.nekoRelayVisitStateToDisplay({
+            type: 'visit_state_change', action: 'ended', visit_id: visitId, side: side || ''
+        });
+    }
+
+    function relayStateSnapshotToDisplay(state, visitId) {
+        if (!visitId || typeof window.nekoRelayVisitStateToDisplay !== 'function') return;
+        var phase = phaseFromState(state.phase);
+        if (!phase) return;
+        var frame = {
+            type: 'visit_state_change',
+            action: phase === 'active' ? 'started' : phase,
+            side: state.side || state.role || '',
+            visit_id: visitId
+        };
+        // GET /api/visit/state keeps the media layout on room.peer_crop.  Older
+        // snapshots used peer.crop, so retain that as a compatibility fallback.
+        var peerCrop = state.room && (state.room.peer_crop === 'upper' || state.room.peer_crop === 'full')
+            ? state.room.peer_crop
+            : (state.peer && (state.peer.crop === 'upper' || state.peer.crop === 'full') ? state.peer.crop : '');
+        if (peerCrop) frame.peer_crop = peerCrop;
+        window.nekoRelayVisitStateToDisplay(frame);
+        // 这一帧可能先于 Pet 窗自己的重载恢复建出 iframe，恢复随即作废，它本该套上的出门样式 / 对端显隐
+        // 也就没了：按后端 started → departed 的顺序补上出门，再按快照同步对端显隐（建 iframe 会清掉这两样，必须排在阶段帧之后）
+        if (frame.side === 'guest' && (phase === 'active' || phase === 'wrap_up')) {
+            window.nekoRelayVisitStateToDisplay({
+                type: 'visit_state_change', action: 'departed', side: frame.side, visit_id: visitId
+            });
+        }
+        if (state.peer && typeof state.peer.hidden === 'boolean') {
+            window.nekoRelayVisitStateToDisplay({
+                type: 'visit_state_change', action: state.peer.hidden ? 'peer_hidden' : 'peer_visible',
+                side: frame.side, visit_id: visitId
+            });
+        }
+    }
+
     // 快照里的对端信息与重载前的台词并进这一场；onlyFill：只填空缺字段（帧带来的更新不覆盖）
     function mergeSnapshotDetails(state, onlyFill) {
         var peer = state.peer;
@@ -2356,12 +2425,22 @@
             && endedVisitIds.indexOf(state.visit_id) === -1 ? state.visit_id : '';
         // 断线或页面重载时可能只读到激活前失败的 ending 快照；
         // 与实时帧一样直接回到初始入口，不复活一个从未开始的场次。
-        if (snapshotVisit && state.phase === 'ending' && !snapshotStarted(state)) {
+        var sameVisitEnding = visit.visitId === snapshotVisit;
+        if (snapshotVisit && state.phase === 'ending' && !snapshotStarted(state)
+            && (!stale || sameVisitEnding)) {
+            if (visit.visitId && visit.visitId !== snapshotVisit && inVisit()) {
+                var previousEndingVisit = visit.visitId;
+                var previousEndingSide = visit.side;
+                onEnded({ visit_id: previousEndingVisit, side: previousEndingSide, reason: '' });
+                relayEndedToDisplay(previousEndingVisit, previousEndingSide);
+            }
             if (visit.visitId === snapshotVisit) {
                 onEnded({ visit_id: snapshotVisit, side: state.side || state.role, reason: '' });
             } else {
                 markEnded(snapshotVisit);
             }
+            // 不先转发 ending：显示端会为它补建一个永远收不到 ended 的 iframe。
+            relayEndedToDisplay(snapshotVisit, state.side || state.role);
             render();
             return;
         }
@@ -2390,7 +2469,13 @@
         if (snapshotVisit) {
             if (visit.visitId !== snapshotVisit) {
                 // 断线期间别的窗口结束了这一场、又开了新一场：上一场照样留下结束消息、标掉还在等回显的本地气泡
-                if (inVisit()) onEnded({ visit_id: visit.visitId, side: visit.side, reason: '' });
+                if (inVisit()) {
+                    var previousVisit = visit.visitId;
+                    var previousSide = visit.side;
+                    onEnded({ visit_id: previousVisit, side: previousSide, reason: '' });
+                    // 显示端必须先退掉旧 iframe，之后才会接受没有 pending 的新场次快照。
+                    relayEndedToDisplay(previousVisit, previousSide);
+                }
                 startNewVisit(snapshotVisit);
             }
             visit.side = state.side || state.role || visit.side;
@@ -2403,9 +2488,18 @@
             visit.ownName = currentCatgirl();
             mergeSnapshotDetails(state, false);
             if (visit.reconnecting) pollReconnect();
+            // 实时 pending 可能正好落在 Pet / chat WebSocket 换手的空窗；本地场次完成
+            // 收口 / 切换后再同步权威快照，确保显示端不会因旧 visit_id 而丢弃它。
+            relayStateSnapshotToDisplay(state, snapshotVisit);
         } else if (inVisit() && (state.active !== true || state.visit_id !== visit.visitId)) {
             // 断线期间那一场已经结束、ended 帧没收到：走与 ended 帧同一个收尾（留下查看详情 / 导出 / 举报）
-            onEnded({ visit_id: visit.visitId, side: visit.side, reason: '' });
+            var endedVisit = visit.visitId;
+            var endedSide = visit.side;
+            onEnded({ visit_id: endedVisit, side: endedSide, reason: '' });
+            relayEndedToDisplay(endedVisit, endedSide);
+        } else if (state.active !== true && typeof state.visit_id === 'string' && state.visit_id) {
+            // 页面本地状态已经空了，Pet 窗仍可能留着重载前的 iframe；权威空闲快照照样负责回收。
+            relayEndedToDisplay(state.visit_id, state.side || state.role);
         }
         render();
     }

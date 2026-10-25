@@ -163,6 +163,7 @@ function getCompactHistoryMessageClassName(message: ChatMessage, selected: boole
   return clsx('compact-export-history-message', {
     'is-user': message.role === 'user',
     'is-assistant': message.role === 'assistant' || message.role === 'tool',
+    'is-visit-peer': message.role === 'tool',
     'is-system': message.role === 'system',
     'is-selected': selected,
     'is-unselected': hasSelection && selectable && !selected,
@@ -175,7 +176,8 @@ function getCompactHistoryMessageClassName(message: ChatMessage, selected: boole
 function getCompactHistoryRoleGroup(message?: ChatMessage) {
   if (!message) return 'none';
   if (message.role === 'user') return 'user';
-  if (message.role === 'assistant' || message.role === 'tool') return 'assistant';
+  if (message.role === 'tool') return 'visit-peer';
+  if (message.role === 'assistant') return 'assistant';
   return 'system';
 }
 
@@ -753,6 +755,7 @@ export default function CompactExportHistoryPanel({
               className={clsx('compact-export-preview-message', {
                 'is-user': message.role === 'user',
                 'is-assistant': message.role === 'assistant' || message.role === 'tool',
+                'is-visit-peer': message.role === 'tool',
                 'is-system': message.role === 'system',
               })}
               role="listitem"

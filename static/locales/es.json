@@ -6937,6 +6937,7 @@
         },
         "persona": {
             "title": "Presentación para visitas",
+            "windowTitle": "Presentación para visitas - Project N.E.K.O.",
             "intro": "Es la presentación que lleva cuando va de visita. No incluye nada sobre ti. La otra chica gato puede verla y repetir su contenido.",
             "editHint": "Unas líneas sobre ella: personalidad, aficiones, forma de hablar",
             "loading": "Cargando…",
@@ -6957,7 +6958,7 @@
             "unavailable": "No se pudo cargar la presentación. Inténtalo más tarde",
             "unknownCatgirl": "No se encontró este personaje",
             "unreviewed": "Revisa primero su presentación; podrá ir de visita cuando la confirmes",
-            "sectionsOutdated": "Esta lista de partes privadas es de la ficha anterior al cambio; lo añadido después no aparece. Revísala tú"
+            "sectionsOutdated": "La ficha del personaje cambió después de la última revisión automática. Es posible que el contenido nuevo no se haya revisado; compruébalo tú"
         },
         "preview": {
             "invalid": "El código de invitación no es válido",
