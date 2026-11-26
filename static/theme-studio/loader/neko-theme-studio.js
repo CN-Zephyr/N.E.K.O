@@ -185,7 +185,8 @@
   //          outer wrappers stay transparent with materials off.)
   //   1.6.53 Removing the theme also clears data-nts-squircle; the upgrade
   //          reload also yields while images / screenshots are queued.
-  var SCRIPT_VERSION = '1.6.53';
+  //   1.6.54 Layer the material tint over the saved palette and its gradients.
+  var SCRIPT_VERSION = '1.6.54';
 
   // Allowed colour value shapes. Deliberately conservative: only plain colours, so
   // arbitrary CSS can never be injected into a variable.
@@ -1599,7 +1600,10 @@
     ':root[data-nts-mt]:root:root:root:root body.api-key-settings-page #main-content,',
     ':root[data-nts-mt]:root:root:root:root body.api-key-settings-page .container,',
     ':root[data-nts-mt]:root:root:root:root body .composer-icon-popover {',
-    '  background-color: var(--nts-mt-bg-c) !important;',
+    // Keep the host or palette's background-color. Paint the compiled component tint
+    // above it, with any authored gradient beneath the material effects.
+    '  --nts-mt-film: linear-gradient(var(--nts-mt-bg-c), var(--nts-mt-bg-c));',
+    '  --nts-mt-palette-image: none;',
     '  background-image:',
     '    var(--nts-mt-inner-img),',
     '    var(--nts-mt-inner2),',
@@ -1609,11 +1613,11 @@
     '    var(--nts-mt-noise-img),',
     '    var(--nts-mt-ambient-img),',
     '    linear-gradient(var(--nts-mt-refract-tint), var(--nts-mt-refract-tint)),',
-    '    var(--nts-mt-dye) !important;',
+    '    var(--nts-mt-dye), var(--nts-mt-film), var(--nts-mt-palette-image) !important;',
     '  background-size: auto, auto, auto, auto, auto, auto, var(--nts-mt-ambient-size) var(--nts-mt-ambient-size),',
-    '    var(--nts-mt-refract-size) var(--nts-mt-refract-size), var(--nts-mt-drift-size) !important;',
+    '    var(--nts-mt-refract-size) var(--nts-mt-refract-size), var(--nts-mt-drift-size), auto, auto !important;',
     '  background-repeat: no-repeat !important;',
-    '  background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50% !important;',
+    '  background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50%, 0 0, 0 0 !important;',
     '  border-style: solid !important;',
     '  border-color: var(--nts-mt-border) !important;',
     '  border-width: var(--nts-mt-bw-c) !important;',
@@ -1636,6 +1640,19 @@
     '              box-shadow var(--nts-mt-hover-duration) var(--nts-mt-easing) !important;',
     '}',
 
+    // Override the local reset on the base surfaces only for palette slots
+    // that paint an image. A nested bubble never inherits the panel gradient.
+    ':root[data-nts-mt] .compact-chat-surface-frame { --nts-mt-palette-image: var(--nts-panel-gradient, none) !important; }',
+    ':root[data-nts-mt] .message-list { --nts-mt-palette-image: var(--nts-chat-gradient, none) !important; }',
+    ':root[data-nts-mt] .message-bubble-user,',
+    ':root[data-nts-mt] .compact-export-history-message.is-user .compact-export-history-bubble {',
+    '  --nts-mt-palette-image: var(--nts-user-bubble-gradient, none) !important;',
+    '}',
+    ':root[data-nts-mt] .message-bubble-assistant,',
+    ':root[data-nts-mt] .compact-export-history-message.is-assistant .compact-export-history-bubble {',
+    '  --nts-mt-palette-image: var(--nts-ai-bubble-gradient, none) !important;',
+    '}',
+    '',
     '/* Backdrop blur only for containers without their own transform / filter; the shell / inner root / popovers / export bubbles are in the no-blur group below. */',
     ':root[data-nts-mt]:root:root:root:root body .compact-chat-surface-frame,',
     ':root[data-nts-mt]:root:root:root:root body .chat-window,',
@@ -1656,10 +1673,9 @@
     '  -webkit-backdrop-filter: blur(var(--nts-mt-blur-c)) saturate(var(--nts-mt-saturation)) brightness(var(--nts-mt-brightness)) contrast(1.03) !important;',
     '  backdrop-filter: blur(var(--nts-mt-blur-c)) saturate(var(--nts-mt-saturation)) brightness(var(--nts-mt-brightness)) contrast(1.03) !important;',
     '}',
-    '/* The chat window base colour actually lives on the inner root (the palette layer gives it a solid colour with !important);',
-    '   with materials on it steps aside so the glass can show through from the shell. */',
+    '/* The inner root keeps the saved chat colour; a material-only theme uses the compiled chat tint. */',
     ':root[data-nts-mt]:root:root:root:root:root body #react-chat-window-root {',
-    '  background-color: var(--nts-mt-bg-c, var(--nts-mt-bg)) !important;',
+    '  background-color: var(--nts-chat-bg, var(--nts-mt-c-bg-chat, var(--nts-mt-bg))) !important;',
     '  background-image: none !important;',
     '  -webkit-backdrop-filter: none !important;',
     '  backdrop-filter: none !important;',
@@ -1674,7 +1690,7 @@
     '}',
     '',
     '/* ---- Settings window (api_key_settings.html): where the panel "Settings" component lands ----',
-    '   It is merged into the base-surface rule above (same 9-layer background + full box-shadow),',
+    '   It is merged into the base-surface rule above (same layered background and full box-shadow),',
     '   so the settings window and the chat window are the same glass. Only the radius is removed separately:',
     '   a radius on a fullscreen window would clip content; .container still takes radius-c from the base surface. */',
 /* The message area is one large scrolling surface: behind it is the same window glass, so blur makes no
@@ -1744,7 +1760,7 @@
     ':root[data-nts-mt]:root:root body .composer-tool-btn,',
     ':root[data-nts-mt]:root:root body .send-button-circle,',
     ':root[data-nts-mt]:root:root body #sendButton {',
-    '  background-color: var(--nts-mt-c-bg-button, var(--nts-mt-bg)) !important;',
+    '  background-image: linear-gradient(var(--nts-mt-c-bg-button, var(--nts-mt-bg)), var(--nts-mt-c-bg-button, var(--nts-mt-bg))) !important;',
     '  -webkit-backdrop-filter: blur(var(--nts-mt-c-blur-button, var(--nts-mt-blur))) saturate(var(--nts-mt-saturation)) !important;',
     '  backdrop-filter: blur(var(--nts-mt-c-blur-button, var(--nts-mt-blur))) saturate(var(--nts-mt-saturation)) !important;',
     '  border: var(--nts-mt-c-border-width-button, var(--nts-mt-border-width)) solid var(--nts-mt-border) !important;',
@@ -1757,9 +1773,9 @@
     '',
     '/* ---- Motion: slow dye drift + ambient reflection sweep (none when --nts-mt-anim is off) ---- */',
     '@keyframes nts-mt-drift {',
-    '  0%   { background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50%; }',
-    '  50%  { background-position: 0 0, 0 0, 3% 3%, 0 0, center, 0 0, 0 0, 0 0, 100% 50%; }',
-    '  100% { background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50%; }',
+    '  0%   { background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50%, 0 0, 0 0; }',
+    '  50%  { background-position: 0 0, 0 0, 3% 3%, 0 0, center, 0 0, 0 0, 0 0, 100% 50%, 0 0, 0 0; }',
+    '  100% { background-position: 0 0, 0 0, 0 0, 0 0, center, 0 0, 0 0, 0 0, 0% 50%, 0 0, 0 0; }',
     '}',
     ':root[data-nts-mt] .compact-chat-surface-frame,',
     ':root[data-nts-mt] .chat-window {',
@@ -1814,12 +1830,12 @@
     '    background-image: linear-gradient(var(--nts-mt-bg-c), var(--nts-mt-bg-c)),',
     '      linear-gradient(var(--nts-mt-bg-c), var(--nts-mt-bg-c)),',
     '      var(--nts-mt-inner2), var(--nts-mt-sheen-img), var(--nts-mt-rim-img), var(--nts-mt-spot), var(--nts-mt-noise-img),',
-    '      var(--nts-mt-dye) !important;',
-    // The fallback has 8 layers and must carry its own size/position: otherwise it
-    // inherits the main rule's 9 values, the noise gets ambient-size (stretched into
+    '      var(--nts-mt-dye), var(--nts-mt-palette-image) !important;',
+    // The fallback has 9 layers and must carry its own size/position: otherwise it
+    // inherits the main rule's layer sizes, the noise gets ambient-size (stretched into
     // blotches) and the dye loses drift-size (stops drifting).
-    '    background-size: auto, auto, auto, auto, auto, auto, auto, var(--nts-mt-drift-size) !important;',
-    '    background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0% 50% !important;',
+    '    background-size: auto, auto, auto, auto, auto, auto, auto, var(--nts-mt-drift-size), auto !important;',
+    '    background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0% 50%, 0 0 !important;',
     '  }',
     '}',
     '',
