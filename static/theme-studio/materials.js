@@ -4,12 +4,14 @@
    and the compiled variables come from the backend compile_materials, so the
    frontend never duplicates the formulas (preview and app window can't drift).
    Public API on window.NekoMaterials:
-     mount(root)     render the shell (#materials-root in index.html)
-     sync(palette)   sync current/baseline after get_theme returns, then redraw
-     snapshot()      full current material settings snapshot (for save comparison)
-     submitPayload() apply payload with only added/modified custom_presets
-     isDirty()       whether there are unapplied material edits
-     resetLocal()    drop local edits and return to the baseline
+     mount(root)          render the shell (#materials-root in index.html)
+     sync(palette)        sync current/baseline after get_theme returns, then redraw
+     snapshot()           full current material settings snapshot (for save comparison)
+     submitPayload()      apply payload with only added/modified custom_presets
+     isDirty()            whether there are unapplied material edits
+     resetLocal()         drop local edits and return to the baseline
+     isPresetOpPending()  whether a saved preset delete/rename/duplicate is in flight
+     whenPresetOpIdle()   promise resolving once any in-flight preset op settles
 */
 (function () {
   'use strict';
@@ -40,6 +42,8 @@
   // buttons stay disabled until it settles: until then BASELINE does not know the new
   // state, so a second action would misjudge which presets are saved.
   var presetOpPending = false;
+  var presetOpPromise = null;
+  var BASELINE_GEN = 0;
   var MODE = 'light';       // editing light / dark
   var BG_MODE = 'dark';     // preview wallpaper: dark wallpaper / light wallpaper
   var BG_TOUCHED = false;   // once the user flips the wallpaper, stop following the edit mode
@@ -780,6 +784,20 @@
         CURRENT.custom_presets[name] = clone(next[name]);
       }
     });
+    // Preserve server key order for shared entries so JSON.stringify-based same()
+    // never flags false dirty state due to key insertion ordering alone.
+    var ordered = {};
+    Object.keys(next).forEach(function (name) {
+      if (HAS.call(CURRENT.custom_presets, name)) {
+        ordered[name] = CURRENT.custom_presets[name];
+      }
+    });
+    Object.keys(CURRENT.custom_presets).forEach(function (name) {
+      if (!HAS.call(ordered, name)) {
+        ordered[name] = CURRENT.custom_presets[name];
+      }
+    });
+    CURRENT.custom_presets = ordered;
   }
 
   /** Update BASELINE.custom_presets / preset from a preset-op response and reconcile untouched drafts. */
@@ -790,6 +808,38 @@
     BASELINE.custom_presets = clone(materials.custom_presets || {});
     BASELINE.preset = materials.preset || 'custom';
     reconcileUntouchedPresets(prevBasePresets, BASELINE.custom_presets);
+  }
+
+  /** Apply only the targeted preset delta to BASELINE when an intervening sync() superseded opGen. */
+  function applyTargetedBaselinePresetDelta(action, name, finalName, materials) {
+    if (!BASELINE) return;
+    if (!BASELINE.custom_presets || typeof BASELINE.custom_presets !== 'object') {
+      BASELINE.custom_presets = {};
+    }
+    var matPresets = (materials && materials.custom_presets && typeof materials.custom_presets === 'object')
+      ? materials.custom_presets : null;
+    if (action === 'delete') {
+      delete BASELINE.custom_presets[name];
+      if (BASELINE.preset === name) BASELINE.preset = 'custom';
+      return;
+    }
+    if (action === 'rename') {
+      if (HAS.call(BASELINE.custom_presets, name) || (matPresets && HAS.call(matPresets, finalName))) {
+        BASELINE.custom_presets[finalName] = (matPresets && HAS.call(matPresets, finalName))
+          ? clone(matPresets[finalName])
+          : clone(BASELINE.custom_presets[name]);
+      }
+      delete BASELINE.custom_presets[name];
+      if (BASELINE.preset === name) BASELINE.preset = finalName;
+      return;
+    }
+    if (action === 'duplicate') {
+      if (matPresets && HAS.call(matPresets, finalName)) {
+        BASELINE.custom_presets[finalName] = clone(matPresets[finalName]);
+      } else if (HAS.call(BASELINE.custom_presets, name)) {
+        BASELINE.custom_presets[finalName] = clone(BASELINE.custom_presets[name]);
+      }
+    }
   }
 
   /** Delete a custom preset: a dedicated entry persists it immediately (apply's merge semantics would re-add it). */
@@ -816,16 +866,16 @@
     var wasSelected = CURRENT.preset === name;
     if (CURRENT.custom_presets) delete CURRENT.custom_presets[name];
     if (wasSelected) CURRENT.preset = 'custom';
+    var opGen = BASELINE_GEN;
     setPresetOpPending(true);
-    callEntry('delete_material_preset', { name: name }).then(function (data) {
+    var op = callEntry('delete_material_preset', { name: name }).then(function (data) {
       var materials = (data && data.materials) || null;
       // The saved baseline follows the server (the delete is persisted), so remaining unapplied edits still show as pending.
       if (BASELINE) {
-        if (materials) {
+        if (materials && BASELINE_GEN === opGen) {
           syncPresetBaseline(materials);
         } else {
-          if (BASELINE.custom_presets) delete BASELINE.custom_presets[name];
-          if (BASELINE.preset === name) BASELINE.preset = 'custom';
+          applyTargetedBaselinePresetDelta('delete', name, name, materials);
         }
       }
       markDirty();
@@ -846,7 +896,11 @@
       toast(T('materials.toast.presetDeleteFailed', '删除预设失败：{{error}}', {
         error: error && error.message ? error.message : error
       }), 'warn');
-    }).then(function () { setPresetOpPending(false); });
+    }).then(function () {
+      if (presetOpPromise === op) presetOpPromise = null;
+      setPresetOpPending(false);
+    });
+    presetOpPromise = op;
   }
 
   function setPresetOpPending(on) {
@@ -930,6 +984,7 @@
     // Rename the draft before the request (like deleteCustomPreset): an Apply clicked
     // while the rename is in flight must not submit the old name, which the backend's
     // merge-by-name would write back next to the renamed preset. Rolled back on failure.
+    var opGen = BASELINE_GEN;
     setPresetOpPending(true);
     if (!keepSource) {
       moveDraftPreset(name, target, false);
@@ -938,13 +993,19 @@
       renderPane();
       renderHeadState();
     }
-    callEntry(keepSource ? 'duplicate_material_preset' : 'rename_material_preset',
+    var op = callEntry(keepSource ? 'duplicate_material_preset' : 'rename_material_preset',
       { name: name, new_name: target }).then(function (data) {
       var materials = (data && data.materials) || null;
       var finalName = (data && data.name) || target;
       // The draft keeps its unapplied edits: a duplicate copies this preset's draft params.
       if (keepSource) moveDraftPreset(name, finalName, true);
-      if (BASELINE && materials) syncPresetBaseline(materials);
+      if (BASELINE) {
+        if (materials && BASELINE_GEN === opGen) {
+          syncPresetBaseline(materials);
+        } else {
+          applyTargetedBaselinePresetDelta(keepSource ? 'duplicate' : 'rename', name, finalName, materials);
+        }
+      }
       markDirty();
       renderPane();
       renderHeadState();
@@ -961,7 +1022,11 @@
       toast(T('materials.toast.presetRenameFailed', '操作预设失败：{{error}}', {
         error: error && error.message ? error.message : error
       }), 'warn');
-    }).then(function () { setPresetOpPending(false); });
+    }).then(function () {
+      if (presetOpPromise === op) presetOpPromise = null;
+      setPresetOpPending(false);
+    });
+    presetOpPromise = op;
   }
 
   function renderPresets(pane) {
@@ -1649,6 +1714,7 @@
       CURRENT && !same(CURRENT, options.submitted));
     var prevBasePresets = (BASELINE && BASELINE.custom_presets && typeof BASELINE.custom_presets === 'object')
       ? BASELINE.custom_presets : {};
+    BASELINE_GEN += 1;
     BASELINE = ensureSections(clone(materials));
     if (keepEdits) {
       // Reconcile custom_presets that this panel did not edit against the refreshed disk
@@ -1743,7 +1809,9 @@
     submitPayload: submitPayload,
     isDirty: isDirty,
     resetLocal: resetLocal,
-    applyPreset: function (id) { applyPreset(id); }
+    applyPreset: function (id) { applyPreset(id); },
+    isPresetOpPending: function () { return presetOpPending; },
+    whenPresetOpIdle: function () { return presetOpPromise || Promise.resolve(); }
   };
 
   // Boot once the DOM is ready and the i18n bundle has loaded (whenI18nReady also times out, so it never blocks).

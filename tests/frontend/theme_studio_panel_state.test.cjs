@@ -488,13 +488,10 @@ test('renderMeta tracks name and enabled drafts independently across palette rea
   assert.equal(__ntsPanel.metaDirtyCount(), 1);
 });
 
-test('applyTheme omits unchanged enabled flag and includes it only when toggled', async () => {
-  const initial = makeBaseMaterials(22, {});
-  const harness = createStudioHarness(initial);
-  const { __ntsPanel } = harness.window;
-
+function mountPanelDomStubs(harness) {
   for (const id of [
     'toast', 'btn-apply', 'status', 'notice', 'notice-text',
+    'mode-light', 'mode-dark',
     'preview-mode', 'preview', 'pv-body', 'pv-topbar', 'pv-user',
     'pv-ai', 'pv-link', 'pv-chip', 'pv-input-area', 'pv-input', 'pv-send',
     'dump', 'dump-foot', 'empty-hint', 'audit-list', 'audit-summary',
@@ -504,6 +501,13 @@ test('applyTheme omits unchanged enabled flag and includes it only when toggled'
     const node = harness.createNode('div');
     node.id = id;
   }
+}
+
+test('applyTheme omits unchanged enabled flag and includes it only when toggled', async () => {
+  const initial = makeBaseMaterials(22, {});
+  const harness = createStudioHarness(initial);
+  const { __ntsPanel } = harness.window;
+  mountPanelDomStubs(harness);
 
   let diskPalette = {
     name: 'Old',
@@ -691,9 +695,280 @@ test('renderMeta clears submitted empty name to default and refreshes untouched 
   assert.equal(harness.themeNameInput.value, 'ExternalName');
   assert.equal(__ntsPanel.metaDirtyCount(), 0);
 
-  // If the user started typing while focused (including trailing space), external rename does not clobber it.
+  // While server name has not changed, trailing whitespace typed mid-edit is preserved.
   harness.themeNameInput.value = 'ExternalName ';
-  __ntsPanel.state.palette = { name: 'AnotherExternal', enabled: true, updated_at: '2026-11-28T10:03:00Z' };
+  __ntsPanel.state.palette = { name: 'ExternalName', enabled: true, updated_at: '2026-11-28T10:02:30Z' };
   __ntsPanel.renderMeta();
   assert.equal(harness.themeNameInput.value, 'ExternalName ');
+  assert.equal(__ntsPanel.metaDirtyCount(), 0);
+
+  // If another panel renames the theme while focus sits on a whitespace-only variation, refresh cleanly.
+  __ntsPanel.state.palette = { name: 'AnotherExternal', enabled: true, updated_at: '2026-11-28T10:03:00Z' };
+  __ntsPanel.renderMeta();
+  assert.equal(harness.themeNameInput.value, 'AnotherExternal');
+  assert.equal(__ntsPanel.metaDirtyCount(), 0);
+
+  // Real non-whitespace edits stay intact even if another panel renames the theme while focused.
+  harness.themeNameInput.value = 'AnotherExternal Draft';
+  __ntsPanel.state.palette = { name: 'YetAnother', enabled: true, updated_at: '2026-11-28T10:04:00Z' };
+  __ntsPanel.renderMeta();
+  assert.equal(harness.themeNameInput.value, 'AnotherExternal Draft');
+});
+
+test('reconcileUntouchedPresets canonicalizes key order to prevent false dirty state', async () => {
+  const initial = makeBaseMaterials(18, { A: makePresetSpecParams(10) });
+  const harness = createStudioHarness(initial, {
+    showPrompt: () => 'A Copy',
+    entryHandler(entryId, args) {
+      if (entryId === 'duplicate_material_preset') {
+        assert.equal(args.name, 'A');
+        assert.equal(args.new_name, 'A Copy');
+        // Another panel added B before A Copy was appended on the server.
+        return {
+          name: 'A Copy',
+          materials: makeBaseMaterials(18, {
+            A: makePresetSpecParams(10),
+            B: makePresetSpecParams(20),
+            'A Copy': makePresetSpecParams(10),
+          }),
+        };
+      }
+    },
+  });
+  await harness.bootMaterials();
+  const { NekoMaterials } = harness.window;
+  NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+  const nav = harness.document.getElementById('mt-tabs');
+  nav.children.find((b) => b.textContent === '预设与画质').click();
+  const pane = harness.document.getElementById('mt-pane');
+  const dupBtn = harness.findDescendants(
+    pane,
+    (n) => n.tagName === 'BUTTON' && n.textContent === '复制',
+  )[0];
+  assert.ok(dupBtn);
+  dupBtn.click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(NekoMaterials.isDirty(), false);
+  assert.deepEqual(Object.keys(NekoMaterials.submitPayload().custom_presets), []);
+  assert.deepEqual(Object.keys(NekoMaterials.snapshot().custom_presets), ['A', 'B', 'A Copy']);
+});
+
+test('applyTheme waits for in-flight preset op and stale preset response respects BASELINE_GEN', async () => {
+  // Case A: applyTheme waits for in-flight delete_material_preset before reading materials payload.
+  {
+    let resolveDelete;
+    const deleteDeferred = new Promise((resolve) => { resolveDelete = resolve; });
+    const initial = makeBaseMaterials(18, {
+      P: makePresetSpecParams(10),
+      Q: makePresetSpecParams(14),
+    });
+    const harness = createStudioHarness(initial, {
+      entryHandler(entryId) {
+        if (entryId === 'delete_material_preset') return deleteDeferred;
+      },
+    });
+    mountPanelDomStubs(harness);
+    await harness.bootMaterials();
+    const { NekoMaterials, __ntsPanel } = harness.window;
+
+    let diskPalette = {
+      name: 'Default',
+      enabled: true,
+      vars: {},
+      dark_vars: {},
+      materials: JSON.parse(JSON.stringify(initial)),
+      updated_at: '2026-11-28T10:00:00Z',
+    };
+    const applyCalls = [];
+    harness.setFetchHandler(async (url, opts) => {
+      const body = opts && opts.body ? JSON.parse(opts.body) : {};
+      if (String(url).endsWith('/run/apply_theme')) {
+        applyCalls.push(body);
+        if (body.vars) Object.assign(diskPalette.vars, body.vars);
+        return { ok: true, status: 200, async json() { return { ok: true, result: { rejected: [] } }; } };
+      }
+      if (String(url).endsWith('/run/get_theme')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { ok: true, result: JSON.parse(JSON.stringify(diskPalette)) }; },
+        };
+      }
+      return { ok: true, status: 200, async json() { return { ok: true, result: {} }; } };
+    });
+
+    __ntsPanel.state.palette = JSON.parse(JSON.stringify(diskPalette));
+    __ntsPanel.renderMeta({ discard: true });
+    NekoMaterials.sync(diskPalette);
+
+    const nav = harness.document.getElementById('mt-tabs');
+    nav.children.find((b) => b.textContent === '预设与画质').click();
+    const pane = harness.document.getElementById('mt-pane');
+    const qWrap = harness.findDescendants(pane, (n) => n.classList.contains('mt-preset-wrap')).find((w) => {
+      const b = harness.findDescendants(w, (n) => n.tagName === 'B')[0];
+      return b && b.textContent === 'Q';
+    });
+    assert.ok(qWrap);
+    const delBtn = harness.findDescendants(qWrap, (n) => n.tagName === 'BUTTON' && n.textContent === '删除')[0];
+    delBtn.click();
+    assert.equal(NekoMaterials.isPresetOpPending(), true);
+
+    __ntsPanel.state.edited.light['--nts-accent'] = '#123456';
+    const applyPromise = __ntsPanel.applyTheme();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(applyCalls.length, 0, 'applyTheme must wait while delete_material_preset is in flight');
+
+    diskPalette.materials = makeBaseMaterials(18, { P: makePresetSpecParams(10) });
+    resolveDelete({ materials: JSON.parse(JSON.stringify(diskPalette.materials)) });
+    await applyPromise;
+
+    assert.equal(applyCalls.length, 1);
+    assert.equal(applyCalls[0].vars['--nts-accent'], '#123456');
+    assert.equal(Object.prototype.hasOwnProperty.call(applyCalls[0], 'materials'), false);
+    assert.equal(NekoMaterials.isDirty(), false);
+  }
+
+  // Case B: intervening sync() advances BASELINE_GEN so a stale delete response does not erase newly synced preset Y.
+  {
+    let resolveDelete;
+    const deleteDeferred = new Promise((resolve) => { resolveDelete = resolve; });
+    const initial = makeBaseMaterials(18, {
+      P: makePresetSpecParams(10),
+      Q: makePresetSpecParams(14),
+    });
+    const harness = createStudioHarness(initial, {
+      entryHandler(entryId) {
+        if (entryId === 'delete_material_preset') return deleteDeferred;
+      },
+    });
+    await harness.bootMaterials();
+    const { NekoMaterials } = harness.window;
+    NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+    const nav = harness.document.getElementById('mt-tabs');
+    nav.children.find((b) => b.textContent === '预设与画质').click();
+    const pane = harness.document.getElementById('mt-pane');
+    const qWrap = harness.findDescendants(pane, (n) => n.classList.contains('mt-preset-wrap')).find((w) => {
+      const b = harness.findDescendants(w, (n) => n.tagName === 'B')[0];
+      return b && b.textContent === 'Q';
+    });
+    const delBtn = harness.findDescendants(qWrap, (n) => n.tagName === 'BUTTON' && n.textContent === '删除')[0];
+    delBtn.click();
+
+    // Intervening readback arrives before the delete response and introduces preset Y.
+    NekoMaterials.sync({
+      enabled: true,
+      materials: makeBaseMaterials(18, {
+        P: makePresetSpecParams(10),
+        Y: makePresetSpecParams(24),
+      }),
+    });
+
+    // Stale delete response lacks Y; targeted delta keeps Y intact.
+    resolveDelete({
+      materials: makeBaseMaterials(18, { P: makePresetSpecParams(10) }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const snap = NekoMaterials.snapshot();
+    assert.equal('Y' in snap.custom_presets, true);
+    assert.equal('Q' in snap.custom_presets, false);
+    assert.equal(NekoMaterials.isDirty(), false);
+  }
+});
+
+test('auditRowsForMode models bubble glass tint, gradients, and text-gradient contrast without darkNative leaks', () => {
+  const initial = makeBaseMaterials(22, {});
+  const harness = createStudioHarness(initial);
+  mountPanelDomStubs(harness);
+  const { __ntsPanel } = harness.window;
+
+  // 1. Opaque white --nts-bubble-glass-tint overrides black user bubble background; applyAuditFix picks dark text.
+  __ntsPanel.state.palette = {
+    name: 'GlassTest',
+    enabled: true,
+    vars: {
+      '--nts-chat-bg': '#101010',
+      '--nts-user-bubble-bg': '#000000',
+      '--nts-user-bubble-text': '#ffffff',
+      '--nts-bubble-glass-tint': '#ffffff',
+    },
+    dark_vars: {},
+  };
+  __ntsPanel.state.edited = { light: {}, dark: {} };
+  __ntsPanel.state.cleared = { light: {}, dark: {} };
+  __ntsPanel.state.mode = 'light';
+
+  let lightRows = __ntsPanel.auditRowsForMode('light');
+  const userRow = lightRows.find((r) => r.key === '--nts-user-bubble-text');
+  assert.ok(userRow);
+  assert.equal(userRow.ok, false);
+  assert.equal(userRow.ratio, 1);
+  assert.equal(userRow.canAutoFix, true);
+  assert.equal(__ntsPanel.applyAuditFix(userRow, true), true);
+  lightRows = __ntsPanel.auditRowsForMode('light');
+  const fixedUserRow = lightRows.find((r) => r.key === '--nts-user-bubble-text');
+  assert.ok(fixedUserRow && fixedUserRow.ok);
+
+  // 2. Dark AI bubble gradient over white AI bubble background fails dark AI text.
+  __ntsPanel.state.palette = {
+    name: 'GradTest',
+    enabled: true,
+    vars: {
+      '--nts-chat-bg': '#ffffff',
+      '--nts-ai-bubble-bg': '#ffffff',
+      '--nts-ai-bubble-gradient': 'linear-gradient(135deg, #111111 0%, #222222 100%)',
+      '--nts-ai-bubble-text': '#111111',
+    },
+    dark_vars: {},
+  };
+  __ntsPanel.state.edited = { light: {}, dark: {} };
+  lightRows = __ntsPanel.auditRowsForMode('light');
+  const aiRow = lightRows.find((r) => r.key === '--nts-ai-bubble-text');
+  assert.ok(aiRow);
+  assert.equal(aiRow.ok, false);
+
+  // 3. Unreadable --nts-text-gradient stop flags the row as non-autofixable and refuses overwrite.
+  __ntsPanel.state.palette = {
+    name: 'TextGradTest',
+    enabled: true,
+    vars: {
+      '--nts-chat-bg': '#000000',
+      '--nts-user-bubble-bg': '#000000',
+      '--nts-user-bubble-text': '#ffffff',
+      '--nts-text-gradient': 'linear-gradient(120deg, #ffffff 0%, #111111 100%)',
+    },
+    dark_vars: {},
+  };
+  __ntsPanel.state.edited = { light: {}, dark: {} };
+  lightRows = __ntsPanel.auditRowsForMode('light');
+  const textGradRow = lightRows.find((r) => r.key === '--nts-text-gradient');
+  assert.ok(textGradRow);
+  assert.equal(textGradRow.ok, false);
+  assert.equal(textGradRow.canAutoFix, false);
+  assert.equal(__ntsPanel.applyAuditFix(textGradRow, true), false);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(__ntsPanel.state.edited.light, '--nts-text-gradient'),
+    false,
+  );
+
+  // 4. Dark mode without explicit --nts-bubble-glass-tint ignores CATALOG darkNative example tint.
+  __ntsPanel.state.palette = {
+    name: 'DarkNoTint',
+    enabled: true,
+    vars: {},
+    dark_vars: {
+      '--nts-chat-bg': '#000000',
+      '--nts-user-bubble-bg': '#000000',
+      '--nts-user-bubble-text': '#ffffff',
+    },
+  };
+  __ntsPanel.state.edited = { light: {}, dark: {} };
+  const darkRows = __ntsPanel.auditRowsForMode('dark');
+  const darkUserRow = darkRows.find((r) => r.key === '--nts-user-bubble-text');
+  assert.ok(darkUserRow);
+  assert.equal(darkUserRow.ok, true);
+  assert.equal(darkUserRow.ratio, 21);
 });

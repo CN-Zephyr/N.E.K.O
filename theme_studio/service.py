@@ -2618,7 +2618,10 @@ class ThemeStudioService(NekoPluginBase):
                 "vars": {"type": "object", "description": "亮色变量表 --nts-* → 值"},
                 "dark_vars": {"type": "object", "description": "暗色变量表 --nts-* → 值"},
                 "name": {"type": "string", "maxLength": 60},
-                "enabled": {"type": "boolean", "default": True},
+                "enabled": {
+                    "type": "boolean",
+                    "description": "是否启用主题；省略时保留磁盘当前值",
+                },
                 "materials": {
                     "type": "object",
                     "description": (

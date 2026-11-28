@@ -1288,9 +1288,9 @@ function contrastRatio(fg, bg) {
   return (l1 + 0.05) / (l2 + 0.05);
 }
 
-/** The middle color stop of a gradient (where bubble text most often sits). */
-function gradientMidColor(value) {
-  if (typeof value !== 'string' || !value) return null;
+/** Parse every concrete color stop token from a CSS gradient/color string. */
+function gradientStops(value) {
+  if (typeof value !== 'string' || !value) return [];
   var re = /(#[0-9a-fA-F]{3,8}|rgba?\([^()]*\))/g;
   var stops = [];
   var m;
@@ -1298,6 +1298,28 @@ function gradientMidColor(value) {
     var c = parseColor(m[1]);
     if (c) stops.push(c);
   }
+  return stops;
+}
+
+/** Average color across all gradient stops (each missing alpha treated as 1). */
+function gradientAvgColor(value) {
+  var stops = gradientStops(value);
+  if (!stops.length) return null;
+  var r = 0, g = 0, b = 0, a = 0;
+  stops.forEach(function (c) {
+    var alpha = (c.a === undefined || c.a === null) ? 1 : c.a;
+    r += c.r;
+    g += c.g;
+    b += c.b;
+    a += alpha;
+  });
+  var n = stops.length;
+  return { r: r / n, g: g / n, b: b / n, a: a / n };
+}
+
+/** The middle color stop of a gradient (where bubble text most often sits). */
+function gradientMidColor(value) {
+  var stops = gradientStops(value);
   if (!stops.length) return null;
   return stops[Math.floor(stops.length / 2)];
 }
@@ -1362,19 +1384,28 @@ function colorToHex(c) {
   return '#' + part(c.r) + part(c.g) + part(c.b);
 }
 
-/** Effective value in the given mode (edited -> edited value; cleared -> ''; otherwise server / native value). */
-function valueForMode(key, mode) {
+function modeValue(key, mode, allowDarkNative) {
   var ed = state.edited[mode] || {};
   var cl = state.cleared[mode] || {};
   if (Object.prototype.hasOwnProperty.call(ed, key)) return ed[key];
   if (Object.prototype.hasOwnProperty.call(cl, key)) return '';
   var bag = state.palette ? (mode === 'dark' ? state.palette.dark_vars : state.palette.vars) : null;
   if (bag && Object.prototype.hasOwnProperty.call(bag, key)) return bag[key];
-  if (mode === 'dark') {
+  if (allowDarkNative && mode === 'dark') {
     var item = CATALOG_BY_KEY[key];
     if (item && item.darkNative !== undefined) return item.darkNative;
   }
   return '';
+}
+
+/** Effective value in the given mode (edited -> edited value; cleared -> ''; otherwise server / native value). */
+function valueForMode(key, mode) {
+  return modeValue(key, mode, true);
+}
+
+/** Explicit value only (edited/cleared/server): ignores CATALOG darkNative examples for optional effect vars. */
+function explicitValueForMode(key, mode) {
+  return modeValue(key, mode, false);
 }
 
 function auditParse(key, mode, fallback) {
@@ -1404,30 +1435,67 @@ function auditRowsForMode(mode) {
   var dark = mode === 'dark';
   var chatBg = auditParse('--nts-chat-bg', mode, dark ? '#1f242a' : '#eef3f8');
   if (!chatBg) chatBg = { r: dark ? 31 : 238, g: dark ? 36 : 243, b: dark ? 42 : 248, a: 1 };
-  var surface = auditParse('--nts-topbar-bg', mode, '') || chatBg;
-  var glass = colorOver(auditParse('--nts-panel-glass-tint', mode, ''), chatBg) || surface;
+  var panelBg = parseColor(explicitValueForMode('--nts-chat-panel-bg', mode));
+  var msgListBg = panelBg ? (colorOver(panelBg, chatBg) || chatBg) : chatBg;
+  var chatGrad = gradientAvgColor(explicitValueForMode('--nts-chat-gradient', mode));
+  if (chatGrad) msgListBg = colorOver(chatGrad, msgListBg) || msgListBg;
+  var surface = colorOver(auditParse('--nts-topbar-bg', mode, ''), chatBg) || chatBg;
+  var glass = colorOver(parseColor(explicitValueForMode('--nts-panel-glass-tint', mode)), chatBg) || surface;
   var inputBg = colorOver(auditParse('--nts-input-bg', mode, ''), chatBg) || chatBg;
-  var userBg = colorOver(auditParse('--nts-user-bubble-bg', mode, ''), chatBg) ||
-    gradientMidColor(valueForMode('--nts-user-bubble-gradient', mode)) || chatBg;
-  var aiBg = colorOver(auditParse('--nts-ai-bubble-bg', mode, ''), chatBg) || chatBg;
-  var chipBg = colorOver(auditParse('--nts-chip-bg', mode, ''), chatBg) || chatBg;
-  var sendBg = auditParse('--nts-send-bg', mode, '') || chatBg;
-  var bgs = { chat: chatBg, surface: surface, input: inputBg, glass: glass, ai: aiBg, user: userBg, chip: chipBg, send: sendBg };
+  var bubbleGlassTint = parseColor(explicitValueForMode('--nts-bubble-glass-tint', mode));
+  function bubbleBg(bgKey, gradKey) {
+    // Loader paints --nts-bubble-glass-tint instead of --nts-*-bubble-bg when set, then stacks gradient on top.
+    var base = bubbleGlassTint
+      ? (colorOver(bubbleGlassTint, msgListBg) || msgListBg)
+      : (colorOver(auditParse(bgKey, mode, ''), msgListBg) || msgListBg);
+    var grad = gradientAvgColor(explicitValueForMode(gradKey, mode));
+    return grad ? (colorOver(grad, base) || base) : base;
+  }
+  var userBg = bubbleBg('--nts-user-bubble-bg', '--nts-user-bubble-gradient');
+  var aiBg = bubbleBg('--nts-ai-bubble-bg', '--nts-ai-bubble-gradient');
+  var chipBg = colorOver(auditParse('--nts-chip-bg', mode, ''), msgListBg) || msgListBg;
+  var sendBg = colorOver(auditParse('--nts-send-bg', mode, ''), chatBg) || chatBg;
+  var bgs = { chat: msgListBg, surface: surface, input: inputBg, glass: glass, ai: aiBg, user: userBg, chip: chipBg, send: sendBg };
+  var textGradStops = gradientStops(explicitValueForMode('--nts-text-gradient', mode));
 
   var out = [];
   READ_PAIRS.forEach(function (pair) {
-    var fg = auditParse(pair.fg, mode, '');
     var bg = bgs[pair.bg];
-    if (!fg || !bg) return;
-    fg = colorOver(fg, bg);
-    var ratio = contrastRatio(fg, bg);
+    if (!bg) return;
+    var rawFg = auditParse(pair.fg, mode, '');
+    var fg = rawFg ? colorOver(rawFg, bg) : null;
+    var ratio = fg ? contrastRatio(fg, bg) : 0;
+    var key = pair.fg;
+    var canAutoFix = true;
+    var usesTextGrad = textGradStops.length > 0 && (pair.bg === 'ai' || pair.bg === 'user' || pair.bg === 'chip');
+    if (usesTextGrad) {
+      var worstStop = null;
+      var worstRatio = Infinity;
+      textGradStops.forEach(function (stop) {
+        var comp = colorOver(stop, bg);
+        if (!comp) return;
+        var r = contrastRatio(comp, bg);
+        if (r < worstRatio) {
+          worstRatio = r;
+          worstStop = comp;
+        }
+      });
+      if (worstStop && (!fg || worstRatio < ratio)) {
+        fg = worstStop;
+        ratio = worstRatio;
+        key = '--nts-text-gradient';
+        canAutoFix = false;
+      }
+    }
+    if (!fg) return;
     out.push({
       name: pair.name,
-      key: pair.fg,
+      key: key,
       mode: mode,
       ratio: Math.round(ratio * 100) / 100,
       need: pair.need,
       ok: ratio >= pair.need,
+      canAutoFix: canAutoFix,
       // The two opaque colors used by auto-fix: fg is already composited onto bg, bg is the computed backdrop.
       fg: fg,
       bg: bg
@@ -1470,7 +1538,7 @@ function jumpToAuditRow(key, mode) {
  * @returns {boolean} true = a usable fix value was found
  */
 function applyAuditFix(row, quiet) {
-  if (!row) return false;
+  if (!row || row.canAutoFix === false) return false;
   // Keep a 0.05 margin: the panel shows two decimals, and 4.499 would look like "fixed but still red".
   var fix = contrastFixColor(row.fg, row.bg, row.need + 0.05);
   if (!fix) return false;
@@ -1493,7 +1561,7 @@ function fixAllAudit() {
   var fixed = 0;
   var stuck = 0;
   ['light', 'dark'].forEach(function (mode) {
-    var rows = auditRowsForMode(mode).filter(function (r) { return !r.ok; });
+    var rows = auditRowsForMode(mode).filter(function (r) { return !r.ok && r.canAutoFix !== false; });
     if (!rows.length) return;
     if (state.mode !== mode) setMode(mode);
     rows.forEach(function (r) {
@@ -1557,19 +1625,21 @@ function renderAudit(auto) {
             jumpToAuditRow(r.key, r.mode);
           }
         });
-        var fixBtn = el('button', {
-          class: 'btn btn-mini audit-fix',
-          type: 'button',
-          text: tsT('core.audit.fixButton', '自动修正'),
-          title: tsT('core.audit.fixButtonTitle', '按背景亮度自动调出一个达标颜色（只填值，不直接应用）')
-        });
-        fixBtn.addEventListener('click', function (event) {
-          event.preventDefault();
-          event.stopPropagation();
-          if (applyAuditFix(r, false)) renderAudit(true);
-          else showToast(tsT('core.audit.fixFailed', '这一组自动调不到 {{need}}:1，需要改背景色', { need: r.need.toFixed(1) }), 'error');
-        });
-        li.appendChild(fixBtn);
+        if (r.canAutoFix !== false) {
+          var fixBtn = el('button', {
+            class: 'btn btn-mini audit-fix',
+            type: 'button',
+            text: tsT('core.audit.fixButton', '自动修正'),
+            title: tsT('core.audit.fixButtonTitle', '按背景亮度自动调出一个达标颜色（只填值，不直接应用）')
+          });
+          fixBtn.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (applyAuditFix(r, false)) renderAudit(true);
+            else showToast(tsT('core.audit.fixFailed', '这一组自动调不到 {{need}}:1，需要改背景色', { need: r.need.toFixed(1) }), 'error');
+          });
+          li.appendChild(fixBtn);
+        }
       }
       list.appendChild(li);
     });
@@ -3765,16 +3835,19 @@ function renderMeta(options) {
   var keepEnabled = !discard && !!enabledInput &&
     (!!enabledInput.checked !== !!state.metaEnabled);
   // The baseline must refresh on every palette read-back: applyTheme uses it to tell whether name/enabled really changed.
-  state.metaName = p.name || '';
+  var nextMetaName = p.name || '';
+  state.metaName = nextMetaName;
   state.metaEnabled = p.enabled !== false;
   // theme.json has no version field anymore (since 0.1.5): the panel shows no version counter,
   // only the theme name and "last updated" pills.
-  $('meta-name').textContent = p.name || tsT('editor.meta.defaultName', '默认');
+  $('meta-name').textContent = nextMetaName || tsT('editor.meta.defaultName', '默认');
   var when = p.updated_at ? String(p.updated_at).replace('T', ' ').slice(0, 19) : '—';
   $('meta-updated').textContent = when;
   if (!keepName && nameInput &&
-      (discard || submittedNameMatch || document.activeElement !== nameInput || nameInput.value === prevMetaName)) {
-    nameInput.value = p.name || '';
+      (discard || submittedNameMatch || document.activeElement !== nameInput ||
+       nameInput.value === prevMetaName ||
+       (currentNameTrimmed === prevMetaName.trim() && nextMetaName.trim() !== prevMetaName.trim()))) {
+    nameInput.value = nextMetaName;
   }
   if (!keepEnabled && enabledInput) {
     enabledInput.checked = p.enabled !== false;
@@ -4129,6 +4202,21 @@ async function applyTheme() {
     showToast(tsT('actions.apply.invalidShort', '有非法输入，未应用'), 'error');
     setStatus(tsT('actions.apply.invalidShort', '有非法输入，未应用'), 'warn');
     return;
+  }
+
+  // Wait for any in-flight preset delete/rename/duplicate before reading materials payloads,
+  // so BASELINE.custom_presets reflects the server result and concurrent changes are not undone.
+  var matApi = window.NekoMaterials;
+  if (matApi &&
+      typeof matApi.isPresetOpPending === 'function' &&
+      matApi.isPresetOpPending() &&
+      typeof matApi.whenPresetOpIdle === 'function') {
+    setBusy(true, tsT('actions.apply.busy', '正在应用…'));
+    try {
+      await matApi.whenPresetOpIdle();
+    } finally {
+      setBusy(false);
+    }
   }
 
   var lightVars = buildArgs('light');
@@ -8367,5 +8455,7 @@ window.__ntsPanel = window.__ntsPanel || {
   saveCatalogCollapsed: saveCatalogCollapsed,
   currentMaterialsPayload: currentMaterialsPayload,
   renderMeta: renderMeta,
-  applyTheme: applyTheme
+  applyTheme: applyTheme,
+  auditRowsForMode: auditRowsForMode,
+  applyAuditFix: applyAuditFix
 };
