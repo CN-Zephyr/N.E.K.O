@@ -36,7 +36,7 @@ make_home() {
              "$state/live2d" "$state/vrm" "$state/mmd" "$state/pngtuber" \
              "$state/emote_templates" \
              "$state/avatar_tools" "$state/chat_avatars" "$state/workshop" \
-             "$state/theater" "$state/jukebox" "$state/watch_together" \
+             "$state/theater" "$state/jukebox" "$state/watch_together" "$state/theme_studio" \
              "$state/character_cards" "$state/card_faces" \
              "$state/runtimes" "$state/embedding_models" "$state/state" \
              "$state/cloudsave" "$state/.cloudsave_staging" "$state/cloudsave_backups" \
@@ -60,6 +60,7 @@ make_home() {
     printf 'theater\n'   > "$state/theater/scene.json"
     printf 'jukebox\n'   > "$state/jukebox/list.json"
     printf 'watch\n'     > "$state/watch_together/lib.json"
+    printf '{}\n'        > "$state/theme_studio/theme.json"
     printf 'runtime\n'   > "$state/runtimes/ocr.bin"
     printf 'embed\n'     > "$state/embedding_models/model.bin"
     printf 'recent\n'    > "$state/memory/recent.json"
@@ -118,6 +119,7 @@ if sh "$BACKUP" --home "$WORK/t2home" --out "$WORK/t2out" --no-stop >"$WORK/t2.l
                     .local/share/N.E.K.O/theater/scene.json \
                     .local/share/N.E.K.O/jukebox/list.json \
                     .local/share/N.E.K.O/watch_together/lib.json \
+                    .local/share/N.E.K.O/theme_studio/theme.json \
                     .local/share/N.E.K.O/runtimes/ocr.bin \
                     .local/share/N.E.K.O/embedding_models/model.bin \
                     .local/share/N.E.K.O/instance_access.key \

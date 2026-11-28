@@ -123,6 +123,7 @@ workshop
 theater
 jukebox
 watch_together
+theme_studio
 character_cards
 card_faces
 runtimes
