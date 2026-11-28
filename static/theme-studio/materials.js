@@ -757,6 +757,35 @@
   }
 
   /**
+   * Three-way merge for plain maps (sections, components, custom_presets):
+   * entries matching prevMap (untouched locally) follow nextMap in nextMap's key
+   * order (updated or dropped), newly appeared nextMap entries are adopted, and
+   * local additions, edits, and deletions stay intact.
+   */
+  function reconcileUntouchedMap(curMap, prevMap, nextMap) {
+    var cur = (curMap && typeof curMap === 'object') ? curMap : {};
+    var prev = (prevMap && typeof prevMap === 'object') ? prevMap : {};
+    var next = (nextMap && typeof nextMap === 'object') ? nextMap : {};
+    var merged = {};
+    Object.keys(next).forEach(function (key) {
+      if (HAS.call(cur, key)) {
+        merged[key] = (HAS.call(prev, key) && same(cur[key], prev[key]))
+          ? clone(next[key])
+          : cur[key];
+      } else if (!HAS.call(prev, key)) {
+        merged[key] = clone(next[key]);
+      }
+    });
+    Object.keys(cur).forEach(function (key) {
+      if (HAS.call(merged, key)) return;
+      if (!(HAS.call(prev, key) && same(cur[key], prev[key]))) {
+        merged[key] = cur[key];
+      }
+    });
+    return merged;
+  }
+
+  /**
    * Reconcile CURRENT.custom_presets against a refreshed server baseline:
    * entries that matched the previous baseline (untouched by this panel) follow
    * the new server baseline (updated or deleted), and newly appeared server entries
@@ -764,50 +793,66 @@
    */
   function reconcileUntouchedPresets(prevBasePresets, nextBasePresets) {
     if (!CURRENT) return;
-    if (!CURRENT.custom_presets || typeof CURRENT.custom_presets !== 'object') {
-      CURRENT.custom_presets = {};
+    var prevCur = (CURRENT.custom_presets && typeof CURRENT.custom_presets === 'object')
+      ? CURRENT.custom_presets : {};
+    CURRENT.custom_presets = reconcileUntouchedMap(prevCur, prevBasePresets, nextBasePresets);
+    if (CURRENT.preset && HAS.call(prevCur, CURRENT.preset) && !HAS.call(CURRENT.custom_presets, CURRENT.preset)) {
+      CURRENT.preset = 'custom';
     }
-    var prev = (prevBasePresets && typeof prevBasePresets === 'object') ? prevBasePresets : {};
-    var next = (nextBasePresets && typeof nextBasePresets === 'object') ? nextBasePresets : {};
-    Object.keys(CURRENT.custom_presets).forEach(function (name) {
-      if (HAS.call(prev, name) && same(CURRENT.custom_presets[name], prev[name])) {
-        if (HAS.call(next, name)) {
-          CURRENT.custom_presets[name] = clone(next[name]);
-        } else {
-          delete CURRENT.custom_presets[name];
-          if (CURRENT.preset === name) CURRENT.preset = 'custom';
-        }
-      }
-    });
-    Object.keys(next).forEach(function (name) {
-      if (!HAS.call(prev, name) && !HAS.call(CURRENT.custom_presets, name)) {
-        CURRENT.custom_presets[name] = clone(next[name]);
-      }
-    });
-    // Preserve server key order for shared entries so JSON.stringify-based same()
-    // never flags false dirty state due to key insertion ordering alone.
-    var ordered = {};
-    Object.keys(next).forEach(function (name) {
-      if (HAS.call(CURRENT.custom_presets, name)) {
-        ordered[name] = CURRENT.custom_presets[name];
-      }
-    });
-    Object.keys(CURRENT.custom_presets).forEach(function (name) {
-      if (!HAS.call(ordered, name)) {
-        ordered[name] = CURRENT.custom_presets[name];
-      }
-    });
-    CURRENT.custom_presets = ordered;
   }
 
-  /** Update BASELINE.custom_presets / preset from a preset-op response and reconcile untouched drafts. */
-  function syncPresetBaseline(materials) {
+  /** Reconcile dark overrides per section while omitting empty sections after local clears or deletes. */
+  function reconcileUntouchedDark(curDark, prevDark, nextDark) {
+    var cur = (curDark && typeof curDark === 'object') ? curDark : {};
+    var prev = (prevDark && typeof prevDark === 'object') ? prevDark : {};
+    var next = (nextDark && typeof nextDark === 'object') ? nextDark : {};
+    var merged = {};
+    function mergeSection(sec) {
+      if (HAS.call(merged, sec)) return;
+      var secMerged = reconcileUntouchedMap(cur[sec], prev[sec], next[sec]);
+      if (Object.keys(secMerged).length) merged[sec] = secMerged;
+    }
+    Object.keys(next).forEach(mergeSection);
+    Object.keys(cur).forEach(mergeSection);
+    return merged;
+  }
+
+  /** Reconcile untouched active material fields alongside custom_presets while keeping genuine drafts. */
+  function reconcileUntouchedMaterials(prevBase, nextBase, opts) {
+    if (!CURRENT || !prevBase || !nextBase) return;
+    ['version', 'enabled', 'preset', 'quality', 'lock'].forEach(function (key) {
+      if (key === 'preset' && opts && opts.optimisticPreset !== undefined &&
+          CURRENT.preset === opts.optimisticPreset && prevBase.preset === opts.prevPreset) {
+        CURRENT.preset = nextBase.preset;
+        return;
+      }
+      if (same(CURRENT[key], prevBase[key])) {
+        CURRENT[key] = nextBase[key];
+      }
+    });
+    ['global', 'lighting', 'refraction', 'surface', 'animation'].forEach(function (section) {
+      CURRENT[section] = reconcileUntouchedMap(CURRENT[section], prevBase[section], nextBase[section]);
+    });
+    CURRENT.components = reconcileUntouchedMap(CURRENT.components, prevBase.components, nextBase.components);
+    CURRENT.dark = reconcileUntouchedDark(CURRENT.dark, prevBase.dark, nextBase.dark);
+    reconcileUntouchedPresets(prevBase.custom_presets, nextBase.custom_presets);
+    // Preserve server top-level key order so JSON.stringify-based same() agrees cleanly.
+    var ordered = {};
+    Object.keys(nextBase).forEach(function (key) {
+      if (HAS.call(CURRENT, key)) ordered[key] = CURRENT[key];
+    });
+    Object.keys(CURRENT).forEach(function (key) {
+      if (!HAS.call(ordered, key)) ordered[key] = CURRENT[key];
+    });
+    CURRENT = ordered;
+  }
+
+  /** Refresh full BASELINE from a preset-op response and reconcile untouched active + preset state. */
+  function syncPresetBaseline(materials, opts) {
     if (!BASELINE || !materials) return;
-    var prevBasePresets = (BASELINE.custom_presets && typeof BASELINE.custom_presets === 'object')
-      ? BASELINE.custom_presets : {};
-    BASELINE.custom_presets = clone(materials.custom_presets || {});
-    BASELINE.preset = materials.preset || 'custom';
-    reconcileUntouchedPresets(prevBasePresets, BASELINE.custom_presets);
+    var prevBase = BASELINE;
+    BASELINE = ensureSections(clone(materials));
+    reconcileUntouchedMaterials(prevBase, BASELINE, opts);
   }
 
   /** Apply only the targeted preset delta to BASELINE when an intervening sync() superseded opGen. */
@@ -873,7 +918,7 @@
       // The saved baseline follows the server (the delete is persisted), so remaining unapplied edits still show as pending.
       if (BASELINE) {
         if (materials && BASELINE_GEN === opGen) {
-          syncPresetBaseline(materials);
+          syncPresetBaseline(materials, wasSelected ? { prevPreset: name, optimisticPreset: 'custom' } : null);
         } else {
           applyTargetedBaselinePresetDelta('delete', name, name, materials);
         }
@@ -984,6 +1029,7 @@
     // Rename the draft before the request (like deleteCustomPreset): an Apply clicked
     // while the rename is in flight must not submit the old name, which the backend's
     // merge-by-name would write back next to the renamed preset. Rolled back on failure.
+    var wasSelected = !keepSource && CURRENT.preset === name;
     var opGen = BASELINE_GEN;
     setPresetOpPending(true);
     if (!keepSource) {
@@ -1001,7 +1047,7 @@
       if (keepSource) moveDraftPreset(name, finalName, true);
       if (BASELINE) {
         if (materials && BASELINE_GEN === opGen) {
-          syncPresetBaseline(materials);
+          syncPresetBaseline(materials, wasSelected ? { prevPreset: name, optimisticPreset: target } : null);
         } else {
           applyTargetedBaselinePresetDelta(keepSource ? 'duplicate' : 'rename', name, finalName, materials);
         }

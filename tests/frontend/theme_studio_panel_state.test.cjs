@@ -972,3 +972,134 @@ test('auditRowsForMode models bubble glass tint, gradients, and text-gradient co
   assert.equal(darkUserRow.ok, true);
   assert.equal(darkUserRow.ratio, 21);
 });
+
+test('preset-operation readback reconciles untouched active material state while preserving local drafts', async () => {
+  // 1. Codex reproduction: clean Panel A deletes Q after Panel B changed preset/params -> stays clean.
+  {
+    const initial = makeBaseMaterials(18, { Q: makePresetSpecParams(14) });
+    initial.preset = 'clear';
+    const remoteState = makeBaseMaterials(37, {});
+    remoteState.preset = 'custom';
+    remoteState.quality = 'high';
+    remoteState.dark = { global: { blur: 28 } };
+    remoteState.components = { topbar: { mode: 'preset', preset: 'clear' } };
+
+    const harness = createStudioHarness(initial, {
+      entryHandler(entryId, args) {
+        if (entryId === 'delete_material_preset') {
+          assert.equal(args.name, 'Q');
+          return { materials: JSON.parse(JSON.stringify(remoteState)) };
+        }
+      },
+    });
+    await harness.bootMaterials();
+    const { NekoMaterials, __ntsPanel } = harness.window;
+    NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+    const nav = harness.document.getElementById('mt-tabs');
+    nav.children.find((b) => b.textContent === '预设与画质').click();
+    const pane = harness.document.getElementById('mt-pane');
+    const delBtn = harness.findDescendants(
+      pane,
+      (n) => n.tagName === 'BUTTON' && n.textContent === '删除',
+    )[0];
+    assert.ok(delBtn);
+    delBtn.click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), false);
+    assert.equal(__ntsPanel.currentMaterialsPayload(), null);
+    const snap = NekoMaterials.snapshot();
+    assert.equal(snap.preset, 'custom');
+    assert.equal(snap.global.blur, 37);
+    assert.equal(snap.quality, 'high');
+    assert.equal(snap.dark.global.blur, 28);
+    assert.equal(snap.components.topbar.preset, 'clear');
+    assert.equal('Q' in snap.custom_presets, false);
+  }
+
+  // 2. Dirty Panel A edits blur=25 locally, then renames Q -> Q2 while Panel B changed preset/blur/quality.
+  {
+    const initial = makeBaseMaterials(18, { Q: makePresetSpecParams(14) });
+    initial.preset = 'clear';
+    const remoteState = makeBaseMaterials(37, { Q2: makePresetSpecParams(14) });
+    remoteState.preset = 'custom';
+    remoteState.quality = 'high';
+
+    const harness = createStudioHarness(initial, {
+      showPrompt: () => 'Q2',
+      entryHandler(entryId, args) {
+        if (entryId === 'rename_material_preset') {
+          assert.equal(args.name, 'Q');
+          assert.equal(args.new_name, 'Q2');
+          return { name: 'Q2', materials: JSON.parse(JSON.stringify(remoteState)) };
+        }
+      },
+    });
+    await harness.bootMaterials();
+    const { NekoMaterials } = harness.window;
+    NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+    const nav = harness.document.getElementById('mt-tabs');
+    nav.children.find((b) => b.textContent === '基础材质').click();
+    const pane = harness.document.getElementById('mt-pane');
+    const rangeInput = harness.findDescendants(
+      pane,
+      (n) => n.tagName === 'INPUT' && n.getAttribute('type') === 'range',
+    )[0];
+    rangeInput.value = '25';
+    rangeInput.dispatchEvent({ type: 'input' });
+
+    nav.children.find((b) => b.textContent === '预设与画质').click();
+    const renameBtn = harness.findDescendants(
+      pane,
+      (n) => n.tagName === 'BUTTON' && n.textContent === '改名',
+    )[0];
+    assert.ok(renameBtn);
+    renameBtn.click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), true);
+    const snap = NekoMaterials.snapshot();
+    assert.equal(snap.global.blur, 25);
+    assert.equal(snap.preset, 'custom');
+    assert.equal(snap.quality, 'high');
+    assert.deepEqual(Object.keys(NekoMaterials.submitPayload().custom_presets), []);
+  }
+
+  // 3. Panel A deletes currently selected preset Q after Panel B already switched disk preset to 'clear'.
+  {
+    const initial = makeBaseMaterials(14, { Q: makePresetSpecParams(14) });
+    initial.preset = 'Q';
+    const remoteState = makeBaseMaterials(20, {});
+    remoteState.preset = 'clear';
+
+    const harness = createStudioHarness(initial, {
+      entryHandler(entryId, args) {
+        if (entryId === 'delete_material_preset') {
+          assert.equal(args.name, 'Q');
+          return { materials: JSON.parse(JSON.stringify(remoteState)) };
+        }
+      },
+    });
+    await harness.bootMaterials();
+    const { NekoMaterials } = harness.window;
+    NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+    const nav = harness.document.getElementById('mt-tabs');
+    nav.children.find((b) => b.textContent === '预设与画质').click();
+    const pane = harness.document.getElementById('mt-pane');
+    const delBtn = harness.findDescendants(
+      pane,
+      (n) => n.tagName === 'BUTTON' && n.textContent === '删除',
+    )[0];
+    assert.ok(delBtn);
+    delBtn.click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), false);
+    const snap = NekoMaterials.snapshot();
+    assert.equal(snap.preset, 'clear');
+    assert.equal(snap.global.blur, 20);
+  }
+});
