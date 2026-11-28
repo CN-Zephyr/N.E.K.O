@@ -3755,8 +3755,13 @@ function renderMeta(options) {
   var discard = !!(options && options.discard);
   var nameInput = $('theme-name');
   var enabledInput = $('theme-enabled');
+  var prevMetaName = String(state.metaName || '');
+  var hasSubmittedName = !!(options && Object.prototype.hasOwnProperty.call(options, 'nameSubmitted'));
+  var currentNameTrimmed = nameInput ? nameInput.value.trim() : '';
+  var submittedNameMatch = hasSubmittedName && currentNameTrimmed === String(options.nameSubmitted || '').trim();
   var keepName = !discard && !!nameInput &&
-    nameInput.value.trim() !== String(state.metaName || '').trim();
+    currentNameTrimmed !== prevMetaName.trim() &&
+    !submittedNameMatch;
   var keepEnabled = !discard && !!enabledInput &&
     (!!enabledInput.checked !== !!state.metaEnabled);
   // The baseline must refresh on every palette read-back: applyTheme uses it to tell whether name/enabled really changed.
@@ -3767,7 +3772,8 @@ function renderMeta(options) {
   $('meta-name').textContent = p.name || tsT('editor.meta.defaultName', '默认');
   var when = p.updated_at ? String(p.updated_at).replace('T', ' ').slice(0, 19) : '—';
   $('meta-updated').textContent = when;
-  if (!keepName && nameInput && (discard || document.activeElement !== nameInput)) {
+  if (!keepName && nameInput &&
+      (discard || submittedNameMatch || document.activeElement !== nameInput || nameInput.value === prevMetaName)) {
     nameInput.value = p.name || '';
   }
   if (!keepEnabled && enabledInput) {
@@ -4159,9 +4165,12 @@ async function applyTheme() {
 
   var args = {
     vars: lightVars,
-    dark_vars: darkVars,
-    enabled: enabled
+    dark_vars: darkVars
   };
+  // Only submit enabled when the user actually toggled it, so applying an unrelated
+  // edit (such as renaming) from a stale panel never re-enables or disables what
+  // another open panel set on disk.
+  if (enabledChanged) args.enabled = enabled;
   if (materialsDirty) args.materials = materials;
   // An emptied name is submitted as the default name, matching the backend's
   // "empty / whitespace = restore default name"; DEFAULT_THEME_NAME matches the
@@ -4181,7 +4190,9 @@ async function applyTheme() {
     // After a successful write we must read back and check the result: if a silent
     // failure is swallowed, the panel keeps old values while saying "applied" --
     // what the user sees would not match disk.
-    var reloaded = await reloadPalette({ silent: true, materialsSubmitted: materialsAtSubmit });
+    var reloadOpts = { silent: true, materialsSubmitted: materialsAtSubmit };
+    if (nameChanged) reloadOpts.nameSubmitted = name;
+    var reloaded = await reloadPalette(reloadOpts);
     if (reloaded) {
       // Only a successful readback means "panel = disk"; only then clear dirty and
       // invalid state -- for the submitted drafts. Edits made during the save remain.
@@ -4207,7 +4218,7 @@ async function applyTheme() {
       // path back to consistency. Also update the name/enabled baseline with the
       // submitted values so the next run does not detect phantom changes.
       if (nameChanged) state.metaName = name || DEFAULT_THEME_NAME;
-      state.metaEnabled = enabled;
+      if (enabledChanged) state.metaEnabled = enabled;
     }
     // Rejected entries stay in the panel for in-place fixing (the valid part is already on disk).
     var restored = rejected && rejected.length ? restoreRejected(rejected, lightVars, darkVars) : 0;
@@ -6588,7 +6599,11 @@ async function reloadPalette(options) {
       // new values or old ones again, and pulls the panel back to disk.
       externalSyncState.lastSignature = '';
     }
-    renderMeta({ discard: discardEdits });
+    var metaOpts = { discard: discardEdits };
+    if (options && Object.prototype.hasOwnProperty.call(options, 'nameSubmitted')) {
+      metaOpts.nameSubmitted = options.nameSubmitted;
+    }
+    renderMeta(metaOpts);
     renderPaletteHint();
     // Refresh the materials subtree from disk: after import/reset/apply the material
     // center's "saved" baseline must update too, or it keeps showing "N pending".
@@ -8351,5 +8366,6 @@ window.__ntsPanel = window.__ntsPanel || {
   loadCatalogCollapsed: loadCatalogCollapsed,
   saveCatalogCollapsed: saveCatalogCollapsed,
   currentMaterialsPayload: currentMaterialsPayload,
-  renderMeta: renderMeta
+  renderMeta: renderMeta,
+  applyTheme: applyTheme
 };

@@ -752,6 +752,46 @@
     toast(T('materials.toast.presetSaved', '已存为「{{name}}」，点「应用材质」写入磁盘。', { name: name }), 'ok');
   }
 
+  /**
+   * Reconcile CURRENT.custom_presets against a refreshed server baseline:
+   * entries that matched the previous baseline (untouched by this panel) follow
+   * the new server baseline (updated or deleted), and newly appeared server entries
+   * are adopted when absent locally. Local unsaved additions / edits stay intact.
+   */
+  function reconcileUntouchedPresets(prevBasePresets, nextBasePresets) {
+    if (!CURRENT) return;
+    if (!CURRENT.custom_presets || typeof CURRENT.custom_presets !== 'object') {
+      CURRENT.custom_presets = {};
+    }
+    var prev = (prevBasePresets && typeof prevBasePresets === 'object') ? prevBasePresets : {};
+    var next = (nextBasePresets && typeof nextBasePresets === 'object') ? nextBasePresets : {};
+    Object.keys(CURRENT.custom_presets).forEach(function (name) {
+      if (HAS.call(prev, name) && same(CURRENT.custom_presets[name], prev[name])) {
+        if (HAS.call(next, name)) {
+          CURRENT.custom_presets[name] = clone(next[name]);
+        } else {
+          delete CURRENT.custom_presets[name];
+          if (CURRENT.preset === name) CURRENT.preset = 'custom';
+        }
+      }
+    });
+    Object.keys(next).forEach(function (name) {
+      if (!HAS.call(prev, name) && !HAS.call(CURRENT.custom_presets, name)) {
+        CURRENT.custom_presets[name] = clone(next[name]);
+      }
+    });
+  }
+
+  /** Update BASELINE.custom_presets / preset from a preset-op response and reconcile untouched drafts. */
+  function syncPresetBaseline(materials) {
+    if (!BASELINE || !materials) return;
+    var prevBasePresets = (BASELINE.custom_presets && typeof BASELINE.custom_presets === 'object')
+      ? BASELINE.custom_presets : {};
+    BASELINE.custom_presets = clone(materials.custom_presets || {});
+    BASELINE.preset = materials.preset || 'custom';
+    reconcileUntouchedPresets(prevBasePresets, BASELINE.custom_presets);
+  }
+
   /** Delete a custom preset: a dedicated entry persists it immediately (apply's merge semantics would re-add it). */
   function deleteCustomPreset(name) {
     if (!name || presetOpPending) return;
@@ -782,8 +822,7 @@
       // The saved baseline follows the server (the delete is persisted), so remaining unapplied edits still show as pending.
       if (BASELINE) {
         if (materials) {
-          BASELINE.custom_presets = clone(materials.custom_presets || {});
-          BASELINE.preset = materials.preset || 'custom';
+          syncPresetBaseline(materials);
         } else {
           if (BASELINE.custom_presets) delete BASELINE.custom_presets[name];
           if (BASELINE.preset === name) BASELINE.preset = 'custom';
@@ -905,10 +944,7 @@
       var finalName = (data && data.name) || target;
       // The draft keeps its unapplied edits: a duplicate copies this preset's draft params.
       if (keepSource) moveDraftPreset(name, finalName, true);
-      if (BASELINE && materials) {
-        BASELINE.custom_presets = clone(materials.custom_presets || {});
-        BASELINE.preset = materials.preset || 'custom';
-      }
+      if (BASELINE && materials) syncPresetBaseline(materials);
       markDirty();
       renderPane();
       renderHeadState();
@@ -1618,25 +1654,7 @@
       // Reconcile custom_presets that this panel did not edit against the refreshed disk
       // baseline, so a concurrent delete/update from another panel is adopted without
       // discarding edits made locally while the save was in flight.
-      if (!CURRENT.custom_presets || typeof CURRENT.custom_presets !== 'object') {
-        CURRENT.custom_presets = {};
-      }
-      var nextBasePresets = BASELINE.custom_presets || {};
-      Object.keys(CURRENT.custom_presets).forEach(function (name) {
-        if (HAS.call(prevBasePresets, name) && same(CURRENT.custom_presets[name], prevBasePresets[name])) {
-          if (HAS.call(nextBasePresets, name)) {
-            CURRENT.custom_presets[name] = clone(nextBasePresets[name]);
-          } else {
-            delete CURRENT.custom_presets[name];
-            if (CURRENT.preset === name) CURRENT.preset = 'custom';
-          }
-        }
-      });
-      Object.keys(nextBasePresets).forEach(function (name) {
-        if (!HAS.call(prevBasePresets, name) && !HAS.call(CURRENT.custom_presets, name)) {
-          CURRENT.custom_presets[name] = clone(nextBasePresets[name]);
-        }
-      });
+      reconcileUntouchedPresets(prevBasePresets, BASELINE.custom_presets);
       DIRTY = !same(CURRENT, BASELINE);
     } else {
       CURRENT = ensureSections(clone(materials));

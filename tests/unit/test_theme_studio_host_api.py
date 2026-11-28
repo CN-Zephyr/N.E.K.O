@@ -884,3 +884,21 @@ def test_apply_theme_filtered_custom_presets_does_not_resurrect_deleted_or_overw
     after_reapply = theme_studio.run_entry_sync("get_theme", {}).value["materials"]
     assert "DeletedByOther" not in after_reapply["custom_presets"]
     assert after_reapply["preset"] == "custom"
+
+
+@pytest.mark.unit
+def test_apply_theme_omitting_enabled_preserves_disk_enabled_state(studio):
+    """Omitting enabled on apply_theme updates name/vars without overwriting disk enabled."""
+    disabled = theme_studio.run_entry_sync("apply_theme", {"enabled": False})
+    assert disabled.ok, disabled.error
+    assert theme_studio.run_entry_sync("get_theme", {}).value["enabled"] is False
+
+    renamed = theme_studio.run_entry_sync(
+        "apply_theme", {"name": "RenamedWhileDisabled", "vars": {"--nts-accent": "#123456"}}
+    )
+    assert renamed.ok, renamed.error
+
+    after = theme_studio.run_entry_sync("get_theme", {}).value
+    assert after["enabled"] is False
+    assert after["name"] == "RenamedWhileDisabled"
+    assert after["vars"]["--nts-accent"] == "#123456"

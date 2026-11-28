@@ -169,6 +169,8 @@ function createMiniDom() {
   const document = {
     readyState: 'loading',
     activeElement: null,
+    body: createNode('body'),
+    documentElement: { lang: 'zh-CN' },
     createElement(tag) { return createNode(tag, 1); },
     createTextNode(text) {
       const node = createNode('#text', 3);
@@ -216,7 +218,7 @@ function makeBaseMaterials(blurVal, customPresets) {
   };
 }
 
-function createStudioHarness(initialMaterials) {
+function createStudioHarness(initialMaterials, options = {}) {
   const { document, createNode, findDescendants, docListeners } = createMiniDom();
 
   const materialsRoot = createNode('div');
@@ -232,11 +234,13 @@ function createStudioHarness(initialMaterials) {
   metaUpdatedNode.id = 'meta-updated';
 
   const winListeners = new Map();
+  let customEntryHandler = options.entryHandler || null;
   const windowObj = {
     location: { origin: 'http://127.0.0.1:48911', pathname: '/theme_studio', search: '' },
     document,
     i18n: { isInitialized: true },
     __NTS_PANEL_BOOTED__: true,
+    showPrompt: options.showPrompt || null,
     addEventListener(type, fn) {
       if (!winListeners.has(type)) winListeners.set(type, new Set());
       winListeners.get(type).add(fn);
@@ -246,7 +250,7 @@ function createStudioHarness(initialMaterials) {
       if (set) set.delete(fn);
     },
     NekoPanel: {
-      call(entryId) {
+      call(entryId, args) {
         if (entryId === 'material_spec') {
           return Promise.resolve({
             version: 1,
@@ -263,6 +267,10 @@ function createStudioHarness(initialMaterials) {
         if (entryId === 'preview_materials') {
           return Promise.resolve({ vars: {}, warnings: [] });
         }
+        if (customEntryHandler) {
+          const handled = customEntryHandler(entryId, args);
+          if (handled !== undefined) return Promise.resolve(handled);
+        }
         return Promise.resolve({});
       },
       toast() {},
@@ -272,10 +280,17 @@ function createStudioHarness(initialMaterials) {
   windowObj.top = windowObj;
 
   let nextTimerId = 1;
+  let fetchHandler = async () => ({
+    ok: true,
+    status: 200,
+    async json() { return { ok: true, result: {} }; },
+  });
   const context = vm.createContext({
     window: windowObj,
     document,
     navigator: { clipboard: null },
+    fetch(url, opts) { return fetchHandler(url, opts); },
+    AbortController: typeof AbortController !== 'undefined' ? AbortController : undefined,
     localStorage: {
       _data: new Map(),
       getItem(k) { return this._data.has(k) ? this._data.get(k) : null; },
@@ -319,6 +334,8 @@ function createStudioHarness(initialMaterials) {
     metaNameNode,
     metaUpdatedNode,
     findDescendants,
+    createNode,
+    setFetchHandler(fn) { fetchHandler = fn; },
     async bootMaterials() {
       for (const fn of matDomHandlers) fn();
       await new Promise((resolve) => setImmediate(resolve));
@@ -469,4 +486,214 @@ test('renderMeta tracks name and enabled drafts independently across palette rea
   assert.equal(__ntsPanel.state.metaName, 'Evening');
   assert.equal(__ntsPanel.state.metaEnabled, true);
   assert.equal(__ntsPanel.metaDirtyCount(), 1);
+});
+
+test('applyTheme omits unchanged enabled flag and includes it only when toggled', async () => {
+  const initial = makeBaseMaterials(22, {});
+  const harness = createStudioHarness(initial);
+  const { __ntsPanel } = harness.window;
+
+  for (const id of [
+    'toast', 'btn-apply', 'status', 'notice', 'notice-text',
+    'preview-mode', 'preview', 'pv-body', 'pv-topbar', 'pv-user',
+    'pv-ai', 'pv-link', 'pv-chip', 'pv-input-area', 'pv-input', 'pv-send',
+    'dump', 'dump-foot', 'empty-hint', 'audit-list', 'audit-summary',
+    'health-state', 'changes-card', 'changes-list', 'changes-count',
+    'btn-undo', 'btn-redo',
+  ]) {
+    const node = harness.createNode('div');
+    node.id = id;
+  }
+
+  let diskPalette = {
+    name: 'Old',
+    enabled: true,
+    vars: {},
+    dark_vars: {},
+    updated_at: '2026-11-28T10:00:00Z',
+  };
+  const applyCalls = [];
+  harness.setFetchHandler(async (url, opts) => {
+    const body = opts && opts.body ? JSON.parse(opts.body) : {};
+    if (String(url).endsWith('/run/apply_theme')) {
+      applyCalls.push(body);
+      if (Object.prototype.hasOwnProperty.call(body, 'name')) diskPalette.name = body.name;
+      if (Object.prototype.hasOwnProperty.call(body, 'enabled')) diskPalette.enabled = body.enabled;
+      return { ok: true, status: 200, async json() { return { ok: true, result: { rejected: [] } }; } };
+    }
+    if (String(url).endsWith('/run/get_theme')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() { return { ok: true, result: JSON.parse(JSON.stringify(diskPalette)) }; },
+      };
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: {} }; } };
+  });
+
+  __ntsPanel.state.palette = JSON.parse(JSON.stringify(diskPalette));
+  __ntsPanel.renderMeta({ discard: true });
+
+  // Simulate another panel disabling the theme on disk while Panel A has an unapplied name edit.
+  diskPalette.enabled = false;
+  harness.themeNameInput.value = 'RenamedByA';
+  await __ntsPanel.applyTheme();
+
+  assert.equal(applyCalls.length, 1);
+  assert.equal(applyCalls[0].name, 'RenamedByA');
+  assert.equal(Object.prototype.hasOwnProperty.call(applyCalls[0], 'enabled'), false);
+  assert.equal(diskPalette.enabled, false, 'unrelated Apply must keep disk enabled=false');
+  assert.equal(harness.themeEnabledInput.checked, false, 'readback refreshes untouched toggle');
+
+  // When the user explicitly toggles enabled, applyTheme includes enabled in the payload.
+  harness.themeEnabledInput.checked = true;
+  await __ntsPanel.applyTheme();
+
+  assert.equal(applyCalls.length, 2);
+  assert.equal(Object.prototype.hasOwnProperty.call(applyCalls[1], 'enabled'), true);
+  assert.equal(applyCalls[1].enabled, true);
+  assert.equal(diskPalette.enabled, true);
+});
+
+test('preset delete, rename, and duplicate callbacks reconcile untouched custom_presets against server baseline', async () => {
+  async function setupPresetScenario(entryHandler, promptAnswer) {
+    const basePresets = {
+      P: makePresetSpecParams(10),
+      R: makePresetSpecParams(12),
+      Q: makePresetSpecParams(14),
+    };
+    const initial = makeBaseMaterials(18, basePresets);
+    const harness = createStudioHarness(initial, {
+      entryHandler,
+      showPrompt: promptAnswer ? () => promptAnswer : null,
+    });
+    await harness.bootMaterials();
+    const { NekoMaterials } = harness.window;
+    NekoMaterials.sync({ enabled: true, materials: JSON.parse(JSON.stringify(initial)) });
+
+    const nav = harness.document.getElementById('mt-tabs');
+    const presetsTab = nav.children.find((b) => b.textContent === '预设与画质');
+    assert.ok(presetsTab);
+    presetsTab.click();
+
+    const findPresetAction = (presetName, actionLabel) => {
+      const pane = harness.document.getElementById('mt-pane');
+      const wraps = harness.findDescendants(pane, (n) => n.classList.contains('mt-preset-wrap'));
+      const targetWrap = wraps.find((w) => {
+        const b = harness.findDescendants(w, (n) => n.tagName === 'B')[0];
+        return b && b.textContent === presetName;
+      });
+      assert.ok(targetWrap, `missing preset card wrapper for ${presetName}`);
+      const btn = harness.findDescendants(
+        targetWrap,
+        (n) => n.tagName === 'BUTTON' && n.textContent === actionLabel,
+      )[0];
+      assert.ok(btn, `missing ${actionLabel} button for ${presetName}`);
+      return btn;
+    };
+
+    return { harness, NekoMaterials, findPresetAction };
+  }
+
+  // 1. Delete Q while another panel updated P to blur=30 and deleted R.
+  {
+    const { NekoMaterials, findPresetAction } = await setupPresetScenario((entryId, args) => {
+      if (entryId === 'delete_material_preset') {
+        assert.equal(args.name, 'Q');
+        return {
+          materials: makeBaseMaterials(18, { P: makePresetSpecParams(30) }),
+        };
+      }
+    });
+    findPresetAction('Q', '删除').click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), false);
+    assert.deepEqual(Object.keys(NekoMaterials.submitPayload().custom_presets), []);
+    const snap = NekoMaterials.snapshot();
+    assert.deepEqual(Object.keys(snap.custom_presets), ['P']);
+    assert.equal(snap.custom_presets.P.global.blur, 30);
+  }
+
+  // 2. Rename Q -> Q2 while another panel updated P=30 and deleted R.
+  {
+    const { NekoMaterials, findPresetAction } = await setupPresetScenario((entryId, args) => {
+      if (entryId === 'rename_material_preset') {
+        assert.equal(args.name, 'Q');
+        assert.equal(args.new_name, 'Q2');
+        return {
+          name: 'Q2',
+          materials: makeBaseMaterials(18, {
+            P: makePresetSpecParams(30),
+            Q2: makePresetSpecParams(14),
+          }),
+        };
+      }
+    }, 'Q2');
+    findPresetAction('Q', '改名').click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), false);
+    assert.deepEqual(Object.keys(NekoMaterials.submitPayload().custom_presets), []);
+    const snap = NekoMaterials.snapshot();
+    assert.deepEqual(Object.keys(snap.custom_presets).sort(), ['P', 'Q2']);
+    assert.equal(snap.custom_presets.P.global.blur, 30);
+  }
+
+  // 3. Duplicate Q -> Q Copy while another panel updated P=30 and deleted R.
+  {
+    const { NekoMaterials, findPresetAction } = await setupPresetScenario((entryId, args) => {
+      if (entryId === 'duplicate_material_preset') {
+        assert.equal(args.name, 'Q');
+        assert.equal(args.new_name, 'Q Copy');
+        return {
+          name: 'Q Copy',
+          materials: makeBaseMaterials(18, {
+            P: makePresetSpecParams(30),
+            Q: makePresetSpecParams(14),
+            'Q Copy': makePresetSpecParams(14),
+          }),
+        };
+      }
+    }, 'Q Copy');
+    findPresetAction('Q', '复制').click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(NekoMaterials.isDirty(), false);
+    assert.deepEqual(Object.keys(NekoMaterials.submitPayload().custom_presets), []);
+    const snap = NekoMaterials.snapshot();
+    assert.deepEqual(Object.keys(snap.custom_presets).sort(), ['P', 'Q', 'Q Copy']);
+    assert.equal(snap.custom_presets.P.global.blur, 30);
+  }
+});
+
+test('renderMeta clears submitted empty name to default and refreshes untouched focused name input', () => {
+  const initial = makeBaseMaterials(22, {});
+  const harness = createStudioHarness(initial);
+  const { __ntsPanel } = harness.window;
+
+  __ntsPanel.state.palette = { name: 'CustomName', enabled: true, updated_at: '2026-11-28T10:00:00Z' };
+  __ntsPanel.renderMeta({ discard: true });
+  assert.equal(harness.themeNameInput.value, 'CustomName');
+
+  // Clearing #theme-name and applying nameSubmitted='' restores server default name cleanly.
+  harness.themeNameInput.value = '';
+  __ntsPanel.state.palette = { name: '默认主题', enabled: true, updated_at: '2026-11-28T10:01:00Z' };
+  __ntsPanel.renderMeta({ nameSubmitted: '' });
+  assert.equal(harness.themeNameInput.value, '默认主题');
+  assert.equal(__ntsPanel.state.metaName, '默认主题');
+  assert.equal(__ntsPanel.metaDirtyCount(), 0);
+
+  // When focus rests on an untouched #theme-name input, external rename still refreshes the input.
+  harness.document.activeElement = harness.themeNameInput;
+  __ntsPanel.state.palette = { name: 'ExternalName', enabled: true, updated_at: '2026-11-28T10:02:00Z' };
+  __ntsPanel.renderMeta();
+  assert.equal(harness.themeNameInput.value, 'ExternalName');
+  assert.equal(__ntsPanel.metaDirtyCount(), 0);
+
+  // If the user started typing while focused (including trailing space), external rename does not clobber it.
+  harness.themeNameInput.value = 'ExternalName ';
+  __ntsPanel.state.palette = { name: 'AnotherExternal', enabled: true, updated_at: '2026-11-28T10:03:00Z' };
+  __ntsPanel.renderMeta();
+  assert.equal(harness.themeNameInput.value, 'ExternalName ');
 });
